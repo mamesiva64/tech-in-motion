@@ -1,0 +1,21 @@
+/* Git internals — page-specific styles */
+.stage .hashv { margin-top: 6px; font: 700 19px/1.3 var(--mono); color: var(--accent); letter-spacing: 0.01em; word-break: break-all; }
+.stage .hashv.sm { margin-top: 0; font-size: 12.5px; font-weight: 600; }
+.stage [data-state="bad"] .hashv { color: var(--red); }
+.stage [data-state="ok"] .hashv { color: var(--green); }
+.stage .file.tight pre { font-size: 10.5px; }
+.stage .file-b + .file-b { border-top: 1px dashed var(--line); }
+.stage .seg > span { text-align: center; }
+.lab-out {
+  margin-top: 12px;
+  min-height: 4.5em;
+  border: 1px solid var(--line2);
+  border-radius: 9px;
+  background: #060a12;
+}
+.lab label input[type="checkbox"] { vertical-align: -2px; margin-right: 6px; }
+/* stamps on .file / .term: those parts clip overflow by default */
+.stage .stampable { overflow: visible; }
+.stage .stampable > .file-h, .stage .stampable > .term-h { border-radius: 9px 9px 0 0; }
+.lab label code { text-transform: none; letter-spacing: 0; }
+.lab label.plain { text-transform: none; letter-spacing: 0; font: 13px/1.6 var(--sans); color: var(--tx2); }

@@ -1,0 +1,561 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Git の中身 — Tech in Motion</title>
+  <meta name="description" content="git init / add / commit で .git の中に何が書かれるか。blob・tree・commit オブジェクトのバイト形式、SHA-1 による ID、refs と HEAD、改ざん検知を実際のハッシュ計算で。">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Space+Grotesk:wght@500;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="../../assets/css/tim.css">
+  <link rel="stylesheet" href="page.css">
+</head>
+<body data-root="../../" data-topic="git-internals">
+  <header class="site-h"></header>
+
+  <div class="page">
+    <aside class="toc"></aside>
+    <main class="doc">
+
+      <!-- 0. HERO -->
+      <section class="hero">
+        <p class="kicker">Dev Tools · Git Internals</p>
+        <h1>Git の中身<small>blob・tree・commit と .git ディレクトリを、実際のバイトとハッシュで</small></h1>
+        <p class="lead">Git のリポジトリは「中身のハッシュ値を名前にしたファイルの集まり（オブジェクト DB）」と「そのハッシュ値を書いただけの小さなファイル（refs）」でできています。<code>git add</code> や <code>git commit</code> で <code>.git/</code> の<strong>どこに・どんなバイト列が・どんな名前で</strong>書かれるかを、このページ上で SHA-1 を実際に計算しながら追います。</p>
+        <div class="facts">
+          <div class="fact"><span>保存場所</span><b><code>.git/objects/ce/013625…</code>（ID の先頭 2 桁がディレクトリ）</b></div>
+          <div class="fact"><span>オブジェクト ID</span><b><code>SHA-1("blob 6\0hello\n")</code> = <code>ce013625…</code></b></div>
+          <div class="fact"><span>ブランチの実体</span><b><code>.git/refs/heads/main</code>：40 桁 hex + 改行 = 41 バイト</b></div>
+          <div class="fact"><span>仕様</span><b>gitformat-index / gitrepository-layout / Pro Git 10 章</b></div>
+        </div>
+      </section>
+
+      <!-- 1. 全体像 -->
+      <section class="chapter" id="overview">
+        <h2>全体像：3 つの置き場所</h2>
+        <p>ファイルは 3 か所を移動します。<strong>作業ツリー</strong>（普通のファイル）→ <code>git add</code> で <strong>index</strong>（<code>.git/index</code>、次のコミットの予定表）と <strong>オブジェクト DB</strong>（<code>.git/objects/</code>）→ <code>git commit</code> で tree と commit オブジェクトが作られ、<strong>ref</strong>（<code>.git/refs/heads/main</code>）が新しい commit を指すように書き換わります。</p>
+        <div class="tbl">
+          <table class="ref">
+            <thead><tr><th>置き場所</th><th>実体</th><th>中身</th><th>書き換えるコマンド</th></tr></thead>
+            <tbody>
+              <tr><td>作業ツリー</td><td><code>./hello.txt</code></td><td>普通のファイル</td><td>エディタ、<code>git checkout</code> / <code>git switch</code> / <code>git restore</code></td></tr>
+              <tr><td>index（ステージ）</td><td><code>.git/index</code></td><td>パス・モード・blob ID・stat 情報の一覧（バイナリ、先頭 <code>DIRC</code>）</td><td><code>git add</code>, <code>git rm --cached</code>, <code>git update-index</code></td></tr>
+              <tr><td>オブジェクト DB</td><td><code>.git/objects/xx/…</code>、<code>.git/objects/pack/</code></td><td>blob / tree / commit / tag（zlib 圧縮、追記のみ）</td><td><code>git add</code>, <code>git commit</code>, <code>git hash-object -w</code>, <code>git gc</code></td></tr>
+              <tr><td>refs</td><td><code>.git/HEAD</code>, <code>.git/refs/heads/*</code>, <code>.git/packed-refs</code></td><td>commit ID（または <code>ref: …</code>）を書いたテキスト</td><td><code>git commit</code>, <code>git switch</code>, <code>git branch</code>, <code>git update-ref</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- 2. git init -->
+      <section class="chapter" id="init">
+        <h2><code>git init</code> が作るもの</h2>
+        <div class="scene" id="sc-init" data-title="git init：空のリポジトリの骨組み">
+          <div class="stage" data-w="960" data-h="470">
+            <div class="term" data-el="tg" style="left:16px;top:16px;width:444px;height:220px"><div class="term-h">alice@laptop: ~</div><div class="term-b"></div></div>
+            <div class="file hide" data-el="gt" style="left:476px;top:16px;width:468px">
+              <div class="file-h"><i data-icon="folder"></i>demo/.git/</div>
+              <pre data-lang="tree">.git/
+├── HEAD                 # 今いるブランチ
+├── config               # リポジトリ固有の設定
+├── description          # GitWeb 用（普段は使わない）
+├── hooks/               # *.sample が 14 個
+├── info/
+│   └── exclude          # このリポジトリだけの .gitignore
+├── objects/
+│   ├── info/
+│   └── pack/            # オブジェクト DB（まだ空）
+└── refs/
+    ├── heads/           # ブランチ（まだ空）
+    └── tags/</pre>
+            </div>
+            <div class="file hide" data-el="hd" style="left:16px;top:252px;width:200px">
+              <div class="file-h">.git/HEAD<small>21 B</small></div>
+              <pre data-lang="text">ref: refs/heads/main</pre>
+            </div>
+            <div class="file hide" data-el="cf" style="left:228px;top:252px;width:232px">
+              <div class="file-h">.git/config</div>
+              <pre data-lang="ini">[core]
+  repositoryformatversion = 0
+  filemode = true
+  bare = false
+  logallrefupdates = true</pre>
+            </div>
+            <div class="chip hide" data-el="c-obj" style="left:476px;top:318px"><i data-icon="box"></i>objects/：0 個（count: 0）</div>
+            <div class="chip c-amber hide" data-el="c-ref" style="left:476px;top:354px"><i data-icon="git"></i>refs/heads/main は存在しない（unborn branch）</div>
+            <div class="chip hide" data-el="c-idx" style="left:476px;top:390px"><i data-icon="file"></i>.git/index もまだ無い</div>
+          </div>
+        </div>
+        <p><code>HEAD</code> が <code>ref: refs/heads/main</code> を指しているのに <code>refs/heads/main</code> ファイルが無い状態を「unborn branch」と呼びます。最初のコミットで初めてこのファイルが作られます。既定のブランチ名は <code>init.defaultBranch</code> の設定で決まり、未設定なら Git 2.x では <code>master</code> です（Git 3.0 で <code>main</code> に変わる予定と <code>git init</code> 自身がヒントを表示します）。</p>
+      </section>
+
+      <!-- 3. blob -->
+      <section class="chapter" id="blob">
+        <h2><code>git add</code> = blob を作る</h2>
+        <p><code>git add hello.txt</code> は、ファイルの中身に <code>blob &lt;バイト数&gt;\0</code> というヘッダを付けて SHA-1 を計算し、その値を名前にして zlib 圧縮した中身を <code>.git/objects/</code> に保存します。<strong>ファイル名は blob に入りません</strong>（名前は tree が持ちます）。同じ中身なら、どのリポジトリ・どのパスでも同じ ID になります。</p>
+        <div class="scene" id="sc-blob" data-title="git add：ヘッダ付き SHA-1 → .git/objects/ce/013625…">
+          <div class="stage" data-w="960" data-h="470">
+            <div class="file" data-el="wf" style="left:20px;top:20px;width:220px">
+              <div class="file-h">hello.txt（作業ツリー）</div>
+              <pre data-lang="text">hello</pre>
+              <div class="file-b bytes"><b>68 65 6c 6c 6f 0a</b>（6 バイト）</div>
+            </div>
+            <div class="file hide" data-el="sum" style="left:20px;top:150px;width:220px">
+              <div class="file-h">sha1sum hello.txt</div>
+              <div class="file-b bytes" data-el="sumv">…</div>
+              <div class="file-b txt">ヘッダが無いので git の ID とは<b>別の値</b></div>
+            </div>
+
+            <div class="seg hide" data-el="hdr" style="left:268px;top:22px">
+              <span class="c-violet"><small>type</small>blob</span><span class="c-gray"><small>SP</small>␣</span><span class="c-amber"><small>size</small>6</span><span class="c-red"><small>NUL</small>\0</span><span class="c-green"><small>content</small>hello\n</span>
+            </div>
+            <div class="file hide" data-el="raw" style="left:268px;top:100px;width:672px">
+              <div class="file-h">ハッシュ対象のバイト列（13 バイト = ヘッダ 7 + 中身 6）</div>
+              <div class="file-b bytes"><b>62 6c 6f 62 20 36 00</b> 68 65 6c 6c 6f 0a</div>
+            </div>
+            <div class="node acc hide" data-el="sha" style="left:268px;top:176px;width:672px">
+              <div class="node-h"><i data-icon="hash"></i><b class="node-t">SHA-1（このページで計算）</b></div>
+              <div class="hashv" data-el="shav">…</div>
+            </div>
+            <div class="file hide" data-el="path" style="left:268px;top:282px;width:412px">
+              <div class="file-h">保存先（ID の先頭 2 桁 = ディレクトリ）</div>
+              <pre data-lang="text">.git/objects/⟪ce⟫/013625030ba8dba906f756967f9e9ca394464a</pre>
+            </div>
+            <div class="file hide" data-el="zl" style="left:696px;top:282px;width:244px">
+              <div class="file-h">zlib 圧縮後の中身<small>21 B</small></div>
+              <div class="file-b bytes"><b>78 01</b> 4b ca c9 4f 52 30 63 c8 48 cd c9 c9 e7 02 00 1d c5 04 14</div>
+            </div>
+            <div class="file hide" data-el="idx" style="left:20px;top:392px;width:660px">
+              <div class="file-h">.git/index（git ls-files --stage）</div>
+              <pre data-lang="text">100644 ce013625030ba8dba906f756967f9e9ca394464a 0  hello.txt</pre>
+            </div>
+          </div>
+        </div>
+
+        <h3>オブジェクトの形式</h3>
+        <div class="tbl">
+          <table class="ref">
+            <thead><tr><th>種類</th><th>ハッシュ対象（圧縮前）</th><th>中身</th><th>確認コマンド</th></tr></thead>
+            <tbody>
+              <tr><td><code>blob</code></td><td><code>blob &lt;size&gt;\0&lt;content&gt;</code></td><td>ファイルの中身そのもの（名前・モードなし）</td><td><code>git cat-file -p &lt;id&gt;</code></td></tr>
+              <tr><td><code>tree</code></td><td><code>tree &lt;size&gt;\0</code> + エントリの並び</td><td>エントリ = <code>&lt;mode&gt; SP &lt;name&gt; \0 &lt;20 バイトの生の ID&gt;</code>。名前順に並ぶ。mode は <code>100644</code> 通常、<code>100755</code> 実行可能、<code>120000</code> シンボリックリンク、<code>40000</code> サブツリー、<code>160000</code> サブモジュール</td><td><code>git ls-tree &lt;id&gt;</code></td></tr>
+              <tr><td><code>commit</code></td><td><code>commit &lt;size&gt;\0</code> + テキスト</td><td><code>tree</code>・<code>parent</code>（0 個以上）・<code>author</code>・<code>committer</code>（名前 &lt;メール&gt; Unix 秒 タイムゾーン）・空行・メッセージ。署名付きなら <code>gpgsig</code> ヘッダ</td><td><code>git cat-file -p &lt;id&gt;</code></td></tr>
+              <tr><td><code>tag</code></td><td><code>tag &lt;size&gt;\0</code> + テキスト</td><td><code>object</code>・<code>type</code>・<code>tag</code>・<code>tagger</code>・空行・メッセージ（注釈付きタグ。軽量タグは ref だけでオブジェクトを作らない）</td><td><code>git cat-file -p v1.0</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="lab" id="lab-hash">
+          <div class="lab-h">LAB · git hash-object をブラウザで計算する</div>
+          <label for="gh-in">ファイルの中身（UTF-8）</label>
+          <textarea id="gh-in" rows="3" spellcheck="false">hello</textarea>
+          <label class="plain"><input type="checkbox" id="gh-nl" checked> 末尾に改行（<code>\n</code>）を付ける — <code>echo</code> やエディタで保存したファイルと同じ</label>
+          <div class="btns"><button class="btn pri" type="button" id="gh-go">計算する</button></div>
+          <pre data-lang="text" data-bare id="gh-out" class="lab-out"></pre>
+        </div>
+
+        <h3>loose object ファイルの実物</h3>
+        <pre data-lang="bash" data-title="zlib を戻すとヘッダ付きの中身が出てくる">$ ls -l .git/objects/ce/
+-r--r--r-- 1 alice alice 21 Sep 28 10:00 013625030ba8dba906f756967f9e9ca394464a
+$ xxd .git/objects/ce/013625030ba8dba906f756967f9e9ca394464a
+00000000: 7801 4bca c94f 5230 63c8 48cd c9c9 e702  x.K..OR0c.H.....
+00000010: 001d c504 14                             .....
+$ python3 -c 'import sys,zlib; print(zlib.decompress(open(sys.argv[1],"rb").read()))' \
+    .git/objects/ce/013625030ba8dba906f756967f9e9ca394464a
+b'⟪blob 6\x00⟫hello\n'</pre>
+        <p>ファイルは読み取り専用（<code>-r--r--r--</code>）で作られます。オブジェクトは一度書いたら変更しない前提だからです。</p>
+
+        <h3><code>.git/index</code> の中身</h3>
+        <p>index はバイナリファイルで、先頭 12 バイトがヘッダ（<code>DIRC</code>・バージョン・エントリ数）、続いてエントリごとに ctime / mtime / dev / ino / mode / uid / gid / size / 20 バイトの blob ID / flags / パス名が並びます（<code>gitformat-index</code>）。stat 情報を持っているので、<code>git status</code> は中身を読まずに「変更があったかもしれないファイル」を絞り込めます。</p>
+        <pre data-lang="text" data-title="xxd .git/index（2 ファイル・先頭 128 バイト）">00000000: ⟪4449 5243⟫ ⟪0000 0002⟫ ⟪0000 0002⟫ 6ab9 6794  DIRC........j.g.   ← "DIRC" / version 2 / 2 entries
+00000010: 0ccf f330 6ab9 6794 0ccf f330 0000 0000  ...0j.g....0....   ← ctime / mtime
+00000020: 0000 0000 0000 ⟪81a4⟫ 0000 0000 0000 0000  ................   ← mode 0x81a4 = 0100644
+00000030: 0000 0007 ⟪fc72 a5c1 094e 203e efcd 1c71⟫  .....r...N >...q   ← size 7 / blob ID
+00000040: ⟪0f06 0957 ebbb aac4⟫ 0009 ⟪5245 4144 4d45⟫  ...W......README   ← flags（名前長 9）/ path
+00000050: ⟪2e6d 64⟫00 6ab9 6794 02e8 3468 6ab9 6794  .md.j.g...4hj.g.
+00000060: 22bc 056c 0000 0000 0000 0000 0000 81a4  "..l............
+00000070: 0000 0000 0000 0000 0000 0006 ⟪ce01 3625⟫  ..............6%   ← hello.txt の blob ID が続く</pre>
+      </section>
+
+      <!-- 4. commit -->
+      <section class="chapter" id="commit">
+        <h2><code>git commit</code> = tree と commit を作り、ref を進める</h2>
+        <p><code>git commit</code> は 3 つの plumbing 操作の組み合わせです。① index から tree を作る（<code>git write-tree</code>）② tree を指す commit を作る（<code>git commit-tree</code>）③ 今のブランチの ref をその commit ID に書き換える（<code>git update-ref</code>）。</p>
+        <div class="scene" id="sc-commit" data-title="git commit：index → tree → commit → refs/heads/main">
+          <div class="stage" data-w="960" data-h="460">
+            <div class="file" data-el="idx" style="left:20px;top:20px;width:450px">
+              <div class="file-h">.git/index</div>
+              <pre data-lang="text">100644 ce013625030ba8dba906f756967f9e9ca394464a 0  hello.txt</pre>
+            </div>
+            <div class="file tight hide" data-el="tr" style="left:20px;top:112px;width:440px">
+              <div class="file-h">tree オブジェクト<small>37 B</small></div>
+              <pre data-lang="text">100644 blob ce013625030ba8dba906f756967f9e9ca394464a  hello.txt</pre>
+              <div class="file-b bytes">生バイト：<b>100644 hello.txt\0</b> + ID の 20 バイト（ce 01 36 25 … 46 4a）</div>
+              <div class="file-b"><span class="hashv sm" data-el="trv">tree …</span></div>
+            </div>
+            <div class="file hide" data-el="cm" style="left:500px;top:20px;width:440px">
+              <div class="file-h">commit オブジェクト<small>163 B</small></div>
+              <pre data-lang="text">tree aaa96ced2d9a1c8e72c56b253a0e2fe78393feb7
+author Alice &lt;alice@example.com&gt; 1727500000 +0900
+committer Alice &lt;alice@example.com&gt; 1727500000 +0900
+
+first commit</pre>
+              <div class="file-b"><span class="hashv sm" data-el="cmv">commit …</span></div>
+            </div>
+            <div class="file hide" data-el="hd" style="left:20px;top:360px;width:196px">
+              <div class="file-h">.git/HEAD</div>
+              <pre data-lang="text">ref: refs/heads/main</pre>
+            </div>
+            <div class="file hide" data-el="rm" style="left:250px;top:360px;width:320px">
+              <div class="file-h">.git/refs/heads/main<small>41 B</small></div>
+              <pre data-lang="text" data-el="rmv">1936b6d40aeaa479cceac281d7ff7b60874b415d</pre>
+            </div>
+            <div class="file hide" data-el="ob" style="left:590px;top:344px;width:350px">
+              <div class="file-h"><i data-icon="folder"></i>.git/objects/（count: 3）</div>
+              <pre data-lang="text">19/36b6d40aeaa479cceac281d7ff7b60874b415d
+aa/a96ced2d9a1c8e72c56b253a0e2fe78393feb7
+ce/013625030ba8dba906f756967f9e9ca394464a</pre>
+            </div>
+          </div>
+        </div>
+
+        <h3>commit オブジェクトのヘッダ</h3>
+        <pre data-lang="text" data-title="git cat-file -p HEAD（2 つ目のコミット）">⟪tree⟫ 123a018a9ee40c870f50a18c60f75d9acbb3f0eb        ← ルートディレクトリの tree
+⟪parent⟫ 1936b6d40aeaa479cceac281d7ff7b60874b415d      ← 親（マージコミットなら 2 行以上、最初のコミットは無し）
+⟪author⟫ Alice &lt;alice@example.com&gt; 1727500600 +0900    ← 変更を書いた人・Unix 秒・UTC からのずれ
+⟪committer⟫ Alice &lt;alice@example.com&gt; 1727500600 +0900 ← コミットを作った人（rebase / cherry-pick で author と分かれる）
+
+add README</pre>
+        <p><code>author</code> と <code>committer</code> には時刻も入るので、<strong>同じ中身・同じメッセージでも、1 秒違えば commit ID は変わります</strong>。逆に、名前・メール・時刻を環境変数（<code>GIT_AUTHOR_DATE</code> など）で固定すれば、このページと同じ ID を手元で再現できます（「手元で試す」参照）。</p>
+      </section>
+
+      <!-- 5. branch -->
+      <section class="chapter" id="branch">
+        <h2>2 つ目のコミットとブランチ</h2>
+        <p>コミットは <code>parent</code> で過去を指す一方向のグラフ（DAG）になります。ブランチは「ある commit の ID を書いた 41 バイトのファイル」、<code>HEAD</code> は「今どのブランチにいるか」を書いたファイルにすぎません。</p>
+        <div class="scene" id="sc-branch" data-title="コミットの DAG・blob の再利用・ブランチと HEAD">
+          <div class="stage" data-w="960" data-h="480">
+            <div class="chip solid" data-el="head" style="left:104px;top:8px">HEAD ↓</div>
+            <div class="chip c-green" data-el="bmain" style="left:108px;top:44px">main ↓</div>
+            <div class="chip c-violet hide" data-el="bfeat" style="left:506px;top:44px">feature ↓</div>
+
+            <div class="node sm" data-el="c1" style="left:40px;top:80px;width:200px"><div class="node-h"><i data-icon="git"></i><b class="node-t">commit 1936b6d</b></div><div class="node-s">first commit</div></div>
+            <div class="node sm hide" data-el="c2" style="left:380px;top:80px;width:200px"><div class="node-h"><i data-icon="git"></i><b class="node-t">commit 5dd578e</b></div><div class="node-s">add README</div></div>
+            <div class="node sm hide" data-el="c3" style="left:720px;top:80px;width:200px"><div class="node-h"><i data-icon="git"></i><b class="node-t">commit 6c6efca</b></div><div class="node-s">update greeting</div></div>
+
+            <div class="node sm c-cyan" data-el="t1" style="left:40px;top:190px;width:200px"><div class="node-h"><i data-icon="folder"></i><b class="node-t">tree aaa96ce</b></div><div class="node-s">hello.txt</div></div>
+            <div class="node sm c-cyan hide" data-el="t2" style="left:380px;top:190px;width:200px"><div class="node-h"><i data-icon="folder"></i><b class="node-t">tree 123a018</b></div><div class="node-s">README.md, hello.txt</div></div>
+            <div class="node sm c-cyan hide" data-el="t3" style="left:720px;top:190px;width:200px"><div class="node-h"><i data-icon="folder"></i><b class="node-t">tree 61848c7</b></div><div class="node-s">README.md, hello.txt</div></div>
+
+            <div class="node sm c-lime" data-el="b1" style="left:40px;top:300px;width:200px"><div class="node-h"><i data-icon="file"></i><b class="node-t">blob ce01362</b></div><div class="node-s">"hello\n"</div></div>
+            <div class="node sm c-lime hide" data-el="b2" style="left:380px;top:300px;width:200px"><div class="node-h"><i data-icon="file"></i><b class="node-t">blob fc72a5c</b></div><div class="node-s">"# demo\n"</div></div>
+            <div class="node sm c-lime hide" data-el="b3" style="left:720px;top:300px;width:200px"><div class="node-h"><i data-icon="file"></i><b class="node-t">blob 94bab17</b></div><div class="node-s">"hello, git\n"</div></div>
+
+            <div class="file" data-el="rmain" style="left:16px;top:400px;width:304px">
+              <div class="file-h">.git/refs/heads/main</div>
+              <pre data-lang="text" data-el="rmainv">1936b6d40aeaa479cceac281d7ff7b60874b415d</pre>
+            </div>
+            <div class="file hide" data-el="rfeat" style="left:328px;top:400px;width:304px">
+              <div class="file-h">.git/refs/heads/feature</div>
+              <pre data-lang="text" data-el="rfeatv">5dd578e04fe83f3ed1ff46fa56e32fa9d824d1c7</pre>
+            </div>
+            <div class="file" data-el="rhead" style="left:640px;top:400px;width:304px">
+              <div class="file-h">.git/HEAD</div>
+              <pre data-lang="text" data-el="rheadv">ref: refs/heads/main</pre>
+            </div>
+          </div>
+        </div>
+        <div class="tbl">
+          <table class="ref">
+            <thead><tr><th>ファイル</th><th>中身の例</th><th>説明</th></tr></thead>
+            <tbody>
+              <tr><td><code>.git/HEAD</code></td><td><code>ref: refs/heads/main</code></td><td>シンボリック ref。detached HEAD のときは commit ID が直接書かれる</td></tr>
+              <tr><td><code>.git/refs/heads/&lt;branch&gt;</code></td><td><code>5dd578e0…d1c7</code> + LF</td><td>ローカルブランチ。<code>git branch x</code> はこのファイルを 1 つ作るだけ</td></tr>
+              <tr><td><code>.git/refs/tags/&lt;tag&gt;</code></td><td>commit または tag オブジェクトの ID</td><td>タグ</td></tr>
+              <tr><td><code>.git/refs/remotes/origin/main</code></td><td>commit ID</td><td>最後に fetch したときのリモートの位置</td></tr>
+              <tr><td><code>.git/packed-refs</code></td><td><code>5dd578e0… refs/heads/main</code></td><td><code>git gc</code> / <code>git pack-refs</code> で refs を 1 ファイルにまとめたもの。個別ファイルがあればそちらが優先</td></tr>
+              <tr><td><code>.git/logs/HEAD</code></td><td><code>&lt;旧ID&gt; &lt;新ID&gt; Alice … commit: …</code></td><td>reflog。HEAD が動いた履歴（<code>git reflog</code>）</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="note">Git 2.45 以降は <code>git init --ref-format=reftable</code> で refs をバイナリの reftable 形式（<code>.git/reftable/</code>）に保存することもできます。その場合 <code>.git/refs/heads/main</code> というファイルは作られないので、<code>cat</code> ではなく <code>git rev-parse</code> / <code>git show-ref</code> で読みます。</div>
+      </section>
+
+      <!-- 6. tamper -->
+      <section class="chapter" id="tamper">
+        <h2>改ざん検知：1 バイト変えると全部変わる</h2>
+        <p>オブジェクトの ID は中身のハッシュで、tree は blob の ID を、commit は tree と parent の ID を中身に含みます。したがって過去の blob を 1 バイトでも変えると、その ID が変わり、それを含む tree・commit・子孫の commit の ID が<strong>連鎖してすべて変わります</strong>。ブランチや他人の clone が指している ID とは一致しなくなるので、黙って過去を書き換えることはできません。</p>
+        <div class="scene" id="sc-tamper" data-title="改ざん検知：ハッシュの連鎖と git fsck">
+          <div class="stage" data-w="960" data-h="520">
+            <div class="label acc" style="left:20px;top:8px">元の履歴（git が作った値）</div>
+            <div class="label hide" data-el="rl" style="left:500px;top:8px;color:var(--red)">blob を 1 バイト書き換えると（このページで再計算）</div>
+
+            <div class="file" data-el="ob" style="left:20px;top:34px;width:440px">
+              <div class="file-h">blob（hello.txt の中身）</div>
+              <div class="file-b bytes">hello\n</div>
+              <div class="file-b"><span class="hashv sm" data-el="obv">ce013625030ba8dba906f756967f9e9ca394464a</span></div>
+            </div>
+            <div class="file" data-el="ot" style="left:20px;top:150px;width:440px">
+              <div class="file-h">tree</div>
+              <div class="file-b bytes">100644 blob <b>ce013625…</b>  hello.txt</div>
+              <div class="file-b"><span class="hashv sm" data-el="otv">aaa96ced2d9a1c8e72c56b253a0e2fe78393feb7</span></div>
+            </div>
+            <div class="file" data-el="oc1" style="left:20px;top:266px;width:440px">
+              <div class="file-h">commit「first commit」</div>
+              <div class="file-b bytes">tree <b>aaa96ced…</b> / author Alice … 1727500000 +0900</div>
+              <div class="file-b"><span class="hashv sm" data-el="oc1v">1936b6d40aeaa479cceac281d7ff7b60874b415d</span></div>
+            </div>
+            <div class="file" data-el="oc2" style="left:20px;top:382px;width:440px">
+              <div class="file-h">commit「add README」</div>
+              <div class="file-b bytes">tree 123a018a… / parent <b>1936b6d4…</b></div>
+              <div class="file-b"><span class="hashv sm" data-el="oc2v">5dd578e04fe83f3ed1ff46fa56e32fa9d824d1c7</span></div>
+            </div>
+            <div class="chip c-green" data-el="om" style="left:20px;top:486px"><i data-icon="git"></i>refs/heads/main = 5dd578e04fe8…</div>
+
+            <div class="file hide" data-el="tb" style="left:500px;top:34px;width:440px">
+              <div class="file-h">blob（改ざん後）</div>
+              <div class="file-b bytes">hell<b>O</b>\n　← 'o' (0x6f) を 'O' (0x4f) に</div>
+              <div class="file-b"><span class="hashv sm" data-el="tbv">?</span></div>
+            </div>
+            <div class="file hide" data-el="tt" style="left:500px;top:150px;width:440px">
+              <div class="file-h">tree（blob の ID が変わったので中身が変わる）</div>
+              <div class="file-b bytes">100644 blob <b>4b32b59c…</b>  hello.txt</div>
+              <div class="file-b"><span class="hashv sm" data-el="ttv">?</span></div>
+            </div>
+            <div class="file hide" data-el="tc1" style="left:500px;top:266px;width:440px">
+              <div class="file-h">commit「first commit」（中身の tree 行が変わる）</div>
+              <div class="file-b bytes">tree <b>72c7b16f…</b> / author Alice … 1727500000 +0900</div>
+              <div class="file-b"><span class="hashv sm" data-el="tc1v">?</span></div>
+            </div>
+            <div class="file stampable hide" data-el="tc2" style="left:500px;top:382px;width:440px">
+              <div class="file-h">commit「add README」（parent 行が変わる）</div>
+              <div class="file-b bytes">tree a60b20d0… / parent <b>21be53fe…</b></div>
+              <div class="file-b"><span class="hashv sm" data-el="tc2v">?</span></div>
+            </div>
+            <div class="chip c-red hide" data-el="tm" style="left:500px;top:486px"><i data-icon="x"></i>20b0b5f2… ≠ main が指す 5dd578e0…</div>
+
+            <div class="term stampable hide" data-el="tf" style="left:500px;top:34px;width:440px;height:436px"><div class="term-h">alice@laptop: ~/demo</div><div class="term-b"></div></div>
+          </div>
+        </div>
+        <pre data-lang="bash" data-title="実際に試した結果（Git 2.55）：オブジェクトファイルをすり替えた場合">$ printf 'hellO\n' | git hash-object -w --stdin
+4b32b59cf6f008703c95a6d2284f027e6ef86b54
+$ chmod u+w .git/objects/ce/013625030ba8dba906f756967f9e9ca394464a
+$ cp .git/objects/4b/32b59cf6f008703c95a6d2284f027e6ef86b54 .git/objects/ce/013625030ba8dba906f756967f9e9ca394464a
+$ git cat-file -p ce013625030ba8dba906f756967f9e9ca394464a
+hellO                          # ← 読むだけでは検証されない
+$ git fsck
+⟪error: 4b32b59cf6f008703c95a6d2284f027e6ef86b54: hash-path mismatch, found at: .git/objects/ce/013625030ba8dba906f756967f9e9ca394464a⟫
+⟪missing blob ce013625030ba8dba906f756967f9e9ca394464a⟫
+$ git clone --no-local demo copy
+⟪fatal: did not receive expected object ce013625030ba8dba906f756967f9e9ca394464a⟫
+fatal: fetch-pack: invalid index-pack output</pre>
+        <div class="note warn"><code>git cat-file</code> や <code>git checkout</code> は、ローカルの loose object を読むたびに SHA-1 を再計算しているわけではありません（上の例でも <code>hellO</code> がそのまま出ます）。検知するのは <code>git fsck</code> と、<strong>clone / fetch / push で受け取った側</strong>（<code>index-pack</code> が受信したオブジェクトの ID を計算し直す）です。エラーの文言は Git のバージョンやコードパスで異なり、<code>hash mismatch for &lt;path&gt; (expected &lt;id&gt;)</code> という形もあります。</div>
+        <p>「ID が変わる」ことで守れるのは<strong>既に ID を知っている相手</strong>に対してです。攻撃者が履歴を丸ごと作り直して新しい ID 一式を配った場合は、それが正しい履歴かは別の手段（署名付きタグ・署名付きコミット <code>git verify-commit</code> / <code>git verify-tag</code>、信頼できるリモートとの比較）で確かめます。なお Git 2.13 以降の SHA-1 は衝突攻撃を検知する SHA-1DC 実装です。</p>
+      </section>
+
+      <!-- 7. packfile -->
+      <section class="chapter" id="pack">
+        <h2>packfile：<code>git gc</code> 後の姿</h2>
+        <p>loose object はオブジェクトごとに 1 ファイルなので、数が増えると <code>git gc</code>（または自動の <code>git gc --auto</code>、push / fetch の転送）で 1 つの <code>.pack</code> にまとめられます。似た blob は<strong>差分（delta）</strong>で保存され、<code>.idx</code> が ID → pack 内オフセットの索引になります。</p>
+        <pre data-lang="bash" data-title="このページのデモリポジトリで git gc（Git 2.55）">$ git count-objects -v
+count: 9
+…
+$ git gc
+$ find .git/objects -type f
+.git/objects/info/commit-graph
+.git/objects/info/packs
+.git/objects/pack/pack-3587f7e80f5ae67c3b98b8b512659874da6ec965.idx
+.git/objects/pack/pack-3587f7e80f5ae67c3b98b8b512659874da6ec965.pack
+.git/objects/pack/pack-3587f7e80f5ae67c3b98b8b512659874da6ec965.rev
+$ cat .git/packed-refs
+# pack-refs with: peeled fully-peeled sorted
+6c6efca04b0dcda0c0810953a0a5000ab91445af refs/heads/feature
+5dd578e04fe83f3ed1ff46fa56e32fa9d824d1c7 refs/heads/main
+$ git verify-pack -v .git/objects/pack/pack-*.idx
+# ID                                     種類   サイズ 圧縮後 オフセット
+6c6efca04b0dcda0c0810953a0a5000ab91445af commit 214 150 12
+5dd578e04fe83f3ed1ff46fa56e32fa9d824d1c7 commit 209 151 162
+1936b6d40aeaa479cceac281d7ff7b60874b415d commit 163 115 313
+fc72a5c1094e203eefcd1c710f060957ebbbaac4 blob   7 16 428
+ce013625030ba8dba906f756967f9e9ca394464a blob   6 15 444
+123a018a9ee40c870f50a18c60f75d9acbb3f0eb tree   74 82 459
+61848c78bc4fad6711083996faf17e2507477606 tree   74 82 541
+94bab17c85ac96c4dd0cfcb7a16f22f6862733eb blob   11 20 623
+aaa96ced2d9a1c8e72c56b253a0e2fe78393feb7 tree   37 48 643
+non delta: 9 objects
+.git/objects/pack/pack-3587f7e80f5ae67c3b98b8b512659874da6ec965.pack: ok</pre>
+        <p>小さすぎるファイルは差分にしても得をしないので上では delta が 0 個です。400 行のファイルの 1 行だけを変えた 2 版を gc すると、次のように<strong>古い方の版</strong>が新しい版への delta（12 バイト）として保存されます（<code>git pack-objects</code> は同じパスの blob を大きい順に並べ、後ろのものを前のものへの delta にします。ファイルは育っていくことが多いので、結果的に新しい版が丸ごと・古い版が delta になりやすく、よく読む最新版の展開が速く済みます）。</p>
+        <pre data-lang="text" data-title="git verify-pack -v（delta あり）">27019aec5c428babb53e8ebf082682f55e9f1e0a blob   3500 804 263                                             ← 新しい版（全体を zlib）
+b62eabd618d27a888136f6b8d91796c4bea73742 blob   ⟪12 23⟫ 1159 ⟪1 27019aec5c428babb53e8ebf082682f55e9f1e0a⟫  ← 古い版 = delta（深さ 1・ベース）
+non delta: 5 objects
+chain length = 1: 1 object</pre>
+        <p><code>.pack</code> の先頭 12 バイトは <code>PACK</code>・バージョン（2）・オブジェクト数です（<code>gitformat-pack</code>）。<code>.rev</code> は pack 内の順序の逆引き索引、<code>commit-graph</code> は履歴走査を速くするための補助ファイルです。</p>
+      </section>
+
+      <!-- 8. SHA-256 -->
+      <section class="chapter" id="sha256">
+        <h2>SHA-256 リポジトリ</h2>
+        <p><code>git init --object-format=sha256</code> で作ったリポジトリは、同じ形式（<code>blob &lt;size&gt;\0…</code>）を SHA-256 でハッシュし、ID が 64 桁になります。ID が SHA-1 リポジトリとは別物になるため、SHA-1 のリポジトリ（多くのホスティングサービス上のもの）とそのまま push / fetch し合うことはできません。Git 3.0 では新規リポジトリの既定を SHA-256 にする計画です（<code>Documentation/BreakingChanges</code>）。</p>
+        <pre data-lang="bash" data-title="Git 2.55 で確認">$ git init -q --object-format=sha256 demo256 &amp;&amp; cd demo256
+$ cat .git/config
+[extensions]
+	objectformat = sha256
+[core]
+	repositoryformatversion = ⟪1⟫
+	…
+$ printf 'hello\n' | git hash-object --stdin
+⟪2cf8d83d9ee29543b34a87727421fdecb7e3f3a183d337639025de576db9ebb4⟫
+$ printf 'blob 6\0hello\n' | sha256sum
+2cf8d83d9ee29543b34a87727421fdecb7e3f3a183d337639025de576db9ebb4  -</pre>
+      </section>
+
+      <!-- 9. layout -->
+      <section class="chapter" id="layout">
+        <h2><code>.git</code> ツリー全体（3 コミット後）</h2>
+        <pre data-lang="tree" data-title="demo/.git（gc 前・Linux の git 2.55）">.git/
+├── COMMIT_EDITMSG            # 直前のコミットメッセージ
+├── HEAD                      # ref: refs/heads/main
+├── ORIG_HEAD                 # reset / merge / rebase 前の HEAD（操作後に作られる）
+├── config
+├── description
+├── hooks/                    # pre-commit.sample など
+├── index                     # ステージ（バイナリ、先頭 "DIRC"）
+├── info/
+│   └── exclude
+├── logs/                     # reflog
+│   ├── HEAD
+│   └── refs/heads/main, feature
+├── objects/
+│   ├── 12/3a018a9ee40c870f50a18c60f75d9acbb3f0eb   # tree（2 つ目）
+│   ├── 19/36b6d40aeaa479cceac281d7ff7b60874b415d   # commit「first commit」
+│   ├── 5d/d578e04fe83f3ed1ff46fa56e32fa9d824d1c7   # commit「add README」
+│   ├── 61/848c78bc4fad6711083996faf17e2507477606   # tree（3 つ目）
+│   ├── 6c/6efca04b0dcda0c0810953a0a5000ab91445af   # commit「update greeting」
+│   ├── 94/bab17c85ac96c4dd0cfcb7a16f22f6862733eb   # blob "hello, git\n"
+│   ├── aa/a96ced2d9a1c8e72c56b253a0e2fe78393feb7   # tree（1 つ目）
+│   ├── ce/013625030ba8dba906f756967f9e9ca394464a   # blob "hello\n"
+│   ├── fc/72a5c1094e203eefcd1c710f060957ebbbaac4   # blob "# demo\n"
+│   ├── info/
+│   └── pack/
+└── refs/
+    ├── heads/
+    │   ├── feature           # 6c6efca0…
+    │   └── main              # 5dd578e0…
+    └── tags/</pre>
+        <p>3 コミットでオブジェクトは 9 個（commit 3・tree 3・blob 3）。blob <code>ce013625…</code> と <code>fc72a5c1…</code> は複数の tree から共有されていて、ファイルとしては 1 回しか保存されていません。</p>
+      </section>
+
+      <!-- 10. plumbing -->
+      <section class="chapter" id="plumbing">
+        <h2>コマンド早見表（plumbing）</h2>
+        <div class="tbl">
+          <table class="ref">
+            <thead><tr><th>コマンド</th><th>主なフラグ</th><th>何が起きるか</th></tr></thead>
+            <tbody>
+              <tr><td><code>git hash-object file</code></td><td><code>-w</code> 書き込む, <code>--stdin</code>, <code>-t tree|commit</code></td><td>blob の ID を計算（<code>-w</code> で <code>.git/objects</code> に保存）</td></tr>
+              <tr><td><code>git cat-file -p &lt;id&gt;</code></td><td><code>-t</code> 種類, <code>-s</code> サイズ, <code>-p</code> 整形表示, <code>--batch-all-objects --batch-check</code></td><td>オブジェクトを読む</td></tr>
+              <tr><td><code>git ls-tree &lt;tree-ish&gt;</code></td><td><code>-r</code> 再帰, <code>-l</code> サイズ付き, <code>--name-only</code></td><td>tree のエントリ一覧</td></tr>
+              <tr><td><code>git ls-files --stage</code></td><td><code>-s</code>, <code>--debug</code></td><td>index の中身（mode・blob ID・stage 番号・パス）</td></tr>
+              <tr><td><code>git update-index --add --cacheinfo</code></td><td><code>100644,&lt;id&gt;,path</code></td><td>作業ツリーを介さず index にエントリを追加</td></tr>
+              <tr><td><code>git write-tree</code></td><td></td><td>index から tree オブジェクトを作り ID を出力</td></tr>
+              <tr><td><code>git mktree</code></td><td><code>--missing</code></td><td><code>ls-tree</code> 形式のテキストから tree を作る</td></tr>
+              <tr><td><code>git commit-tree &lt;tree&gt;</code></td><td><code>-p &lt;parent&gt;</code>, <code>-m msg</code></td><td>commit オブジェクトを作り ID を出力（ref は動かさない）</td></tr>
+              <tr><td><code>git update-ref refs/heads/main &lt;id&gt;</code></td><td><code>-d</code> 削除, 第 3 引数で旧値確認</td><td>ref を書き換える（reflog も記録）</td></tr>
+              <tr><td><code>git symbolic-ref HEAD</code></td><td><code>HEAD refs/heads/x</code> で変更</td><td>HEAD が指すブランチを読む / 書く</td></tr>
+              <tr><td><code>git rev-parse &lt;rev&gt;</code></td><td><code>HEAD~1</code>, <code>main^{tree}</code>, <code>--show-object-format</code></td><td>名前を ID に解決</td></tr>
+              <tr><td><code>git show-ref</code></td><td><code>--heads</code>, <code>--tags</code></td><td>refs と ID の一覧（packed-refs も含む）</td></tr>
+              <tr><td><code>git count-objects -v</code></td><td></td><td>loose / pack のオブジェクト数とサイズ</td></tr>
+              <tr><td><code>git fsck</code></td><td><code>--full</code>, <code>--unreachable</code>, <code>--lost-found</code></td><td>全オブジェクトのハッシュと接続を検査</td></tr>
+              <tr><td><code>git verify-pack -v</code></td><td></td><td>pack 内のオブジェクト・delta を一覧</td></tr>
+              <tr><td><code>git gc</code></td><td><code>--aggressive</code>, <code>--prune=now</code></td><td>loose object を pack にまとめ、不要なものを削除</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <h3>porcelain → plumbing 対応表</h3>
+        <div class="tbl">
+          <table class="ref">
+            <thead><tr><th>いつものコマンド</th><th>相当する plumbing 操作</th></tr></thead>
+            <tbody>
+              <tr><td><code>git add hello.txt</code></td><td><code>git hash-object -w hello.txt</code> + <code>git update-index --add hello.txt</code></td></tr>
+              <tr><td><code>git commit -m msg</code></td><td><code>git write-tree</code> → <code>git commit-tree &lt;tree&gt; -p HEAD -m msg</code> → <code>git update-ref HEAD &lt;commit&gt;</code></td></tr>
+              <tr><td><code>git branch feature</code></td><td><code>git update-ref refs/heads/feature HEAD</code></td></tr>
+              <tr><td><code>git switch feature</code></td><td>作業ツリーと index を <code>feature</code> の tree に合わせ、<code>git symbolic-ref HEAD refs/heads/feature</code></td></tr>
+              <tr><td><code>git switch --detach &lt;id&gt;</code></td><td>同上で、<code>.git/HEAD</code> に ID を直接書く</td></tr>
+              <tr><td><code>git tag -a v1.0 -m msg</code></td><td>tag オブジェクトを書く（<code>git mktag</code> 相当）→ <code>git update-ref refs/tags/v1.0 &lt;tag&gt;</code></td></tr>
+              <tr><td><code>git log</code></td><td>HEAD から <code>parent</code> を辿って <code>git cat-file commit</code> を繰り返す（<code>git rev-list HEAD</code>）</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- 11. try -->
+      <section class="chapter" id="try">
+        <h2>手元で試す：plumbing だけでコミットを作る</h2>
+        <p><code>git add</code> も <code>git commit</code> も使わずに、このページと<strong>まったく同じ ID</strong>のコミットを作れます（名前・メール・時刻を固定しているため）。</p>
+        <pre data-lang="bash" data-title="plumbing だけで最初のコミット">$ mkdir plumbing &amp;&amp; cd plumbing
+$ git init -q -b main
+$ printf 'hello\n' | git hash-object -w --stdin
+ce013625030ba8dba906f756967f9e9ca394464a
+$ git update-index --add --cacheinfo 100644,ce013625030ba8dba906f756967f9e9ca394464a,hello.txt
+$ git write-tree
+aaa96ced2d9a1c8e72c56b253a0e2fe78393feb7
+$ export GIT_AUTHOR_NAME=Alice GIT_AUTHOR_EMAIL=alice@example.com GIT_AUTHOR_DATE="1727500000 +0900"
+$ export GIT_COMMITTER_NAME=Alice GIT_COMMITTER_EMAIL=alice@example.com GIT_COMMITTER_DATE="1727500000 +0900"
+$ echo "first commit" | git commit-tree aaa96ced2d9a1c8e72c56b253a0e2fe78393feb7
+1936b6d40aeaa479cceac281d7ff7b60874b415d
+$ git update-ref refs/heads/main 1936b6d40aeaa479cceac281d7ff7b60874b415d
+$ git log --oneline
+1936b6d first commit
+$ git status --short
+ D hello.txt          # 作業ツリーにはまだファイルが無い
+$ git checkout -- hello.txt &amp;&amp; cat hello.txt
+hello</pre>
+        <pre data-lang="bash" data-title="ID を git を使わずに計算して確かめる">$ printf 'blob 6\0hello\n' | sha1sum
+ce013625030ba8dba906f756967f9e9ca394464a  -
+$ printf 'hello\n' | sha1sum          # ヘッダが無いと別の値
+f572d396fae9206628714fb2ce00f72e94f2258f  -
+$ git cat-file commit HEAD | wc -c
+163
+$ { printf 'commit 163\0'; git cat-file commit HEAD; } | sha1sum
+1936b6d40aeaa479cceac281d7ff7b60874b415d  -
+$ { printf 'tree 37\0'; git cat-file tree HEAD^{tree}; } | sha1sum
+aaa96ced2d9a1c8e72c56b253a0e2fe78393feb7  -</pre>
+      </section>
+
+      <!-- 12. pitfalls -->
+      <section class="chapter" id="pitfalls">
+        <h2>ハマりどころ</h2>
+        <div class="note warn"><b><code>sha1sum hello.txt</code> は git の ID と一致しない。</b>git はヘッダ <code>blob &lt;size&gt;\0</code> を付けてからハッシュします。</div>
+        <div class="note warn"><b>改行コードの自動変換で ID が変わる。</b>Windows の <code>core.autocrlf=true</code> では、作業ツリーの CRLF が LF に変換されてから blob になります。「同じファイルなのに ID が違う」ときは <code>git ls-files --eol</code> と <code>.gitattributes</code> を確認します。</div>
+        <div class="note warn"><b>空のディレクトリはコミットできない。</b>tree のエントリは blob か tree で、空の tree を指すエントリは <code>git add</code> では作られません。慣習として <code>.gitkeep</code> を置きます。</div>
+        <div class="note warn"><b>tree 内の mode は <code>40000</code>。</b>生のオブジェクトではディレクトリの mode は先頭 0 なしの <code>40000</code> ですが、<code>git ls-tree</code> は <code>040000</code> と 6 桁で表示します。自前でパースするときの落とし穴です。</div>
+        <div class="note warn"><b>ブランチを消してもコミットはすぐには消えない。</b>refs から辿れなくなった commit も reflog（既定 90 日、到達不能なものは 30 日）と <code>gc.pruneExpire</code>（既定 2 週間）の間は残ります。<code>git reflog</code> で ID を探して <code>git branch rescue &lt;id&gt;</code> で戻せます。</div>
+        <div class="note warn"><b>detached HEAD でのコミット。</b><code>.git/HEAD</code> に ID が直接書かれた状態でコミットすると、どのブランチも指さない commit ができます。別のブランチに <code>switch</code> すると辿れなくなるので、残すなら先に <code>git switch -c &lt;name&gt;</code>。</div>
+        <div class="note warn"><b><code>.git/refs/heads/</code> を直接 <code>cat</code> しても無いことがある。</b><code>git gc</code> 後は <code>.git/packed-refs</code> に、reftable 形式なら <code>.git/reftable/</code> に入っています。スクリプトでは <code>git rev-parse</code> を使います。</div>
+      </section>
+
+      <!-- 13. spec -->
+      <section class="chapter" id="spec">
+        <h2>仕様・参考</h2>
+        <ul>
+          <li><a href="https://git-scm.com/book/en/v2/Git-Internals-Plumbing-and-Porcelain" target="_blank" rel="noopener">Pro Git — 10. Git Internals</a>（<a href="https://git-scm.com/book/en/v2/Git-Internals-Git-Objects" target="_blank" rel="noopener">Git Objects</a> / <a href="https://git-scm.com/book/en/v2/Git-Internals-Git-References" target="_blank" rel="noopener">Git References</a> / <a href="https://git-scm.com/book/en/v2/Git-Internals-Packfiles" target="_blank" rel="noopener">Packfiles</a>）</li>
+          <li><a href="https://git-scm.com/docs/gitrepository-layout" target="_blank" rel="noopener">gitrepository-layout</a> — <code>.git</code> 以下の各ファイルの意味</li>
+          <li><a href="https://git-scm.com/docs/gitformat-index" target="_blank" rel="noopener">gitformat-index</a> — <code>.git/index</code> のバイナリ形式</li>
+          <li><a href="https://git-scm.com/docs/gitformat-pack" target="_blank" rel="noopener">gitformat-pack</a> — packfile と <code>.idx</code> の形式</li>
+          <li><a href="https://git-scm.com/docs/hash-function-transition" target="_blank" rel="noopener">hash-function-transition</a> — SHA-1 から SHA-256 への移行設計</li>
+          <li><a href="https://git-scm.com/docs/git-cat-file" target="_blank" rel="noopener">git-cat-file</a> / <a href="https://git-scm.com/docs/git-hash-object" target="_blank" rel="noopener">git-hash-object</a> / <a href="https://git-scm.com/docs/git-commit-tree" target="_blank" rel="noopener">git-commit-tree</a> / <a href="https://git-scm.com/docs/git-update-ref" target="_blank" rel="noopener">git-update-ref</a> / <a href="https://git-scm.com/docs/git-fsck" target="_blank" rel="noopener">git-fsck</a></li>
+          <li><a href="https://git-scm.com/docs/gitglossary" target="_blank" rel="noopener">gitglossary</a>（blob / tree / commit / unborn branch / detached HEAD の定義）</li>
+          <li>関連ページ：<a href="../ssh/">SSH</a>（<code>git@github.com:</code> で push するときの鍵交換と公開鍵認証）</li>
+        </ul>
+      </section>
+
+    </main>
+  </div>
+
+  <footer class="site-f"></footer>
+  <script src="../../assets/js/topics.js"></script>
+  <script src="../../assets/js/tim.js"></script>
+  <script src="scenes.js"></script>
+</body>
+</html>

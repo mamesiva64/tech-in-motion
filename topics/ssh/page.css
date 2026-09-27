@@ -1,0 +1,14 @@
+/* SSH — page-specific styles */
+.lab-out {
+  margin-top: 12px;
+  min-height: 4.5em;
+  border: 1px solid var(--line2);
+  border-radius: 9px;
+  background: #060a12;
+}
+.stage .divider { border-left: 1px dashed var(--line2); }
+.stage .file-b + .file-b { border-top: 1px dashed var(--line); }
+/* stamps on .file / .term: those parts clip overflow by default */
+.stage .stampable { overflow: visible; }
+.stage .stampable > .file-h, .stage .stampable > .term-h { border-radius: 9px 9px 0 0; }
+.lab label code { text-transform: none; letter-spacing: 0; }

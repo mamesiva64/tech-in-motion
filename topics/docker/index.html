@@ -116,7 +116,7 @@ Restart=always</pre>
         <p>Docker Engine 23.0 以降、<code>docker build</code> は <code>docker buildx build</code> の別名で、ビルドは dockerd に内蔵された <strong>BuildKit</strong> が行います。CLI はまず <strong>build context</strong>（最後の引数のディレクトリ）を <code>.dockerignore</code> で絞り込んで送り、BuildKit は Dockerfile の命令を 1 つずつ実行して、ファイルシステムの差分を <strong>レイヤー（tar）</strong>として積み上げます。</p>
 
         <div class="scene" id="sc-build" data-title="docker build：context → BuildKit → レイヤーとキャッシュ">
-          <div class="stage" data-w="960" data-h="520">
+          <div class="stage" data-w="960" data-h="576">
             <div class="file" data-el="ctx" style="left:16px;top:16px;width:250px">
               <div class="file-h">~/web/（build context）</div>
               <div class="file-b">
@@ -458,7 +458,7 @@ CMD ["node", "server.js"]</pre>
         <p>ホストから見ればコンテナは<strong>普通のプロセス</strong>です。違うのは、<code>runc</code> が <code>clone(2)</code> に <code>CLONE_NEWPID</code> などのフラグを付けて「見える世界」を分け（namespaces）、<code>/sys/fs/cgroup/…/memory.max</code> などに書き込んで「使える量」を制限（cgroup）している点だけです。</p>
 
         <div class="scene" id="sc-ns" data-title="PID 4321 と PID 1 は同じプロセス：/proc/&lt;pid&gt;/ns と cgroup ファイル">
-          <div class="stage" data-w="960" data-h="520">
+          <div class="stage" data-w="960" data-h="576">
             <div class="zone" data-label="host の PID namespace（ps）" style="left:16px;top:16px;width:450px;height:286px"></div>
             <div class="node lrow" data-el="h1" style="left:32px;top:40px;width:230px">
               <b class="node-t">systemd</b><div class="node-s">PID 1</div>

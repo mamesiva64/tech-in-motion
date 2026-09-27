@@ -1,0 +1,640 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SSH — Tech in Motion</title>
+  <meta name="description" content="ssh-keygen が作るファイル、鍵交換とホスト鍵確認（known_hosts）、公開鍵認証（authorized_keys と署名）、ssh -v の読み方、よくあるエラーを OpenSSH の実際の出力で。">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Space+Grotesk:wght@500;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="../../assets/css/tim.css">
+  <link rel="stylesheet" href="page.css">
+</head>
+<body data-root="../../" data-topic="ssh">
+  <header class="site-h"></header>
+
+  <div class="page">
+    <aside class="toc"></aside>
+    <main class="doc">
+
+      <!-- 0. HERO -->
+      <section class="hero">
+        <p class="kicker">Network · Secure Shell</p>
+        <h1>SSH<small>鍵交換・ホスト鍵確認・公開鍵認証を、実際のファイルとメッセージで</small></h1>
+        <p class="lead"><code>ssh alice@server.example.com</code> の 1 行の裏で、クライアントとサーバーは「暗号路を作る（鍵交換）」「相手が本物のサーバーか確かめる（ホスト鍵）」「ユーザーが鍵の持ち主か確かめる（公開鍵認証）」の 3 段階を踏みます。このページでは、それぞれで<strong>どのファイルが読まれ、どのバイト列に誰が署名し、どこで検証されるか</strong>を OpenSSH 10.3 の実際の出力で追います。</p>
+        <div class="facts">
+          <div class="fact"><span>クライアントの鍵</span><b><code>~/.ssh/id_ed25519</code>（600）と <code>id_ed25519.pub</code></b></div>
+          <div class="fact"><span>サーバーが照合</span><b><code>~/.ssh/authorized_keys</code>・<code>/etc/ssh/ssh_host_ed25519_key</code></b></div>
+          <div class="fact"><span>ホストの確認</span><b><code>~/.ssh/known_hosts</code> の公開鍵で交換ハッシュ H の署名を検証</b></div>
+          <div class="fact"><span>仕様</span><b>RFC 4251–4254 / RFC 8709 / RFC 8731</b></div>
+        </div>
+      </section>
+
+      <!-- 1. 全体像 -->
+      <section class="chapter" id="overview">
+        <h2>全体像：どのファイルがどこで使われるか</h2>
+        <p>SSH の鍵は 2 種類あります。<strong>ユーザー鍵</strong>（クライアントの <code>~/.ssh/id_ed25519</code>）は「このユーザーは本人か」を、<strong>ホスト鍵</strong>（サーバーの <code>/etc/ssh/ssh_host_ed25519_key</code>）は「このサーバーは本物か」を証明します。どちらも公開鍵だけを相手側に登録し（<code>authorized_keys</code> / <code>known_hosts</code>）、秘密鍵は持ち主のマシンから出ません。</p>
+        <div class="tbl">
+          <table class="ref">
+            <thead><tr><th>段階</th><th>仕様</th><th>どこで</th><th>使うファイル</th><th>何が起きるか</th></tr></thead>
+            <tbody>
+              <tr><td>トランスポート層</td><td>RFC 4253</td><td>ssh ⇄ sshd（TCP 22）</td><td><code>/etc/ssh/ssh_host_ed25519_key</code>（サーバー）<br><code>~/.ssh/known_hosts</code>（クライアント）</td><td>アルゴリズム交渉 → 鍵共有 → サーバーがホスト鍵で交換ハッシュ H に署名 → クライアントが known_hosts の公開鍵で検証 → 暗号化開始</td></tr>
+              <tr><td>ユーザー認証</td><td>RFC 4252</td><td>暗号化済みの経路上</td><td><code>~/.ssh/id_ed25519</code> または ssh-agent（クライアント）<br><code>~/.ssh/authorized_keys</code>（サーバー）</td><td>クライアントがセッション識別子を含むデータにユーザー秘密鍵で署名 → サーバーが authorized_keys の公開鍵で検証</td></tr>
+              <tr><td>コネクション層</td><td>RFC 4254</td><td>認証後のセッション</td><td><code>~/.ssh/config</code>・<code>/etc/ssh/sshd_config</code></td><td>シェル・コマンド実行・ポートフォワード（<code>-L</code> <code>-R</code> <code>-D</code>）をチャネルとして多重化</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>最初のシーンでは、鍵ペアを作ってサーバーに登録するまでを追います。左がクライアント（alice のノート PC）、右がサーバーです。</p>
+
+        <div class="scene" id="sc-keys" data-title="鍵の生成と登録：ssh-keygen → ssh-copy-id">
+          <div class="stage" data-w="960" data-h="500">
+            <div class="zone" data-label="alice@laptop · 198.51.100.7" style="left:16px;top:18px;width:560px;height:466px"></div>
+            <div class="zone c-green" data-label="server.example.com · 203.0.113.10" style="left:592px;top:18px;width:352px;height:466px"></div>
+
+            <div class="term" data-el="tk" style="left:32px;top:40px;width:528px;height:206px"><div class="term-h">alice@laptop: ~ (bash)</div><div class="term-b"></div></div>
+            <div class="file hide" data-el="priv" style="left:32px;top:262px;width:282px">
+              <div class="file-h">~/.ssh/id_ed25519<small>秘密鍵</small></div>
+              <pre data-lang="pem">-----BEGIN OPENSSH PRIVATE KEY-----
+b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAA…
+（デモ用・以下省略）
+-----END OPENSSH PRIVATE KEY-----</pre>
+            </div>
+            <div class="file hide" data-el="pub" style="left:326px;top:262px;width:234px">
+              <div class="file-h">~/.ssh/id_ed25519.pub<small>公開鍵</small></div>
+              <div class="file-b bytes"><b>ssh-ed25519</b> AAAAC3NzaC1lZDI1NTE5AAAAIICs0g2weZhh4dhLtKRKd8Snoru8mXVH0iYNbsqPHJFp <b>you@example.com</b></div>
+            </div>
+            <dl class="kv hide" data-el="perm" style="left:326px;top:372px;width:234px">
+              <dt>drwx------</dt><dd>~/.ssh/ (700)</dd>
+              <dt>-rw-------</dt><dd>id_ed25519 (600)</dd>
+              <dt>-rw-r--r--</dt><dd>id_ed25519.pub (644)</dd>
+            </dl>
+            <div class="chip hide" data-el="fp" style="left:32px;top:440px"><i data-icon="hash"></i><span data-el="fpv">SHA256:…</span></div>
+
+            <div class="node c-green" data-el="sshd" style="left:608px;top:40px;width:320px">
+              <div class="node-h"><i data-icon="server"></i><b class="node-t">sshd</b></div>
+              <div class="node-s">OpenSSH_10.3 · 203.0.113.10:22<br>AuthorizedKeysFile .ssh/authorized_keys</div>
+            </div>
+            <div class="term hide" data-el="ts" style="left:608px;top:136px;width:320px;height:118px"><div class="term-h">sshd が起動したシェル（alice 権限）</div><div class="term-b"></div></div>
+            <div class="file hide" data-el="ak" style="left:608px;top:270px;width:320px">
+              <div class="file-h">/home/alice/.ssh/authorized_keys<small>600</small></div>
+              <div class="file-b bytes" data-el="akb">（空）</div>
+            </div>
+            <dl class="kv hide" data-el="sperm" style="left:608px;top:376px;width:320px">
+              <dt>drwx------</dt><dd>/home/alice/.ssh/ (700)</dd>
+              <dt>-rw-------</dt><dd>authorized_keys (600)</dd>
+            </dl>
+            <div class="chip hide" data-el="acc" style="left:608px;top:440px"><i data-icon="check"></i>Accepted publickey for alice</div>
+          </div>
+        </div>
+      </section>
+
+      <!-- 2. 鍵ファイルの中身 -->
+      <section class="chapter" id="keyfiles">
+        <h2>鍵ファイルの中身</h2>
+        <h3>公開鍵 <code>id_ed25519.pub</code>：1 行 3 フィールド</h3>
+        <pre data-lang="text" data-title="~/.ssh/id_ed25519.pub（デモ鍵・97 バイト）">⟪ssh-ed25519⟫ AAAAC3NzaC1lZDI1NTE5AAAAIICs0g2weZhh4dhLtKRKd8Snoru8mXVH0iYNbsqPHJFp ⟪you@example.com⟫</pre>
+        <div class="tbl">
+          <table class="ref">
+            <thead><tr><th>フィールド</th><th>中身</th><th>説明</th></tr></thead>
+            <tbody>
+              <tr><td><code>ssh-ed25519</code></td><td>鍵の種類</td><td>他に <code>ecdsa-sha2-nistp256</code>、<code>ssh-rsa</code>、<code>sk-ssh-ed25519@openssh.com</code>（FIDO セキュリティキー）など</td></tr>
+              <tr><td><code>AAAAC3Nz…</code></td><td>鍵 blob の base64（68 文字）</td><td>デコードすると 51 バイト：<code>00 00 00 0b</code> + <code>"ssh-ed25519"</code> + <code>00 00 00 20</code> + 公開鍵 32 バイト（RFC 8709 §4）。先頭が必ず <code>AAAAC3NzaC1lZDI1NTE5AAAAI</code> になるのはこのため</td></tr>
+              <tr><td><code>you@example.com</code></td><td>コメント</td><td><code>-C</code> で指定した任意の文字列。認証には使われません（<code>ssh-keygen -c</code> で変更可）</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <pre data-lang="bash" data-title="blob をバイト列に戻す">$ awk '{print $2}' ~/.ssh/id_ed25519.pub | base64 -d | xxd
+00000000: ⟪0000 000b⟫ 7373 682d 6564 3235 3531 3900  ....ssh-ed25519.
+00000010: ⟪0000 20⟫80 acd2 0db0 7998 61e1 d84b b4a4  .. .....y.a..K..
+00000020: 4a77 c4a7 a2bb bc99 7547 d226 0d6e ca8f  Jw......uG.&amp;.n..
+00000030: 1c91 69                                  ..i</pre>
+
+        <h3>フィンガープリント = base64( SHA-256( 鍵 blob ) )</h3>
+        <p><code>ssh-keygen -lf</code> や接続時のプロンプトに出る <code>SHA256:…</code> は、上の 51 バイトの SHA-256 を base64 にして末尾の <code>=</code> を削ったもの（43 文字）です。コメントは含まれません。下のラボはこのページ上で WebCrypto を使って実際に計算します。</p>
+        <pre data-lang="bash" data-title="ssh-keygen を使わずに同じ値を出す">$ ssh-keygen -lf ~/.ssh/id_ed25519.pub
+256 SHA256:1CJKc5w5H5JWqOQ3uHI55fN1NgyxwAOiwqyegCepEQ0 you@example.com (ED25519)
+
+$ awk '{print $2}' ~/.ssh/id_ed25519.pub | base64 -d | openssl dgst -sha256 -binary | base64 | tr -d '='
+1CJKc5w5H5JWqOQ3uHI55fN1NgyxwAOiwqyegCepEQ0</pre>
+
+        <div class="lab" id="lab-fp">
+          <div class="lab-h">LAB · 公開鍵のフィンガープリントを計算する</div>
+          <label for="fp-in"><code>*.pub</code> の 1 行（または <code>known_hosts</code> の行）を貼り付け</label>
+          <textarea id="fp-in" rows="3" spellcheck="false">ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIICs0g2weZhh4dhLtKRKd8Snoru8mXVH0iYNbsqPHJFp you@example.com</textarea>
+          <div class="btns"><button class="btn pri" type="button" id="fp-go">計算する</button><button class="btn" type="button" id="fp-host">サーバーのホスト鍵（デモ）</button></div>
+          <pre data-lang="text" data-bare id="fp-out" class="lab-out"></pre>
+        </div>
+
+        <h3>秘密鍵 <code>id_ed25519</code>：openssh-key-v1 形式</h3>
+        <p>見た目は PEM ですが中身は PKCS#8 ではなく、OpenSSH 独自の <code>openssh-key-v1</code> 形式です（仕様は OpenSSH 付属の <code>PROTOCOL.key</code>）。パスフレーズなしだと <code>ciphername</code> が <code>none</code>、ありだと <code>aes256-ctr</code> と KDF <code>bcrypt</code> になり、秘密鍵部分が暗号化されます。</p>
+        <pre data-lang="text" data-title="base64 を戻した先頭（パスフレーズなしのデモ鍵）">"openssh-key-v1\0"          マジック
+00000004 "none"             ciphername   （パスフレーズありなら "aes256-ctr"）
+00000004 "none"             kdfname      （同 "bcrypt"）
+00000000                    kdfoptions   （同 salt と rounds）
+00000001                    鍵の個数
+00000033 ⟪公開鍵 blob 51 B⟫    .pub と同じ blob
+00000098 ⟪秘密セクション 152 B⟫ checkint×2・鍵種別・公開鍵・秘密鍵・コメント・padding</pre>
+        <div class="note tip">秘密鍵ファイルから公開鍵は復元できます：<code>ssh-keygen -y -f ~/.ssh/id_ed25519 &gt; id_ed25519.pub</code>。逆（公開鍵 → 秘密鍵）はできません。</div>
+      </section>
+
+      <!-- 3. 接続とホスト認証 -->
+      <section class="chapter" id="hostauth">
+        <h2>接続とホスト認証（鍵交換）</h2>
+        <p>ユーザー認証より<strong>先に</strong>、サーバーの本人確認と暗号化が済みます。サーバーはホスト秘密鍵 <code>/etc/ssh/ssh_host_ed25519_key</code> で「この接続の交換ハッシュ H」に署名し、クライアントは <code>~/.ssh/known_hosts</code> に保存したホスト公開鍵でそれを検証します。H にはこの接続でしか出てこない一時鍵が入るので、署名を使い回すことはできません。</p>
+
+        <div class="scene" id="sc-kex" data-title="接続とホスト認証：KEXINIT → 鍵共有 → 署名検証 → NEWKEYS">
+          <div class="stage" data-w="960" data-h="540">
+            <div class="node" data-el="cl" style="left:20px;top:14px;width:196px">
+              <div class="node-h"><i data-icon="laptop"></i><b class="node-t">ssh（client）</b></div>
+              <div class="node-s">OpenSSH_10.3 · laptop</div>
+            </div>
+            <div class="node c-green" data-el="sv" style="left:424px;top:14px;width:196px">
+              <div class="node-h"><i data-icon="server"></i><b class="node-t">sshd（server）</b></div>
+              <div class="node-s">OpenSSH_10.3 · :22</div>
+            </div>
+            <div class="divider" style="left:118px;top:82px;height:296px"></div>
+            <div class="divider" style="left:522px;top:82px;height:296px"></div>
+
+            <div class="file hide" data-el="kexc" style="left:640px;top:14px;width:304px">
+              <div class="file-h">KEXINIT の交渉結果</div>
+              <div class="file-b"><dl class="kv">
+                <dt>kex</dt><dd class="acc">mlkem768x25519-sha256</dd>
+                <dt>hostkey</dt><dd class="acc">ssh-ed25519</dd>
+                <dt>cipher</dt><dd class="acc">chacha20-poly1305@openssh.com</dd>
+                <dt>mac</dt><dd>&lt;implicit&gt;（AEAD）</dd>
+                <dt>comp</dt><dd>none</dd>
+              </dl></div>
+            </div>
+            <div class="file stampable hide" data-el="hc" style="left:640px;top:162px;width:304px">
+              <div class="file-h">交換ハッシュ H（SHA-256）</div>
+              <pre data-lang="text">H = SHA-256( V_C, V_S,   バナー
+             I_C, I_S,   KEXINIT
+             K_S,        ホスト公開鍵
+             Q_C, Q_S, K )</pre>
+              <div class="file-b bytes" data-el="hv">H = …</div>
+              <div class="file-b bytes hide" data-el="hsig">sig = Ed25519-Sign(ssh_host_ed25519_key, H)</div>
+            </div>
+            <div class="file hide" data-el="kh" style="left:640px;top:388px;width:304px">
+              <div class="file-h">~/.ssh/known_hosts</div>
+              <div class="file-b bytes" data-el="khb">（server.example.com の行なし）</div>
+            </div>
+            <div class="file hide" data-el="keys" style="left:640px;top:14px;width:304px">
+              <div class="file-h">NEWKEYS 後の鍵（RFC 4253 §7.2）</div>
+              <pre data-lang="text">IV  c→s = HASH(K‖H‖"A"‖session_id)
+Key c→s = HASH(K‖H‖"C"‖session_id)
+MAC c→s = HASH(K‖H‖"E"‖session_id)</pre>
+            </div>
+            <div class="chip c-green hide" data-el="note" style="left:170px;top:360px"><i data-icon="shieldok"></i>ユーザー名もパスワードもまだ送っていない</div>
+            <div class="term" data-el="tc" style="left:16px;top:392px;width:608px;height:134px"><div class="term-h">alice@laptop: ~</div><div class="term-b"></div></div>
+          </div>
+        </div>
+
+        <h3>SSH_MSG_KEXINIT の中身（RFC 4253 §7.1）</h3>
+        <p>両者が同時に送り合う「使えるアルゴリズムの一覧」です。各項目は<strong>クライアントの一覧の先頭から見て、サーバーも持っている最初のもの</strong>が選ばれます。一覧は <code>ssh -Q kex</code>（対応しているもの）や <code>ssh -G host | grep -i kexalgorithms</code>（実際に使う設定値）で確認できます。</p>
+        <pre data-lang="text" data-title="SSH_MSG_KEXINIT（payload）">byte       SSH_MSG_KEXINIT (20)
+byte[16]   cookie（乱数）
+name-list  kex_algorithms            mlkem768x25519-sha256,sntrup761x25519-sha512,…,⟪ext-info-c,kex-strict-c-v00@openssh.com⟫
+name-list  server_host_key_algorithms  ssh-ed25519-cert-v01@openssh.com,…,ssh-ed25519,ecdsa-sha2-nistp256,…
+name-list  encryption_algorithms_client_to_server  chacha20-poly1305@openssh.com,aes128-gcm@openssh.com,aes256-gcm@openssh.com,aes128-ctr,…
+name-list  encryption_algorithms_server_to_client  （同上）
+name-list  mac_algorithms_client_to_server  umac-64-etm@openssh.com,umac-128-etm@openssh.com,hmac-sha2-256-etm@openssh.com,…
+name-list  mac_algorithms_server_to_client  （同上）
+name-list  compression_algorithms_client_to_server  none,zlib@openssh.com
+name-list  compression_algorithms_server_to_client  none,zlib@openssh.com
+name-list  languages_client_to_server  （空）
+name-list  languages_server_to_client  （空）
+boolean    first_kex_packet_follows
+uint32     0（予約）</pre>
+        <p><code>ext-info-c</code> と <code>kex-strict-c-v00@openssh.com</code> はアルゴリズムではなく「拡張に対応している」という印です（前者は RFC 8308 の <code>SSH_MSG_EXT_INFO</code>、後者は Terrapin 攻撃対策の strict KEX）。</p>
+
+        <h3>OpenSSH の既定の鍵交換アルゴリズム（バージョン別）</h3>
+        <div class="tbl">
+          <table class="ref">
+            <thead><tr><th>バージョン</th><th>既定で最優先の kex</th><th>備考</th></tr></thead>
+            <tbody>
+              <tr><td><code>OpenSSH 10.0</code> 以降（2025-04）</td><td><code>mlkem768x25519-sha256</code></td><td>ML-KEM-768（FIPS 203）と X25519 のハイブリッド。10.1 からは、耐量子でない kex が選ばれると <code>** WARNING: connection is not using a post-quantum key exchange algorithm.</code> と表示（<code>WarnWeakCrypto</code>）</td></tr>
+              <tr><td><code>OpenSSH 9.0</code>〜<code>9.9</code></td><td><code>sntrup761x25519-sha512@openssh.com</code></td><td>Streamlined NTRU Prime と X25519 のハイブリッド。9.9 で <code>mlkem768x25519-sha256</code> が追加（既定ではない）</td></tr>
+              <tr><td><code>OpenSSH 8.9</code> 以前</td><td><code>curve25519-sha256</code></td><td>X25519 の ECDH（RFC 8731）</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>どれも同じメッセージ（<code>SSH_MSG_KEX_ECDH_INIT</code> (30) / <code>SSH_MSG_KEX_ECDH_REPLY</code> (31)）でやり取りします。違うのは中身の大きさで、<code>curve25519-sha256</code> では <code>Q_C</code>・<code>Q_S</code> は 32 バイトの X25519 公開鍵、<code>mlkem768x25519-sha256</code> では <code>Q_C</code> = ML-KEM-768 公開鍵 1184 バイト ‖ X25519 公開鍵 32 バイト、<code>Q_S</code> = ML-KEM 暗号文 1088 バイト ‖ X25519 公開鍵 32 バイトになります。</p>
+
+        <h3><code>known_hosts</code> の書式</h3>
+        <pre data-lang="text" data-title="~/.ssh/known_hosts">server.example.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBEDErqZ2CAGW7Qa5VehKWuP8A/nse1EVt8vPduCPiHr
+[git.example.com]:2222 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI…        # 22 以外のポートは [host]:port
+⟪|1|FFrdmEesy6T53v8juoCrA1YcMH0=|jgsKpqc3dA1gvgjV9IA+gXPG/gE=⟫ ssh-ed25519 AAAAC3Nz…  # HashKnownHosts yes のときのホスト名ハッシュ
+@cert-authority *.example.com ssh-ed25519 AAAAC3Nz…                  # ホスト証明書の CA を信頼する行</pre>
+        <p>1 行 = 「ホスト名（カンマ区切り可）・鍵の種類・base64 の公開鍵 blob」。<code>|1|salt|hash</code> は <code>HashKnownHosts yes</code>（Debian/Ubuntu の <code>/etc/ssh/ssh_config</code> では有効）で書かれたもので、ホスト名を HMAC-SHA1 で隠しています。探すときは <code>ssh-keygen -F server.example.com</code> を使います。</p>
+      </section>
+
+      <!-- 4. ユーザー認証 -->
+      <section class="chapter" id="userauth">
+        <h2>ユーザー認証（publickey）</h2>
+        <p>暗号化が始まった後、クライアントは「この公開鍵で認証したい」と申し出て、サーバーが <code>authorized_keys</code> に載っていると答えたら、<strong>セッション識別子（最初の鍵交換の H）を含むデータ</strong>に秘密鍵で署名して送ります。署名対象にセッション固有の値が入るので、盗聴した署名を別の接続で再利用することはできません。</p>
+
+        <div class="scene" id="sc-auth" data-title="公開鍵認証：authorized_keys の照合と署名">
+          <div class="stage" data-w="960" data-h="500">
+            <div class="node" data-el="ssh" style="left:24px;top:22px;width:210px">
+              <div class="node-h"><i data-icon="laptop"></i><b class="node-t">ssh（client）</b></div>
+              <div class="node-s">alice@laptop</div>
+            </div>
+            <div class="node c-green" data-el="sshd" style="left:726px;top:22px;width:210px">
+              <div class="node-h"><i data-icon="server"></i><b class="node-t">sshd（server）</b></div>
+              <div class="node-s">server.example.com:22</div>
+            </div>
+            <div class="chip hide" data-el="enc" style="left:360px;top:8px"><i data-icon="lock"></i>chacha20-poly1305 で暗号化済み</div>
+
+            <div class="node c-violet hide" data-el="agent" style="left:24px;top:136px;width:210px">
+              <div class="node-h"><i data-icon="key"></i><b class="node-t">ssh-agent</b></div>
+              <div class="node-s">$SSH_AUTH_SOCK</div>
+              <div class="chip" data-el="skey"><i data-icon="lock"></i>id_ed25519 秘密鍵</div>
+            </div>
+
+            <div class="file hide" data-el="sd" style="left:250px;top:112px;width:364px">
+              <div class="file-h">署名対象データ（RFC 4252 §7 / PROTOCOL 3.1）</div>
+              <pre data-lang="text">string  session_id  (= 最初の H, 32 B)
+byte    50  SSH_MSG_USERAUTH_REQUEST
+string  "alice"
+string  "ssh-connection"
+string  "publickey-hostbound-v00@openssh.com"
+bool    TRUE
+string  "ssh-ed25519"
+string  ユーザー公開鍵 blob (51 B)
+string  サーバーのホスト公開鍵 blob</pre>
+            </div>
+            <div class="file hide" data-el="sig" style="left:250px;top:318px;width:364px">
+              <div class="file-h">署名（Ed25519・64 バイト）<small data-el="signote"></small></div>
+              <div class="file-b bytes" data-el="sigv">…</div>
+            </div>
+
+            <div class="file stampable hide" data-el="ak" style="left:630px;top:112px;width:314px">
+              <div class="file-h">~alice/.ssh/authorized_keys</div>
+              <div class="file-b bytes"><b>ssh-ed25519</b> AAAAC3NzaC1lZDI1NTE5AAAAIICs0g2weZhh4dhLtKRKd8Snoru8mXVH0iYNbsqPHJFp you@example.com</div>
+            </div>
+            <div class="term hide" data-el="log" style="left:630px;top:222px;width:314px;height:168px"><div class="term-h">server: journalctl -u ssh -f</div><div class="term-b"></div></div>
+
+            <div class="label hide" data-el="wl" style="left:24px;top:262px">ネットワークに流れたもの</div>
+            <div class="chip hide" data-el="w1" style="left:24px;top:288px"><i data-icon="key"></i>公開鍵 blob</div>
+            <div class="chip hide" data-el="w2" style="left:24px;top:322px"><i data-icon="sign"></i>署名 64 B</div>
+            <div class="chip c-red hide" data-el="w3" style="left:24px;top:356px"><i data-icon="x"></i>秘密鍵は送られない</div>
+          </div>
+        </div>
+
+        <h3>署名されるデータと、サーバーの検証</h3>
+        <p>RFC 4252 §7 の <code>publickey</code> 方式では、署名対象は「セッション識別子 + 認証要求メッセージそのもの」です。OpenSSH 8.9 以降の組み合わせでは、サーバーが <code>SSH_MSG_EXT_INFO</code> で <code>publickey-hostbound@openssh.com</code> を通知すると、クライアントは <code>publickey-hostbound-v00@openssh.com</code> 方式を使い、<strong>サーバーのホスト公開鍵</strong>も署名対象に加えます（ssh-agent の転送先制限 <code>ssh-add -h</code> のため）。</p>
+        <div class="tbl">
+          <table class="ref">
+            <thead><tr><th>メッセージ</th><th>番号</th><th>向き</th><th>中身</th></tr></thead>
+            <tbody>
+              <tr><td><code>SSH_MSG_SERVICE_REQUEST</code></td><td>5</td><td>c → s</td><td><code>"ssh-userauth"</code></td></tr>
+              <tr><td><code>SSH_MSG_USERAUTH_REQUEST</code></td><td>50</td><td>c → s</td><td>ユーザー名・<code>"ssh-connection"</code>・方式名・（publickey なら）署名有無・アルゴリズム・公開鍵・署名</td></tr>
+              <tr><td><code>SSH_MSG_USERAUTH_FAILURE</code></td><td>51</td><td>s → c</td><td>続けて使える方式の一覧（<code>publickey,password</code>）</td></tr>
+              <tr><td><code>SSH_MSG_USERAUTH_PK_OK</code></td><td>60</td><td>s → c</td><td>「その公開鍵なら受け付ける。署名を送れ」</td></tr>
+              <tr><td><code>SSH_MSG_USERAUTH_SUCCESS</code></td><td>52</td><td>s → c</td><td>認証成功</td></tr>
+              <tr><td><code>SSH_AGENTC_SIGN_REQUEST</code></td><td>13</td><td>ssh → agent</td><td>公開鍵 blob・署名対象データ・flags（<code>$SSH_AUTH_SOCK</code> の UNIX ソケット経由）</td></tr>
+              <tr><td><code>SSH_AGENT_SIGN_RESPONSE</code></td><td>14</td><td>agent → ssh</td><td>署名</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3><code>authorized_keys</code> のオプション</h3>
+        <p>行頭にオプションを書くと、その鍵でできることを絞れます（<code>man sshd</code> の AUTHORIZED_KEYS FILE FORMAT）。</p>
+        <pre data-lang="text" data-title="~/.ssh/authorized_keys">ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIICs0g2weZhh4dhLtKRKd8Snoru8mXVH0iYNbsqPHJFp you@example.com
+⟪from="198.51.100.0/24"⟫ ssh-ed25519 AAAAC3Nz… ci@example.com           # 接続元を限定
+⟪restrict,command="/usr/local/bin/backup.sh"⟫ ssh-ed25519 AAAAC3Nz… backup  # 転送・pty を全部禁止し、コマンドを固定</pre>
+      </section>
+
+      <!-- 5. ssh -v -->
+      <section class="chapter" id="verbose">
+        <h2><code>ssh -v</code> を読む</h2>
+        <p>接続できないときに最初に見るのが <code>ssh -v</code>（<code>-vv</code>、<code>-vvv</code> でさらに詳細）です。出力は上の 3 段階の順に並んでいるので、<strong>どこまで進んで止まったか</strong>で原因の場所が分かります。</p>
+
+        <div class="scene" id="sc-verbose" data-title="ssh -v の出力を段階ごとに読む">
+          <div class="stage" data-w="960" data-h="520">
+            <div class="term" data-el="tv" style="left:16px;top:16px;width:600px;height:488px"><div class="term-h">alice@laptop: ~ — ssh -v（OpenSSH 10.3p1）</div><div class="term-b"></div></div>
+            <div class="node sm" data-el="p1" style="left:636px;top:16px;width:308px"><div class="node-h"><i data-icon="gear"></i><b class="node-t">① 設定読込・TCP 接続</b></div><div class="node-s">Reading configuration / Connecting</div></div>
+            <div class="node sm" data-el="p2" style="left:636px;top:86px;width:308px"><div class="node-h"><i data-icon="network"></i><b class="node-t">② バナー交換</b></div><div class="node-s">Local / Remote version string</div></div>
+            <div class="node sm" data-el="p3" style="left:636px;top:156px;width:308px"><div class="node-h"><i data-icon="key"></i><b class="node-t">③ 鍵交換（KEX）</b></div><div class="node-s">KEXINIT · kex: algorithm · ECDH</div></div>
+            <div class="node sm" data-el="p4" style="left:636px;top:226px;width:308px"><div class="node-h"><i data-icon="shieldok"></i><b class="node-t">④ ホスト鍵の確認</b></div><div class="node-s">Server host key · known_hosts</div></div>
+            <div class="node sm" data-el="p5" style="left:636px;top:296px;width:308px"><div class="node-h"><i data-icon="lock"></i><b class="node-t">⑤ 暗号化開始</b></div><div class="node-s">SSH2_MSG_NEWKEYS · EXT_INFO</div></div>
+            <div class="node sm" data-el="p6" style="left:636px;top:366px;width:308px"><div class="node-h"><i data-icon="user"></i><b class="node-t">⑥ ユーザー認証</b></div><div class="node-s">Offering public key · Authenticated</div></div>
+            <div class="node sm" data-el="p7" style="left:636px;top:436px;width:308px"><div class="node-h"><i data-icon="terminal"></i><b class="node-t">⑦ セッション開始</b></div><div class="node-s">channel 0: new session</div></div>
+          </div>
+        </div>
+
+        <h3>全文（注釈付き）</h3>
+        <pre data-lang="text" data-title="ssh -v alice@server.example.com（OpenSSH 10.3p1 同士・一部省略）">debug1: OpenSSH_10.3p1, OpenSSL 3.5.7 9 Jun 2026
+debug1: Reading configuration data /home/alice/.ssh/config          ← ① ~/.ssh/config
+debug1: Reading configuration data /etc/ssh/ssh_config
+debug1: Connecting to server.example.com [203.0.113.10] port 22.    ← ① DNS 解決と TCP
+debug1: Connection established.
+debug1: Local version string SSH-2.0-OpenSSH_10.3                   ← ② 自分のバナー
+debug1: Remote protocol version 2.0, remote software version OpenSSH_10.3
+debug1: compat_banner: match: OpenSSH_10.3 pat OpenSSH* compat 0x04000000
+debug1: Authenticating to server.example.com:22 as 'alice'
+debug1: SSH2_MSG_KEXINIT sent                                       ← ③ アルゴリズム一覧を交換
+debug1: SSH2_MSG_KEXINIT received
+debug1: kex: algorithm: ⟪mlkem768x25519-sha256⟫                        ← ③ 決まった kex
+debug1: kex: host key algorithm: ⟪ssh-ed25519⟫
+debug1: kex: server->client cipher: ⟪chacha20-poly1305@openssh.com⟫ MAC: &lt;implicit&gt; compression: none
+debug1: kex: client->server cipher: chacha20-poly1305@openssh.com MAC: &lt;implicit&gt; compression: none
+debug1: expecting SSH2_MSG_KEX_ECDH_REPLY
+debug1: SSH2_MSG_KEX_ECDH_REPLY received
+debug1: Server host key: ssh-ed25519 ⟪SHA256:KsUIdbXsTWf9c2BqWhUiXlD2hztj9R7T5QTNA9Tm5wA⟫   ← ④
+debug1: Host 'server.example.com' is known and matches the ED25519 host key.
+debug1: Found key in /home/alice/.ssh/known_hosts:1                 ← ④ 何行目と一致したか
+debug1: rekey out after 134217728 blocks                            ← ⑤
+debug1: SSH2_MSG_NEWKEYS sent
+debug1: expecting SSH2_MSG_NEWKEYS
+debug1: SSH2_MSG_NEWKEYS received
+debug1: rekey in after 134217728 blocks
+debug1: SSH2_MSG_EXT_INFO received
+debug1: SSH2_MSG_SERVICE_ACCEPT received                            ← ⑥
+debug1: Authentications that can continue: ⟪publickey,password⟫
+debug1: Next authentication method: publickey
+debug1: Will attempt key: /home/alice/.ssh/id_ed25519 ED25519 SHA256:1CJKc5w5H5JWqOQ3uHI55fN1NgyxwAOiwqyegCepEQ0 agent
+debug1: Offering public key: /home/alice/.ssh/id_ed25519 ED25519 SHA256:1CJKc5w5H5JWqOQ3uHI55fN1NgyxwAOiwqyegCepEQ0 agent
+debug1: ⟪Server accepts key⟫: /home/alice/.ssh/id_ed25519 ED25519 SHA256:1CJKc5w5H5JWqOQ3uHI55fN1NgyxwAOiwqyegCepEQ0 agent
+⟪Authenticated to server.example.com ([203.0.113.10]:22) using "publickey".⟫
+debug1: channel 0: new session [client-session] (inactive timeout: 0) ← ⑦
+debug1: Requesting no-more-sessions@openssh.com
+debug1: Entering interactive session.
+debug1: Sending environment.</pre>
+        <div class="tbl">
+          <table class="ref">
+            <thead><tr><th>止まった場所</th><th>最後に見える行</th><th>疑うもの</th></tr></thead>
+            <tbody>
+              <tr><td>① TCP</td><td><code>connect to host … port 22: Connection refused</code> / <code>Connection timed out</code></td><td>sshd が起動していない、ポート違い、ファイアウォール</td></tr>
+              <tr><td>③ 鍵交換</td><td><code>Unable to negotiate with … no matching key exchange method found. Their offer: …</code></td><td>相手が古い（<code>Their offer</code> に共通のアルゴリズムがない）</td></tr>
+              <tr><td>④ ホスト鍵</td><td><code>Host key verification failed.</code></td><td>known_hosts と不一致（下の失敗ケース参照）</td></tr>
+              <tr><td>⑥ 認証</td><td><code>Authentications that can continue: publickey</code> が繰り返され <code>Permission denied (publickey).</code></td><td>鍵が authorized_keys にない、パーミッション、別の鍵を提示している</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- 6. 失敗ケース -->
+      <section class="chapter" id="failures">
+        <h2>失敗ケース：ホスト鍵の不一致・パーミッション・Permission denied</h2>
+        <p>SSH のエラーは「どちらのマシンの、どのファイルが原因か」で直し方が決まります。ホスト鍵の不一致は<strong>クライアントの known_hosts</strong>、<code>UNPROTECTED PRIVATE KEY FILE</code> は<strong>クライアントの秘密鍵のモード</strong>、<code>Permission denied (publickey)</code> は多くの場合<strong>サーバー側の authorized_keys かそのディレクトリのモード</strong>です。</p>
+
+        <div class="scene" id="sc-fail" data-title="失敗ケース：MITM 検知・秘密鍵のモード・StrictModes">
+          <div class="stage" data-w="960" data-h="596">
+            <div class="node" data-el="cl" style="left:20px;top:20px;width:210px">
+              <div class="node-h"><i data-icon="laptop"></i><b class="node-t">ssh（client）</b></div>
+              <div class="node-s">alice@laptop</div>
+            </div>
+            <div class="node c-red hide" data-el="atk" style="left:375px;top:20px;width:210px">
+              <div class="node-h"><i data-icon="attacker"></i><b class="node-t">偽サーバー</b></div>
+              <div class="node-s">192.0.2.66 · 別のホスト鍵</div>
+            </div>
+            <div class="node c-green" data-el="sv" style="left:730px;top:20px;width:210px">
+              <div class="node-h"><i data-icon="server"></i><b class="node-t">sshd（本物）</b></div>
+              <div class="node-s">server.example.com</div>
+            </div>
+
+            <div class="file" data-el="kh" style="left:20px;top:104px;width:440px">
+              <div class="file-h">~/.ssh/known_hosts（client）</div>
+              <div class="file-b bytes" data-el="khb"><b>1:</b> server.example.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBEDErqZ2CAGW7Qa5VehKWuP8A/nse1EVt8vPduCPiHr</div>
+            </div>
+            <div class="file stampable hide" data-el="cmp" style="left:20px;top:192px;width:440px">
+              <div class="file-h">ホスト鍵フィンガープリントの比較</div>
+              <div class="file-b"><dl class="kv">
+                <dt>保存済み</dt><dd data-el="cmp1">SHA256:KsUIdbXsTWf9c2BqWhUiXlD2hztj9R7T5QTNA9Tm5wA</dd>
+                <dt>受信</dt><dd data-el="cmp2">SHA256:X5D4nC+hhOLWMcY+S5AzAurGbqkJCciCt13WUy6/tek</dd>
+              </dl></div>
+            </div>
+            <div class="file hide" data-el="pk" style="left:20px;top:276px;width:440px">
+              <div class="file-h">client: ls -l ~/.ssh/id_ed25519</div>
+              <div class="file-b"><dl class="kv"><dt>mode</dt><dd data-el="pkm">-rw-r--r--（0644）</dd></dl></div>
+            </div>
+            <div class="file hide" data-el="sd" style="left:20px;top:340px;width:440px">
+              <div class="file-h">server: ls -ld /home/alice/.ssh</div>
+              <div class="file-b"><dl class="kv"><dt>mode</dt><dd data-el="sdm">drwxrwxr-x（0775）</dd></dl></div>
+            </div>
+            <div class="file hide" data-el="alog" style="left:20px;top:404px;width:440px">
+              <div class="file-h">server: journalctl -u ssh（sshd のログ）</div>
+              <div class="file-b bytes">Authentication refused: bad ownership or modes for directory /home/alice/.ssh</div>
+            </div>
+
+            <div class="term" data-el="tf" style="left:480px;top:104px;width:460px;height:420px"><div class="term-h">alice@laptop: ~</div><div class="term-b"></div></div>
+          </div>
+        </div>
+
+        <div class="tbl">
+          <table class="ref">
+            <thead><tr><th>メッセージ</th><th>どこで判定</th><th>原因</th><th>直し方</th></tr></thead>
+            <tbody>
+              <tr><td><code>WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!</code><br><code>Host key verification failed.</code></td><td>クライアント（ssh が known_hosts と照合）</td><td>サーバーの再構築・ホスト鍵再生成・IP の付け替え、または中間者攻撃</td><td>サーバー管理者から正しいフィンガープリントを入手して照合してから <code>ssh-keygen -R host</code></td></tr>
+              <tr><td><code>Permissions 0644 for '…/id_ed25519' are too open.</code></td><td>クライアント（ssh が秘密鍵を読む時）</td><td>自分の秘密鍵に group/other の権限が 1 ビットでもある</td><td><code>chmod 600 ~/.ssh/id_ed25519</code></td></tr>
+              <tr><td><code>Permission denied (publickey).</code></td><td>サーバー（sshd が authorized_keys を照合）</td><td>公開鍵が未登録／別の鍵を提示／<code>StrictModes</code> でモードが緩い／<code>AuthorizedKeysFile</code> の場所違い</td><td>サーバーのログ（<code>journalctl -u ssh</code>、<code>/var/log/auth.log</code>）を見る。<code>chmod 700 ~/.ssh; chmod 600 ~/.ssh/authorized_keys</code></td></tr>
+              <tr><td><code>no matching host key type found. Their offer: ssh-rsa</code></td><td>クライアント（KEXINIT の交渉）</td><td>相手が SHA-1 署名の <code>ssh-rsa</code> しか出さない（OpenSSH 8.8 から既定で無効）</td><td>サーバー側を更新するのが本筋。一時的には <code>-o HostKeyAlgorithms=+ssh-rsa</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="note">Debian / Ubuntu のパッケージ版 OpenSSH は、ホスト鍵不一致のメッセージの後に <code>remove with:</code> と <code>ssh-keygen -f '…/known_hosts' -R 'server.example.com'</code> の案内を追加で表示します（Debian のパッチ）。上流の OpenSSH にはこの 2 行はありません。</div>
+      </section>
+
+      <!-- 7. ファイル早見表 -->
+      <section class="chapter" id="files">
+        <h2>ファイル早見表（クライアント / サーバー）</h2>
+        <div class="cols">
+          <pre data-lang="tree" data-title="クライアント（alice@laptop）">~/.ssh/                      # 700
+├── config                   # 600 推奨。Host ごとの設定
+├── id_ed25519               # 600 必須。ユーザー秘密鍵
+├── id_ed25519.pub           # 644。サーバーに登録する公開鍵
+├── known_hosts              # 644。接続したサーバーのホスト公開鍵
+└── agent/                   # OpenSSH 10.1+ の ssh-agent ソケット置き場
+/etc/ssh/
+├── ssh_config               # システム全体のクライアント設定
+└── ssh_known_hosts          # システム全体の known_hosts</pre>
+          <pre data-lang="tree" data-title="サーバー（server.example.com）">/etc/ssh/
+├── sshd_config              # sshd の設定
+├── sshd_config.d/           # Include 先（Debian/Ubuntu 等）
+├── ssh_host_ed25519_key     # 600 root。ホスト秘密鍵
+├── ssh_host_ed25519_key.pub # 644。クライアントの known_hosts に入る
+├── ssh_host_ecdsa_key(.pub)
+└── ssh_host_rsa_key(.pub)
+/home/alice/.ssh/            # 700（StrictModes が検査）
+└── authorized_keys          # 600。ログインを許す公開鍵の一覧</pre>
+        </div>
+        <div class="tbl">
+          <table class="ref">
+            <thead><tr><th>ファイル</th><th>ホスト</th><th>モード</th><th>誰が読む / 書く</th></tr></thead>
+            <tbody>
+              <tr><td><code>~/.ssh/id_ed25519</code></td><td>client</td><td>600（400 も可）</td><td><code>ssh-keygen</code> が作成、<code>ssh</code> / <code>ssh-add</code> が読む。group/other に権限があると無視される</td></tr>
+              <tr><td><code>~/.ssh/id_ed25519.pub</code></td><td>client</td><td>644</td><td><code>ssh-copy-id</code> がサーバーへ送る</td></tr>
+              <tr><td><code>~/.ssh/known_hosts</code></td><td>client</td><td>644</td><td>初回接続時に <code>ssh</code> が追記、以後は照合。<code>ssh-keygen -R</code> で削除</td></tr>
+              <tr><td><code>~/.ssh/config</code></td><td>client</td><td>600 推奨</td><td><code>ssh</code> が最初に読む（<code>ssh -G host</code> で最終値）</td></tr>
+              <tr><td><code>~/.ssh/authorized_keys</code></td><td>server</td><td>600</td><td><code>sshd</code> がユーザー認証時に読む。<code>StrictModes yes</code> ならファイル・<code>~/.ssh</code>・ホームが他人に書き込み可だと拒否</td></tr>
+              <tr><td><code>/etc/ssh/ssh_host_*_key</code></td><td>server</td><td>600 root</td><td>インストール時に <code>ssh-keygen -A</code> 等で生成。<code>sshd</code> が鍵交換で H に署名</td></tr>
+              <tr><td><code>/etc/ssh/sshd_config</code></td><td>server</td><td>644</td><td><code>sshd</code> が起動・再読込時に読む（<code>sshd -t</code> で構文検査）</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- 8. sshd_config -->
+      <section class="chapter" id="sshd">
+        <h2>sshd_config の重要な設定</h2>
+        <div class="tbl">
+          <table class="ref">
+            <thead><tr><th>設定</th><th>OpenSSH の既定値</th><th>意味・よく使う値</th></tr></thead>
+            <tbody>
+              <tr><td><code>PubkeyAuthentication</code></td><td><code>yes</code></td><td>公開鍵認証を許可</td></tr>
+              <tr><td><code>PasswordAuthentication</code></td><td><code>yes</code></td><td>鍵を配り終えたら <code>no</code> にしてパスワード総当たりを止める</td></tr>
+              <tr><td><code>KbdInteractiveAuthentication</code></td><td><code>yes</code></td><td>PAM 経由のパスワード入力もこちら。パスワードを止めるなら両方 <code>no</code>（8.7 で <code>ChallengeResponseAuthentication</code> から改名）</td></tr>
+              <tr><td><code>PermitRootLogin</code></td><td><code>prohibit-password</code></td><td>root は鍵のみ許可。<code>no</code> で完全禁止</td></tr>
+              <tr><td><code>AuthorizedKeysFile</code></td><td><code>.ssh/authorized_keys .ssh/authorized_keys2</code></td><td>同梱の sshd_config は <code>.ssh/authorized_keys</code> のみに上書き。<code>%h</code> <code>%u</code> が使える</td></tr>
+              <tr><td><code>StrictModes</code></td><td><code>yes</code></td><td>ホーム・<code>~/.ssh</code>・authorized_keys が他人に書き込み可なら拒否</td></tr>
+              <tr><td><code>MaxAuthTries</code></td><td><code>6</code></td><td>1 接続での認証試行回数。鍵をたくさん agent に入れていると <code>Too many authentication failures</code></td></tr>
+              <tr><td><code>AllowUsers</code> / <code>AllowGroups</code></td><td>（なし）</td><td>ログインできるユーザーを限定</td></tr>
+              <tr><td><code>Port</code> / <code>ListenAddress</code></td><td><code>22</code> / 全アドレス</td><td>待ち受け</td></tr>
+              <tr><td><code>HostKey</code></td><td><code>/etc/ssh/ssh_host_*_key</code></td><td>使うホスト鍵</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <pre data-lang="ini" data-title="/etc/ssh/sshd_config.d/10-hardening.conf（例）"># 鍵だけでログインさせる
+PubkeyAuthentication yes
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PermitRootLogin no
+AllowUsers alice deploy</pre>
+        <pre data-lang="bash" data-title="反映前に必ず検査する">$ sudo sshd -t                                   # 構文エラーがあれば表示（何も出なければ OK）
+$ sudo sshd -T | grep -Ei '^(passwordauthentication|pubkeyauthentication|permitrootlogin)'
+passwordauthentication no
+pubkeyauthentication yes
+permitrootlogin no
+$ sudo systemctl reload ssh                      # Debian/Ubuntu。RHEL 系は sshd</pre>
+        <div class="note warn">設定変更後は<strong>今のセッションを閉じずに</strong>別ターミナルから新規接続できることを確かめます。<code>PasswordAuthentication no</code> を先に入れて鍵登録を忘れると締め出されます。</div>
+      </section>
+
+      <!-- 9. config とポートフォワード -->
+      <section class="chapter" id="config">
+        <h2><code>~/.ssh/config</code> とポートフォワード</h2>
+        <pre data-lang="text" data-title="~/.ssh/config">Host bastion
+    HostName bastion.example.com
+    User alice
+    IdentityFile ~/.ssh/id_ed25519
+    IdentitiesOnly yes          # IdentityFile の鍵だけを提示する
+
+Host app1
+    HostName 10.0.1.23          # 踏み台の内側のアドレス
+    User deploy
+    ProxyJump bastion           # ssh -J bastion と同じ
+
+Host *
+    ServerAliveInterval 30</pre>
+        <p><code>ssh app1</code> と打つと、<code>bastion</code> に SSH で入り、そこから <code>10.0.1.23:22</code> への TCP を中継させて、その上でもう一度 SSH（鍵交換・ホスト鍵確認・認証）をします。<code>app1</code> のホスト鍵は手元の known_hosts に <code>10.0.1.23</code> として記録されます。最終的な設定値は <code>ssh -G app1</code> で確認できます。</p>
+        <div class="tbl">
+          <table class="ref">
+            <thead><tr><th>フラグ</th><th>例</th><th>何が起きるか</th></tr></thead>
+            <tbody>
+              <tr><td><code>-L</code></td><td><code>ssh -L 5432:db.internal:5432 bastion</code></td><td>手元の <code>localhost:5432</code> への接続を、bastion から <code>db.internal:5432</code> へ中継（ローカルフォワード）</td></tr>
+              <tr><td><code>-R</code></td><td><code>ssh -R 8080:localhost:3000 server</code></td><td>server の <code>localhost:8080</code> への接続を、手元の <code>localhost:3000</code> へ中継（リモートフォワード）</td></tr>
+              <tr><td><code>-D</code></td><td><code>ssh -D 1080 bastion</code></td><td>手元に SOCKS プロキシ <code>localhost:1080</code> を立て、接続先ごとに bastion から接続（ダイナミックフォワード）</td></tr>
+              <tr><td><code>-J</code></td><td><code>ssh -J bastion deploy@10.0.1.23</code></td><td>踏み台経由（<code>ProxyJump</code>）</td></tr>
+              <tr><td><code>-N</code></td><td><code>ssh -N -L …</code></td><td>リモートコマンドを実行しない（転送専用）</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- 10. コマンド早見表 -->
+      <section class="chapter" id="commands">
+        <h2>コマンド早見表</h2>
+        <div class="tbl">
+          <table class="ref">
+            <thead><tr><th>コマンド</th><th>主なフラグ</th><th>何が起きるか</th></tr></thead>
+            <tbody>
+              <tr><td><code>ssh-keygen -t ed25519</code></td><td><code>-t</code> 種類, <code>-C</code> コメント, <code>-f</code> 出力先, <code>-N</code> パスフレーズ, <code>-a</code> KDF ラウンド</td><td>鍵ペアを <code>~/.ssh/id_ed25519</code> と <code>.pub</code> に作る</td></tr>
+              <tr><td><code>ssh-keygen -lf file</code></td><td><code>-l</code> 指紋表示, <code>-E md5</code> 旧形式, <code>-v</code> randomart</td><td>公開鍵（known_hosts も可）のフィンガープリント</td></tr>
+              <tr><td><code>ssh-keygen -y -f key</code></td><td></td><td>秘密鍵から公開鍵を出力</td></tr>
+              <tr><td><code>ssh-keygen -R host</code></td><td><code>-f</code> 対象ファイル</td><td>known_hosts から host の行を削除（元は <code>known_hosts.old</code>）</td></tr>
+              <tr><td><code>ssh-keygen -F host</code></td><td></td><td>known_hosts から host の行を検索（ハッシュ化されていても可）</td></tr>
+              <tr><td><code>ssh-keygen -p -f key</code></td><td></td><td>パスフレーズの変更</td></tr>
+              <tr><td><code>ssh-copy-id -i key.pub user@host</code></td><td><code>-p</code> ポート, <code>-f</code> 強制</td><td>パスワード認証でログインし、公開鍵を <code>~/.ssh/authorized_keys</code> に追記</td></tr>
+              <tr><td><code>eval "$(ssh-agent -s)"</code></td><td></td><td>agent を起動し <code>SSH_AUTH_SOCK</code> / <code>SSH_AGENT_PID</code> を設定</td></tr>
+              <tr><td><code>ssh-add key</code></td><td><code>-l</code> 一覧, <code>-L</code> 公開鍵, <code>-d</code> 削除, <code>-t</code> 有効期限</td><td>秘密鍵を agent に読み込む（パスフレーズ入力は 1 回）</td></tr>
+              <tr><td><code>ssh-keyscan -t ed25519 host</code></td><td><code>-p</code> ポート, <code>-H</code> ハッシュ化</td><td>サーバーのホスト公開鍵を取得（検証はしない）</td></tr>
+              <tr><td><code>ssh -v user@host</code></td><td><code>-v</code>/<code>-vv</code>/<code>-vvv</code></td><td>接続の各段階をデバッグ出力</td></tr>
+              <tr><td><code>ssh -i key -p 2222 user@host</code></td><td><code>-i</code> 鍵, <code>-p</code> ポート, <code>-o Opt=val</code></td><td>鍵・ポートを指定して接続</td></tr>
+              <tr><td><code>ssh -J jump user@host</code></td><td><code>-L</code> <code>-R</code> <code>-D</code> <code>-N</code></td><td>踏み台経由・ポートフォワード</td></tr>
+              <tr><td><code>ssh -G host</code></td><td></td><td>config を解釈した最終的な設定値を表示（接続しない）</td></tr>
+              <tr><td><code>ssh -Q kex</code></td><td><code>-Q cipher</code> <code>-Q key</code> <code>-Q mac</code></td><td>このクライアントが対応するアルゴリズム一覧</td></tr>
+              <tr><td><code>sshd -t</code> / <code>sshd -T</code></td><td></td><td>設定の構文検査 / 有効な設定値の一覧</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- 11. 手元で試す -->
+      <section class="chapter" id="try">
+        <h2>手元で試す</h2>
+        <p>サーバーがなくても、鍵ファイル・フィンガープリント・known_hosts の操作は手元だけで再現できます（一時ディレクトリを使うので既存の <code>~/.ssh</code> は触りません）。</p>
+        <pre data-lang="bash" data-title="1. デモ用の鍵を作ってフィンガープリントを自分で計算する">$ cd "$(mktemp -d)"
+$ ssh-keygen -t ed25519 -C "you@example.com" -f ./demo_ed25519 -N ""
+$ cat demo_ed25519.pub
+$ ssh-keygen -lf demo_ed25519.pub
+$ awk '{print $2}' demo_ed25519.pub | base64 -d | openssl dgst -sha256 -binary | base64 | tr -d '='
+# ↑ 2 つの SHA256: の値が一致することを確認
+$ awk '{print $2}' demo_ed25519.pub | base64 -d | xxd | head -2
+$ ssh-keygen -y -f demo_ed25519          # 秘密鍵から公開鍵を復元</pre>
+        <pre data-lang="bash" data-title="2. known_hosts の追加・検索・削除を一時ファイルで">$ echo "server.example.com $(cut -d' ' -f1,2 demo_ed25519.pub)" > kh
+$ ssh-keygen -F server.example.com -f kh
+# Host server.example.com found: line 1
+$ ssh-keygen -H -f kh                     # ホスト名をハッシュ化（kh.old が残る）
+$ cat kh
+$ ssh-keygen -R server.example.com -f kh
+# Host server.example.com found: line 1
+kh updated.
+Original contents retained as kh.old</pre>
+        <pre data-lang="bash" data-title="3. 実在のサーバーでホスト鍵とアルゴリズムを見る">$ ssh-keyscan -t ed25519 github.com 2>/dev/null | ssh-keygen -lf -
+$ ssh -G github.com | grep -Ei '^(kexalgorithms|hostkeyalgorithms|ciphers) '
+$ ssh -v -o BatchMode=yes git@github.com 2>&1 | grep -E 'kex: |Server host key|Authentications'
+# 公開値と照合する: https://docs.github.com/ja/authentication/keeping-your-account-and-data-secure/githubs-ssh-key-fingerprints</pre>
+      </section>
+
+      <!-- 12. ハマりどころ -->
+      <section class="chapter" id="pitfalls">
+        <h2>ハマりどころ</h2>
+        <div class="note warn"><b>ホスト鍵の警告で <code>StrictHostKeyChecking no</code> にしない。</b>警告は MITM を検知した結果かもしれません。CI などで自動化するなら、事前に正しいホスト鍵を <code>known_hosts</code> に配っておくか、<code>StrictHostKeyChecking accept-new</code>（初回のみ自動追加・変更は拒否）を使います。</div>
+        <div class="note warn"><b>秘密鍵はモード 600。</b>group/other に 1 ビットでも権限があると <code>Permissions 0644 … are too open.</code> で<strong>黙って無視</strong>され、結果として <code>Permission denied (publickey)</code> になります。Windows の OpenSSH では NTFS の ACL で同じ検査をします。</div>
+        <div class="note warn"><b>サーバー側の <code>StrictModes</code>。</b>ホームディレクトリ・<code>~/.ssh</code>・<code>authorized_keys</code> が group/other 書き込み可だと、クライアントには理由が出ず <code>Permission denied (publickey)</code> だけが返ります。理由はサーバーのログ（<code>Authentication refused: bad ownership or modes …</code>）にしか出ません。</div>
+        <div class="note warn"><b>agent に鍵を入れすぎると <code>Too many authentication failures</code>。</b>ssh は agent の鍵を順番に提示し、<code>MaxAuthTries</code>（既定 6）を超えると切断されます。<code>~/.ssh/config</code> で <code>IdentityFile</code> と <code>IdentitiesOnly yes</code> を指定します。</div>
+        <div class="note warn"><b><code>authorized_keys</code> の 1 行が途中で折り返されている。</b>コピー時に改行が入ると別の行として解釈されます。1 鍵 = 1 行です。<code>ssh-copy-id</code> を使うか、<code>ssh-keygen -lf ~/.ssh/authorized_keys</code> で全行が読めるか確認します。</div>
+        <div class="note warn"><b>フィンガープリントの形式違い。</b>OpenSSH 6.8 以降は <code>SHA256:</code>（base64）、古い資料や他ツールは <code>MD5:xx:xx:…</code>（16 進）です。比べるときは <code>ssh-keygen -l -E md5 -f</code> で形式を揃えます。</div>
+        <div class="note warn"><b>ssh-agent のソケットの場所。</b>OpenSSH 10.1 から <code>ssh-agent</code> と転送された agent のソケットは <code>/tmp</code> ではなく <code>~/.ssh/agent/</code> 配下に作られます。<code>/tmp/ssh-*</code> を前提にしたスクリプトは見直しが必要です。</div>
+      </section>
+
+      <!-- 13. 仕様・参考 -->
+      <section class="chapter" id="spec">
+        <h2>仕様・参考</h2>
+        <ul>
+          <li><a href="https://www.rfc-editor.org/rfc/rfc4251" target="_blank" rel="noopener">RFC 4251 — The Secure Shell (SSH) Protocol Architecture</a>（データ型 <code>string</code> <code>name-list</code> <code>mpint</code> は §5）</li>
+          <li><a href="https://www.rfc-editor.org/rfc/rfc4252" target="_blank" rel="noopener">RFC 4252 — Authentication Protocol</a>（§7 publickey の署名対象）</li>
+          <li><a href="https://www.rfc-editor.org/rfc/rfc4253" target="_blank" rel="noopener">RFC 4253 — Transport Layer Protocol</a>（§4.2 バナー、§6 バイナリパケット、§7 KEXINIT と鍵導出、§8 交換ハッシュ）</li>
+          <li><a href="https://www.rfc-editor.org/rfc/rfc4254" target="_blank" rel="noopener">RFC 4254 — Connection Protocol</a>（チャネル・ポートフォワード）</li>
+          <li><a href="https://www.rfc-editor.org/rfc/rfc5656" target="_blank" rel="noopener">RFC 5656 — Elliptic Curve Algorithm Integration</a>（§4 ECDH 鍵交換と <code>SSH_MSG_KEX_ECDH_*</code>）</li>
+          <li><a href="https://www.rfc-editor.org/rfc/rfc8709" target="_blank" rel="noopener">RFC 8709 — Ed25519 and Ed448 Public Key Algorithms for SSH</a></li>
+          <li><a href="https://www.rfc-editor.org/rfc/rfc8731" target="_blank" rel="noopener">RFC 8731 — curve25519-sha256 / curve448-sha512</a></li>
+          <li><a href="https://www.rfc-editor.org/rfc/rfc8308" target="_blank" rel="noopener">RFC 8308 — Extension Negotiation（<code>SSH_MSG_EXT_INFO</code>, <code>server-sig-algs</code>）</a></li>
+          <li><a href="https://datatracker.ietf.org/doc/draft-ietf-sshm-mlkem-hybrid-kex/" target="_blank" rel="noopener">draft-ietf-sshm-mlkem-hybrid-kex — mlkem768x25519-sha256</a> / <a href="https://datatracker.ietf.org/doc/draft-ietf-sshm-ssh-agent/" target="_blank" rel="noopener">draft-ietf-sshm-ssh-agent — SSH agent protocol</a></li>
+          <li><a href="https://github.com/openssh/openssh-portable/blob/master/PROTOCOL" target="_blank" rel="noopener">OpenSSH PROTOCOL</a>（publickey-hostbound、strict KEX など OpenSSH 拡張）／ <a href="https://github.com/openssh/openssh-portable/blob/master/PROTOCOL.key" target="_blank" rel="noopener">PROTOCOL.key</a>（openssh-key-v1）／ <a href="https://github.com/openssh/openssh-portable/blob/master/PROTOCOL.chacha20poly1305" target="_blank" rel="noopener">PROTOCOL.chacha20poly1305</a></li>
+          <li><a href="https://www.openssh.com/releasenotes.html" target="_blank" rel="noopener">OpenSSH Release Notes</a>（9.0 / 9.5 / 10.0 / 10.1 の既定値変更）・<a href="https://www.openssh.com/pq.html" target="_blank" rel="noopener">OpenSSH: Post-Quantum Cryptography</a></li>
+          <li>マニュアル：<code>man ssh</code>, <code>man ssh_config</code>, <code>man sshd</code>（AUTHORIZED_KEYS FILE FORMAT / SSH_KNOWN_HOSTS FILE FORMAT）, <code>man sshd_config</code>, <code>man ssh-keygen</code></li>
+          <li>関連ページ：<a href="../x509/">X.509 証明書</a>（SSH は通常 X.509 を使わず、known_hosts で直接公開鍵を信頼する）・<a href="../git-internals/">Git の中身</a>（<code>git@github.com:</code> の SSH 接続）</li>
+        </ul>
+      </section>
+
+    </main>
+  </div>
+
+  <footer class="site-f"></footer>
+  <script src="../../assets/js/topics.js"></script>
+  <script src="../../assets/js/tim.js"></script>
+  <script src="scenes.js"></script>
+</body>
+</html>

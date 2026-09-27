@@ -335,7 +335,7 @@
         code: { title: 'shell（署名の検証はしていない点に注意）', lang: 'bash', src: DECODE_FN + '\n$ b64url_decode "$(cut -d. -f2 <<< "$TOKEN")"; echo\n' + hsPc },
         run: async (s) => {
           s.state('pj', 'warn');
-          await s.caption('base64url は<b>エンコード</b>。payload は誰でも読める', { cls: 'bad', x: 668, y: 222 });
+          await s.caption('base64url は<b>エンコード</b>。payload は誰でも読める', { cls: 'bad', x: 668, y: 188 });
         },
       },
     ],

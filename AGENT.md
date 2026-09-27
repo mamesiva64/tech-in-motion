@@ -159,7 +159,7 @@ TIM.scene('#sc-flow', {
 
 | ヘルパー | 説明 |
 |---|---|
-| `s.$(sel)` / `s.el(sel)` | 要素取得。`'a b'` のような英数字語の並びは `data-el` 名、それ以外は CSS セレクタ |
+| `s.$(sel)` / `s.el(sel)` | 要素取得。`'a b'` のような英数字語の並びは `data-el` 名、それ以外は CSS セレクタ。`'css:hdr span'` のように `css:` を付けると常に CSS セレクタとして扱う |
 | `s.show(sel, {fx, dur, delay, stagger})` | `.hide` を外して登場。`fx`: `up`(既定) `down` `left` `right` `zoom` `pop` `fade` `blur` `draw`(SVG path) |
 | `s.hide(sel, {dur})` | 退場して `.hide` を付与 |
 | `s.swap(outSel, inSel)` | 入れ替え |

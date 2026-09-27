@@ -1164,7 +1164,7 @@ CMD ["node", "server.js"]`;
         run: async (s) => {
           s.state('k-mem', null);
           await s.show('xc', { fx: 'pop' });
-          s.caption('コンテナ ＝ namespaces（見える範囲）+ cgroup（使える量）を付けたプロセス', { cls: 'ok', x: 717, y: 462 });
+          s.caption('コンテナ ＝ namespaces（見える範囲）+ cgroup（使える量）を付けたプロセス', { cls: 'ok' });
         },
       },
     ],

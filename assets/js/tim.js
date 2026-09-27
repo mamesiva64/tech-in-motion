@@ -313,6 +313,13 @@
     fade: [{ opacity: 0 }, { opacity: 1 }],
     blur: [{ opacity: 0, filter: 'blur(8px)' }, { opacity: 1, filter: 'blur(0px)' }],
   };
+  /** animation.finished with an upper bound: in hidden documents the WAAPI clock may not advance */
+  function fin(a, ms) {
+    return Promise.race([
+      a.finished,
+      sleep(ms / SPEED + 400).then(() => { try { if (a.playState !== 'finished' && a.playState !== 'idle') a.finish(); } catch (e) { /* ignore */ } }),
+    ]);
+  }
   const ANCHOR = /^(.*?):(c|t|b|l|r|tl|tr|bl|br)$/;
   const NAMES = /^[\w-]+(\s+[\w-]+)*$/;
   const SVGNS = 'http://www.w3.org/2000/svg';
@@ -331,6 +338,7 @@
       if (sel instanceof Element) return [sel];
       if (Array.isArray(sel)) return sel.flatMap((x) => this.$(x));
       sel = String(sel).trim();
+      if (sel.startsWith('css:')) return Array.from(this.world.querySelectorAll(sel.slice(4)));
       const m = sel.match(ANCHOR);
       if (m && NAMES.test(m[1])) sel = m[1];
       if (NAMES.test(sel)) return sel.split(/\s+/).flatMap((n) => Array.from(this.world.querySelectorAll('[data-el="' + n + '"]')));
@@ -351,7 +359,7 @@
         fill: o.fill || 'backwards',
       });
       this.sc.anims.add(a);
-      return a.finished.then(() => { this.sc.anims.delete(a); }, () => {});
+      return fin(a, (o.dur != null ? o.dur : 500) + (o.delay || 0)).then(() => { this.sc.anims.delete(a); }, () => {});
     }
 
     box(target) {
@@ -530,7 +538,7 @@
       }
       const an = p.animate(frames, { duration: this.ms(o.dur || 1000), delay: this.ms(o.delay || 0), easing: o.ease || 'cubic-bezier(.45,0,.25,1)', fill: 'both' });
       this.sc.anims.add(an);
-      return an.finished.then(() => {
+      return fin(an, (o.dur || 1000) + (o.delay || 0)).then(() => {
         this.sc.anims.delete(an);
         if (!this.alive) return;
         land();
@@ -581,7 +589,7 @@
       const an = p.animate([{ strokeDasharray: L + ' ' + L, strokeDashoffset: L }, { strokeDasharray: L + ' ' + L, strokeDashoffset: 0 }], { duration: this.ms(o.dur || 600), delay: this.ms(o.delay || 0), easing: EASE.inOut, fill: 'backwards' });
       this.sc.anims.add(an);
       if (lab) this._a(lab, FX.zoom, { dur: 300, delay: (o.delay || 0) + (o.dur || 600) * 0.6 });
-      return an.finished.then(() => { this.sc.anims.delete(an); if (this.alive) addMarkers(); }, () => {});
+      return fin(an, (o.dur || 600) + (o.delay || 0)).then(() => { this.sc.anims.delete(an); if (this.alive) addMarkers(); }, () => {});
     }
 
     move(sel, o = {}) {
@@ -624,7 +632,7 @@
         this.fx.appendChild(r);
         const an = r.animate([{ opacity: 0.95, scale: '1' }, { opacity: 0, scale: String(o.scale || 1.12) }], { duration: this.ms(o.dur || 700), easing: 'ease-out' });
         this.sc.anims.add(an);
-        return an.finished.then(() => r.remove(), () => r.remove());
+        return fin(an, o.dur || 700).then(() => r.remove(), () => r.remove());
       }));
     }
     shake(sel) {
@@ -641,7 +649,7 @@
         this.fx.appendChild(s);
         const an = s.firstChild.animate([{ top: '0%' }, { top: '100%' }], { duration: this.ms(o.dur || 900), easing: 'ease-in-out', iterations: o.times || 1 });
         this.sc.anims.add(an);
-        return an.finished.then(() => s.remove(), () => s.remove());
+        return fin(an, (o.dur || 900) * (o.times || 1)).then(() => s.remove(), () => s.remove());
       }));
     }
     stamp(sel, text, o = {}) {
@@ -1163,7 +1171,7 @@
         // overlap between visible top-level parts (zones are containers by design) and wire labels
         const items = [];
         sc.world.querySelectorAll(':scope > :not(.hide):not(svg):not(.fx):not(.zone):not([data-overlap-ok])').forEach((e) => items.push([e, box(e)]));
-        sc.fx.querySelectorAll('.wlabel:not(.hide):not([data-overlap-ok])').forEach((e) => items.push([e, { x: e.offsetLeft - e.offsetWidth / 2, y: e.offsetTop - e.offsetHeight / 2, w: e.offsetWidth, h: e.offsetHeight }]));
+        sc.fx.querySelectorAll('.wlabel:not(.hide):not([data-overlap-ok]), .caption').forEach((e) => items.push([e, { x: e.offsetLeft - e.offsetWidth / 2, y: e.offsetTop - (e.classList.contains('caption') ? 0 : e.offsetHeight / 2), w: e.offsetWidth, h: e.offsetHeight }]));
         for (let a = 0; a < items.length; a++) {
           for (let b = a + 1; b < items.length; b++) {
             const A = items[a][1], B = items[b][1];

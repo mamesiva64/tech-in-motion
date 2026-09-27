@@ -109,13 +109,13 @@ window.TIM_TOPICS = [
     sub: '鍵交換・ホスト鍵確認・公開鍵認証。known_hosts と authorized_keys の役割',
     cmds: ['ssh-keygen -t ed25519 -C "you@example.com"', 'ssh -v user@host', 'ssh-keyscan -t ed25519 host'],
     tags: ['~/.ssh/id_ed25519', 'known_hosts', 'authorized_keys', 'sshd_config'],
-    related: ['x509', 'git-internals'], status: 'soon',
+    related: ['x509', 'git-internals'], status: 'ready',
   },
   {
     id: 'git-internals', cat: 'dev', title: 'Git の中身',
     sub: 'blob / tree / commit と .git ディレクトリ。コミットは SHA-1 で繋がったグラフ',
     cmds: ['git cat-file -p HEAD', 'git hash-object -w hello.txt', 'git ls-tree HEAD'],
     tags: ['.git/objects', 'refs/heads/main', 'HEAD', 'index', 'packfile'],
-    related: ['ssh', 'docker'], status: 'soon',
+    related: ['ssh', 'docker'], status: 'ready',
   },
 ];

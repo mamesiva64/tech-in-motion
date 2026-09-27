@@ -615,12 +615,14 @@ a.rel-a:hover { border-color: var(--accent); transform: translateY(-2px); box-sh
   background: #04070d;
   border: 1px solid var(--line2);
   border-radius: 10px;
-  overflow: hidden;
+  overflow: visible; /* stamp がはみ出せるように。スクロールは .term-b が担う */
   box-shadow: 0 12px 30px -16px #000;
 }
-.term-h { display: flex; align-items: center; gap: 10px; padding: 5px 10px; font: 600 10.5px var(--mono); color: var(--tx3); border-bottom: 1px solid var(--line); background: #0a0f1a; }
+.term-h { display: flex; align-items: center; gap: 10px; padding: 5px 10px; font: 600 10.5px var(--mono); color: var(--tx3); border-bottom: 1px solid var(--line); background: #0a0f1a; border-radius: 9px 9px 0 0; }
 .term-h::before { content: ""; width: 34px; height: 8px; flex: none; background: radial-gradient(circle at 4px 4px, #f87171 3px, transparent 3.5px), radial-gradient(circle at 17px 4px, #fbbf24 3px, transparent 3.5px), radial-gradient(circle at 30px 4px, #34d399 3px, transparent 3.5px); opacity: 0.75; }
-.term-b { flex: 1; padding: 8px 12px; font: 11.5px/1.6 var(--mono); color: #c9d4ec; overflow: hidden; white-space: pre-wrap; word-break: break-all; }
+.term-b { flex: 1; min-height: 0; padding: 8px 12px; font: 11.5px/1.6 var(--mono); color: #c9d4ec; overflow: hidden; white-space: pre-wrap; word-break: break-all; border-radius: 0 0 9px 9px; }
+.file.tight pre { font-size: 10.5px; line-height: 1.45; }
+.file.tight .file-h { font-size: 10px; padding: 4px 9px; }
 .tl.out { color: #97a5c4; }
 .typing::after { content: "▋"; color: var(--accent); animation: blink 0.9s steps(1) infinite; margin-left: 1px; }
 @keyframes blink { 50% { opacity: 0; } }
@@ -766,6 +768,7 @@ a.rel-a:hover { border-color: var(--accent); transform: translateY(-2px); box-sh
 .lab-h { display: flex; align-items: center; gap: 10px; font: 700 11px var(--mono); letter-spacing: 0.2em; color: var(--accent); margin-bottom: 12px; }
 .lab-h::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 10px var(--accent); animation: cvp 2s infinite; }
 .lab label { display: block; font: 600 11px var(--mono); letter-spacing: 0.1em; color: var(--tx3); margin: 10px 0 6px; text-transform: uppercase; }
+.lab label code, .zone.raw::before { text-transform: none; }
 .lab textarea, .lab input[type="text"], .lab select {
   width: 100%;
   padding: 10px 12px;
