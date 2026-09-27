@@ -581,15 +581,18 @@ a.rel-a:hover { border-color: var(--accent); transform: translateY(-2px); box-sh
   white-space: nowrap;
 }
 .zone.solid { border-style: solid; }
+.zone.raw::before { text-transform: none; letter-spacing: 0.04em; }
 
 .file {
   background: #080d17;
   border: 1px solid var(--line2);
   border-radius: 10px;
-  overflow: hidden;
+  overflow: visible; /* stamp がはみ出せるように。角丸は子要素側で処理 */
   box-shadow: 0 12px 30px -16px #000;
   transition: border-color 0.35s, box-shadow 0.35s;
 }
+.file > :first-child { border-top-left-radius: 9px; border-top-right-radius: 9px; }
+.file > :last-child { border-bottom-left-radius: 9px; border-bottom-right-radius: 9px; }
 .file-h {
   display: flex; align-items: center; gap: 7px;
   padding: 5px 10px;
@@ -643,7 +646,7 @@ a.rel-a:hover { border-color: var(--accent); transform: translateY(-2px); box-sh
 .seg { display: flex; font: 600 12px/1.4 var(--mono); border-radius: 8px; overflow: hidden; border: 1px solid var(--line2); }
 .seg > span { padding: 7px 10px; background: color-mix(in srgb, var(--accent) 15%, #070b14); color: var(--accent); border-right: 1px solid var(--line2); word-break: break-all; min-width: 0; }
 .seg > span:last-child { border-right: 0; }
-.seg > span small { display: block; font-size: 9.5px; letter-spacing: 0.14em; color: var(--tx3); text-transform: uppercase; margin-bottom: 2px; }
+.seg > span small { display: block; font-size: 9.5px; letter-spacing: 0.08em; color: var(--tx3); margin-bottom: 2px; }
 
 .label { font: 700 11px/1.4 var(--mono); letter-spacing: 0.1em; color: var(--tx3); text-transform: uppercase; white-space: nowrap; }
 .label.acc { color: var(--accent); }
@@ -729,6 +732,7 @@ a.rel-a:hover { border-color: var(--accent); transform: translateY(-2px); box-sh
 .stamp.st-ok { color: var(--green); }
 .stamp.st-bad { color: var(--red); }
 .stamp.st-warn { color: var(--amber); }
+.stamp.in-fx { right: auto; }
 .stamp.at-bl { top: auto; bottom: -14px; right: auto; left: -10px; }
 .stamp.at-br { top: auto; bottom: -14px; }
 .stamp.at-tl { right: auto; left: -10px; }

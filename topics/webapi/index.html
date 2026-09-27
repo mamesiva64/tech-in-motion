@@ -1,0 +1,681 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Web API (REST) — Tech in Motion</title>
+  <meta name="description" content="curl から nginx・Express・PostgreSQL を通って JSON が返るまでの実物の経路、/v1/users の CRUD、Bearer JWT と API キー、problem+json、ETag/If-Match の 412、Idempotency-Key、429、openapi.yaml までを動かして見るページ。">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Space+Grotesk:wght@500;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="../../assets/css/tim.css">
+  <link rel="stylesheet" href="page.css">
+</head>
+<body data-root="../../" data-topic="webapi">
+  <header class="site-h"></header>
+
+  <div class="page">
+    <aside class="toc"></aside>
+    <main class="doc">
+
+      <!-- 0. HERO -->
+      <section class="hero">
+        <p class="kicker">Web / HTTP · REST API</p>
+        <h1>Web API (REST)<small>curl 1 行が JSON になって戻るまでに通る、設定ファイルとコードと SQL</small></h1>
+        <p class="lead">「API を叩く」とき、リクエストは nginx の <code>location /v1/</code> で <code>X-Forwarded-For</code> を付けられ、Express のルートハンドラで <code>SELECT … WHERE id = $1</code> になり、<code>res.json()</code> で <code>application/json</code> に戻ってきます。このページでは <code>/v1/users</code> を題材に、その経路、CRUD、<code>Authorization: Bearer</code>、<code>application/problem+json</code>、<code>If-Match</code> → <code>412</code>、<code>Idempotency-Key</code>、<code>429</code>、<code>openapi.yaml</code> を実物で再生します。</p>
+        <div class="facts">
+          <div class="fact"><span>どこで</span><b>nginx（<code>api.example.com:443</code>）→ app <code>127.0.0.1:3000</code> → PostgreSQL <code>:5432</code></b></div>
+          <div class="fact"><span>何を</span><b><code>/v1/users/{id}</code> × JSON、エラーは <code>application/problem+json</code></b></div>
+          <div class="fact"><span>どうやって</span><b><code>curl --json</code> / <code>fetch()</code> / <code>openapi.yaml</code></b></div>
+          <div class="fact"><span>仕様</span><b>RFC 9110 / 9457（problem+json）/ 6750（Bearer）/ 8288（Link）/ OpenAPI 3.1</b></div>
+        </div>
+      </section>
+
+      <!-- 1. 全体像 -->
+      <section class="chapter" id="overview">
+        <h2>全体像：1 リクエストが通る実物の経路</h2>
+        <p>典型的な構成は「TLS を終端するリバースプロキシ（nginx）＋ループバックで待つアプリ ＋ DB」です。<strong>ホップごとにヘッダが付け足され、形式が変わります</strong>。アプリから見た送信元 IP やスキーム（https）は、nginx が付けた <code>X-Forwarded-*</code> を信頼して初めて正しくなります。</p>
+
+        <div class="scene" id="sc-path" data-title="GET /v1/users/42 が通る経路と、各ホップの実物">
+          <div class="stage" data-w="960" data-h="520">
+            <div class="zone" data-label="web01 · 203.0.113.10" style="left:222px;top:36px;width:718px;height:118px"></div>
+            <div class="node" data-el="cli" style="left:20px;top:62px;width:180px">
+              <div class="node-h"><i data-icon="terminal"></i><b class="node-t">curl / fetch</b></div>
+              <div class="node-s">198.51.100.23</div>
+            </div>
+            <div class="node" data-el="ngx" style="left:242px;top:62px;width:200px">
+              <div class="node-h"><i data-icon="shield"></i><b class="node-t">nginx</b></div>
+              <div class="node-s">:443 TLS 終端 / proxy</div>
+            </div>
+            <div class="node" data-el="app" style="left:486px;top:62px;width:200px">
+              <div class="node-h"><i data-icon="code"></i><b class="node-t">app (Express)</b></div>
+              <div class="node-s">127.0.0.1:3000</div>
+            </div>
+            <div class="node" data-el="db" style="left:730px;top:62px;width:190px">
+              <div class="node-h"><i data-icon="db"></i><b class="node-t">PostgreSQL</b></div>
+              <div class="node-s">127.0.0.1:5432</div>
+            </div>
+            <div class="file" data-el="src" style="left:20px;top:180px;width:500px">
+              <div class="file-h" data-el="srch">-</div>
+              <div data-el="srcbox"><pre data-lang="text"> </pre></div>
+            </div>
+            <div class="file" data-el="wire" style="left:540px;top:180px;width:400px">
+              <div class="file-h" data-el="wireh">-</div>
+              <div data-el="wirebox"><pre data-lang="text"> </pre></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="tbl">
+          <table class="ref">
+            <thead><tr><th>ホップ</th><th>何が付与・変換されるか</th><th>実物</th></tr></thead>
+            <tbody>
+              <tr><td>client → nginx</td><td>TLS で暗号化された HTTP。<code>Host</code> と <code>Authorization</code> はクライアントが付ける</td><td><code>curl -H "Authorization: Bearer $TOKEN" https://api.example.com/v1/users/42</code></td></tr>
+              <tr><td>nginx 内部</td><td>TLS を復号し、<code>server_name</code> と <code>location</code> で転送先を決める</td><td><code>/etc/nginx/conf.d/api.conf</code> の <code>location /v1/</code></td></tr>
+              <tr><td>nginx → app</td><td>平文 HTTP に変わり、<code>X-Forwarded-For</code> <code>X-Forwarded-Proto</code> <code>X-Request-ID</code> を付与。<code>Host</code> は指定しないと <code>$proxy_host</code>（<code>127.0.0.1:3000</code>）</td><td><code>proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;</code></td></tr>
+              <tr><td>app 内部</td><td>ヘッダがオブジェクトに。<code>trust proxy</code> 設定で <code>req.ip</code> / <code>req.protocol</code> が X-Forwarded-* 由来に</td><td><code>app.set('trust proxy', 'loopback')</code></td></tr>
+              <tr><td>app → DB</td><td>パスパラメータが SQL のプレースホルダ値に（文字列連結はしない）</td><td><code>SELECT … FROM users WHERE id = $1</code>, <code>['42']</code></td></tr>
+              <tr><td>DB → app → JSON</td><td>行が JS オブジェクトに。<code>timestamptz</code> は <code>Date</code>、JSON 化で ISO 8601 文字列</td><td><code>"created_at":"2026-09-01T09:12:34.000Z"</code></td></tr>
+              <tr><td>app → nginx → client</td><td>nginx が <code>Server</code> を付け、<code>proxy_hide_header</code> で <code>X-Powered-By</code> を落とし、<code>add_header</code> で <code>X-Request-ID</code> を返す</td><td><code>add_header X-Request-ID $request_id always;</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <pre data-lang="text" data-title="/etc/nginx/conf.d/api.conf（シーンで使った設定の全文）">upstream app {
+    server 127.0.0.1:3000;
+    keepalive 16;
+}
+
+log_format api '$remote_addr "$request" $status $body_bytes_sent '
+               'rt=$request_time urt=$upstream_response_time rid=$request_id';
+
+server {
+    listen 443 ssl;
+    server_name api.example.com;
+    ssl_certificate     /etc/letsencrypt/live/api.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/api.example.com/privkey.pem;
+    access_log /var/log/nginx/api.access.log api;
+
+    location /v1/ {
+        proxy_pass http://app;                 # URI なし → /v1/users/42 のまま転送
+        proxy_http_version 1.1;                # upstream keepalive 用
+        proxy_set_header Connection "";
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Request-ID      $request_id;
+        proxy_hide_header X-Powered-By;
+        add_header X-Request-ID $request_id always;
+        proxy_read_timeout 30s;
+    }
+}</pre>
+        <div class="note warn"><b><code>location /api/</code> と <code>proxy_pass</code> の末尾スラッシュ：</b><code>location /api/ { proxy_pass http://app/; }</code> のように <code>proxy_pass</code> に URI（末尾の <code>/</code> も URI）を書くと、<code>/api/v1/users/42</code> の <code>/api/</code> 部分が <code>/</code> に置き換わり、アプリには <code>/v1/users/42</code> が届きます。<code>proxy_pass http://app;</code>（URI なし）ならパスはそのまま <code>/api/v1/users/42</code> です。アプリが返す <code>Location: /v1/users/43</code> のような相対パスは、クライアントから見ると <code>/api</code> が抜けて壊れる点にも注意します。</div>
+      </section>
+
+      <!-- 2. リソース設計と CRUD -->
+      <section class="chapter" id="crud">
+        <h2>リソース設計と CRUD</h2>
+        <p>REST 風 API では「名詞のコレクション（<code>/v1/users</code>）とメンバー（<code>/v1/users/{id}</code>）」に HTTP メソッドを掛け合わせます。動詞は URL ではなくメソッドで表します。</p>
+
+        <div class="tbl">
+          <table class="ref">
+            <thead><tr><th>メソッド</th><th>パス</th><th>意味</th><th>成功</th><th>主な失敗</th><th>SQL</th></tr></thead>
+            <tbody>
+              <tr><td><code>GET</code></td><td><code>/v1/users?limit=20&amp;cursor=…</code></td><td>一覧（ページング）</td><td><code>200</code> + <code>Link</code></td><td><code>400</code>（不正な cursor）</td><td><code>SELECT … WHERE id &gt; $1 ORDER BY id LIMIT 21</code></td></tr>
+              <tr><td><code>POST</code></td><td><code>/v1/users</code></td><td>作成</td><td><code>201</code> + <code>Location</code></td><td><code>415</code> / <code>422</code> / <code>409</code>（email 重複）</td><td><code>INSERT … RETURNING …</code></td></tr>
+              <tr><td><code>GET</code></td><td><code>/v1/users/{id}</code></td><td>1 件取得</td><td><code>200</code> + <code>ETag</code></td><td><code>404</code></td><td><code>SELECT … WHERE id = $1</code></td></tr>
+              <tr><td><code>PATCH</code></td><td><code>/v1/users/{id}</code></td><td>部分更新（merge patch）</td><td><code>200</code></td><td><code>412</code> / <code>428</code> / <code>422</code></td><td><code>UPDATE … WHERE id = $1 AND version = $2</code></td></tr>
+              <tr><td><code>PUT</code></td><td><code>/v1/users/{id}</code></td><td>丸ごと置換</td><td><code>200</code> / <code>204</code></td><td><code>412</code> / <code>422</code></td><td><code>UPDATE … SET name=$1, email=$2 …</code></td></tr>
+              <tr><td><code>DELETE</code></td><td><code>/v1/users/{id}</code></td><td>削除</td><td><code>204</code></td><td><code>403</code> / <code>404</code></td><td><code>DELETE FROM users WHERE id = $1</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="scene" id="sc-crud" data-title="/v1/users を curl で作る・読む・直す・消す">
+          <div class="stage" data-w="960" data-h="520">
+            <div class="term" data-el="t" style="left:20px;top:20px;width:560px;height:430px">
+              <div class="term-h">bash — TOKEN=eyJhbGciOiJIUzI1NiIs…</div>
+              <div class="term-b"></div>
+            </div>
+            <div class="file" data-el="tbl" style="left:600px;top:20px;width:340px">
+              <div class="file-h"><i data-icon="db"></i>PostgreSQL · public.users</div>
+              <div class="file-b" data-el="rows" style="min-height:124px"></div>
+            </div>
+            <div class="file hide" data-el="sql" style="left:600px;top:210px;width:340px">
+              <div class="file-h">実行された SQL（node-postgres）</div>
+              <div data-el="sqlbox"></div>
+            </div>
+            <div class="big hide" data-el="st" style="left:600px;top:404px;width:340px"><small>STATUS</small><span data-el="stv">-</span></div>
+          </div>
+        </div>
+
+        <div class="cols">
+          <pre data-lang="bash" data-title="curl：作成して Location を追う">$ curl -si https://api.example.com/v1/users \
+    -H "Authorization: Bearer $TOKEN" \
+    --json '{"name":"carol","email":"carol@example.com"}' \
+  | tr -d '\r' | awk 'tolower($1)=="location:"{print $2}'
+/v1/users/144
+$ curl -s https://api.example.com/v1/users/144 \
+    -H "Authorization: Bearer $TOKEN" | jq .</pre>
+          <pre data-lang="js" data-title="fetch：4xx/5xx でも reject されない">const res = await fetch('https://api.example.com/v1/users', {
+  method: 'POST',
+  headers: {
+    'Content-Type': 'application/json',
+    'Authorization': `Bearer ${token}`,
+  },
+  body: JSON.stringify({ name: 'carol', email: 'carol@example.com' }),
+});
+if (!res.ok) {                       // 200〜299 以外
+  const problem = await res.json();  // application/problem+json
+  throw new Error(`${problem.status} ${problem.title}: ${problem.detail}`);
+}
+const location = res.headers.get('Location'); // '/v1/users/144'
+const user = await res.json();</pre>
+        </div>
+
+        <h3>ページングの 2 方式</h3>
+        <div class="tbl">
+          <table class="ref">
+            <thead><tr><th>方式</th><th>リクエスト</th><th>SQL</th><th>弱点</th></tr></thead>
+            <tbody>
+              <tr><td>オフセット</td><td><code>?page=2&amp;per_page=20</code></td><td><code>ORDER BY id LIMIT 20 OFFSET 20</code></td><td>ページ間に追加・削除があると行が重複・欠落する。OFFSET が大きいほど遅い</td></tr>
+              <tr><td>カーソル（keyset）</td><td><code>?limit=20&amp;cursor=eyJpZCI6NjB9</code></td><td><code>WHERE id &gt; 60 ORDER BY id LIMIT 21</code></td><td>任意のページへ飛べない。並び順のキーは一意である必要がある</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <pre data-lang="http" data-title="Link ヘッダ（RFC 8288）でページを示す例">HTTP/1.1 200 OK
+Content-Type: application/json; charset=utf-8
+Link: &lt;https://api.example.com/v1/users?page=3&amp;per_page=20&gt;; rel="next",
+      &lt;https://api.example.com/v1/users?page=1&amp;per_page=20&gt;; rel="prev",
+      &lt;https://api.example.com/v1/users?page=8&amp;per_page=20&gt;; rel="last"
+
+{"data":[{"id":21,"name":"…"}, …],"page":2,"per_page":20,"total":144}</pre>
+        <p>実際のヘッダは 1 行です（上は読みやすさのため改行）。カーソル方式では本文に <code>"next_cursor"</code> を入れるか、<code>Link: &lt;…?cursor=eyJpZCI6NjB9&gt;; rel="next"</code> を返します。<code>eyJpZCI6NjB9</code> は <code>{"id":60}</code> の base64url で、クライアントは中身を解釈せずそのまま送り返す約束にします。</p>
+      </section>
+
+      <!-- 3. 認証 -->
+      <section class="chapter" id="auth">
+        <h2>認証ヘッダ：Bearer JWT と API キー、401 と 403</h2>
+        <p>API の認証情報は <code>Authorization</code> ヘッダで送るのが基本です。<code>Bearer</code> トークン（RFC 6750）は「持っている人が使える」ので、盗まれないことが前提です。JWT の中身と署名検証は <a href="../jwt/">JWT</a> のページで詳しく扱います。</p>
+
+        <div class="scene" id="sc-auth" data-title="Authorization ヘッダの検証と 401 / 403">
+          <div class="stage" data-w="960" data-h="520">
+            <div class="node" data-el="cli" style="left:20px;top:24px;width:200px">
+              <div class="node-h"><i data-icon="browser"></i><b class="node-t">client</b></div>
+              <div class="node-s">curl / SPA</div>
+            </div>
+            <div class="node" data-el="api" style="left:330px;top:24px;width:230px">
+              <div class="node-h"><i data-icon="shield"></i><b class="node-t">API</b></div>
+              <div class="node-s">requireAuth middleware</div>
+            </div>
+            <div class="file" data-el="keys" style="left:600px;top:16px;width:340px">
+              <div class="file-h"><i data-icon="key"></i>サーバー側の検証材料</div>
+              <div class="file-b">
+                <dl class="kv">
+                  <dt>JWT_SECRET</dt><dd>HS256 の共有鍵（環境変数）</dd>
+                  <dt>api_keys</dt><dd>key_hash = sha256(API キー)</dd>
+                </dl>
+              </div>
+            </div>
+            <div class="file" data-el="req" style="left:20px;top:120px;width:560px">
+              <div class="file-h">request</div>
+              <div data-el="reqbox"><pre data-lang="text"> </pre></div>
+            </div>
+            <div class="seg hide" data-el="jwt" style="left:20px;top:262px;width:560px">
+              <span class="c-pink" style="flex:0 0 170px"><small>header</small><b data-el="jh">eyJhbGciOiJIUzI1NiIs…</b></span>
+              <span class="c-violet" style="flex:1 1 auto"><small>payload</small><b data-el="jp">eyJzdWIiOiI0MiIsInNjb3Bl…</b></span>
+              <span class="c-cyan" style="flex:0 0 170px"><small>signature</small><b data-el="js">NXJtp6PdE6Y6VBHmvlWt…</b></span>
+            </div>
+            <dl class="kv hide" data-el="chk" style="left:600px;top:120px;width:340px">
+              <dt>方式</dt><dd data-el="c1">-</dd>
+              <dt>署名 / 照合</dt><dd data-el="c2">-</dd>
+              <dt>有効期限</dt><dd data-el="c3">-</dd>
+              <dt>スコープ</dt><dd data-el="c4">-</dd>
+              <dt>判定</dt><dd data-el="c5">-</dd>
+            </dl>
+            <div class="note-s hide" data-el="why" style="left:600px;top:236px;width:340px">-</div>
+            <div class="file" data-el="res" style="left:20px;top:330px;width:560px">
+              <div class="file-h">response</div>
+              <div data-el="resbox"><pre data-lang="text"> </pre></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="tbl">
+          <table class="ref">
+            <thead><tr><th>状況</th><th>ステータス</th><th>WWW-Authenticate（RFC 6750 §3）</th><th>クライアントの次の行動</th></tr></thead>
+            <tbody>
+              <tr><td><code>Authorization</code> がない</td><td><code>401</code></td><td><code>Bearer realm="api"</code></td><td>ログインしてトークンを取得</td></tr>
+              <tr><td>署名不正・形式不正・失効済み</td><td><code>401</code></td><td><code>Bearer realm="api", error="invalid_token"</code></td><td>トークンを捨てて再取得（リトライしない）</td></tr>
+              <tr><td><code>exp</code> 切れ</td><td><code>401</code></td><td><code>…, error="invalid_token", error_description="The access token expired"</code></td><td>リフレッシュトークンで更新</td></tr>
+              <tr><td>ヘッダの形式が壊れている</td><td><code>400</code></td><td><code>Bearer error="invalid_request"</code></td><td>クライアントのバグを直す</td></tr>
+              <tr><td>本人確認は OK、スコープ・権限が足りない</td><td><code>403</code></td><td><code>Bearer error="insufficient_scope", scope="users:delete"</code></td><td>権限を持つユーザーで実行。リトライしても無駄</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="cols">
+          <pre data-lang="http" data-title="Bearer（JWT）">GET /v1/users/42 HTTP/1.1
+Host: api.example.com
+Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiI0MiIsInNjb3BlIjoidXNlcnM6cmVhZCB1c2Vyczp3cml0ZSIsImlhdCI6MTc5MDU2NDQwMCwiZXhwIjoxNzkwNTY4MDAwfQ.NXJtp6PdE6Y6VBHmvlWtTVkRcTYEYYSLbBfLXj3OEMk</pre>
+          <pre data-lang="http" data-title="API キー（ヘッダ名は API ごとの独自仕様）">GET /v1/users/42 HTTP/1.1
+Host: api.example.com
+X-API-Key: demo_k7Qx2mN9pL4vR8sT1wZ3
+
+# サーバー側：平文ではなくハッシュで照合
+# sha256("demo_k7Qx2mN9pL4vR8sT1wZ3") =
+# da5afbfff67793a050d96fceb39ad62025e5fb7e97d8fb01c04811fca8734f92</pre>
+        </div>
+        <p>上の JWT はこのページ用のデモ値です（HS256、鍵 <code>demo-secret-do-not-use</code>、<code>exp</code> = 2026-09-28T04:00:00Z）。<code>X-API-Key</code> は標準ヘッダではなく慣習で、API ごとに <code>Authorization: ApiKey …</code> など形式が異なります（OpenAPI では <code>securitySchemes</code> の <code>type: apiKey</code> で名前と場所を宣言します）。</p>
+      </section>
+
+      <!-- 4. エラー表現 -->
+      <section class="chapter" id="errors">
+        <h2>エラー表現：application/problem+json（RFC 9457）</h2>
+        <p>エラーを API ごとの独自 JSON にせず、<code>Content-Type: application/problem+json</code> と決まったメンバーで返すと、クライアントは共通の処理を書けます。RFC 9457 は RFC 7807 を置き換えた現行仕様です。</p>
+        <div class="tbl">
+          <table class="ref">
+            <thead><tr><th>メンバー</th><th>型</th><th>意味</th><th>例</th></tr></thead>
+            <tbody>
+              <tr><td><code>type</code></td><td>URI 参照</td><td>問題の種類の識別子。省略時は <code>"about:blank"</code>（ステータスコード以上の意味はない）</td><td><code>"https://api.example.com/problems/validation-error"</code></td></tr>
+              <tr><td><code>title</code></td><td>文字列</td><td>種類の短い要約。同じ <code>type</code> なら毎回同じ文言</td><td><code>"Your request is not valid."</code></td></tr>
+              <tr><td><code>status</code></td><td>数値</td><td>HTTP ステータスコードの写し（参考値。実際のステータス行が正）</td><td><code>422</code></td></tr>
+              <tr><td><code>detail</code></td><td>文字列</td><td>この発生に固有の説明。人間向けで、パースさせない</td><td><code>"User 144 does not exist"</code></td></tr>
+              <tr><td><code>instance</code></td><td>URI 参照</td><td>この発生を指す URI（リクエストパスやエラー ID）</td><td><code>"/v1/users/144"</code></td></tr>
+              <tr><td>拡張メンバー</td><td>任意</td><td><code>type</code> ごとに定義してよい追加情報</td><td><code>"errors": [{"detail": …, "pointer": "#/email"}]</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="cols">
+          <pre data-lang="http" data-title="404（存在しない ID）">HTTP/1.1 404 Not Found
+Content-Type: application/problem+json
+
+{
+  "type": "https://api.example.com/problems/not-found",
+  "title": "Resource not found",
+  "status": 404,
+  "detail": "User 144 does not exist",
+  "instance": "/v1/users/144"
+}</pre>
+          <pre data-lang="http" data-title="422（バリデーション。RFC 9457 §3 の errors 拡張と同じ形）">HTTP/1.1 422 Unprocessable Content
+Content-Type: application/problem+json
+
+{
+  "type": "https://api.example.com/problems/validation-error",
+  "title": "Your request is not valid.",
+  "status": 422,
+  "errors": [
+    { "detail": "must NOT have fewer than 1 characters", "pointer": "#/name" },
+    { "detail": "must match format \"email\"", "pointer": "#/email" }
+  ]
+}</pre>
+        </div>
+        <div class="note warn"><b>200 でエラーを返さない：</b><code>HTTP/1.1 200 OK</code> + <code>{"success":false,"error":"not found"}</code> のような応答は、キャッシュ・プロキシ・監視・リトライ処理・<code>fetch</code> の <code>res.ok</code> をすべて誤らせます。失敗はステータスコードで表し、詳細を problem+json に入れます。</div>
+      </section>
+
+      <!-- 5. 並行更新・冪等性・レート制限 -->
+      <section class="chapter" id="concurrency">
+        <h2>並行更新・再送・レート制限（失敗ケース）</h2>
+        <p>2 人が同じリソースを同時に編集すると、後から保存した人が先の変更を黙って消す「lost update」が起きます。HTTP には <code>ETag</code> + <code>If-Match</code> による楽観的ロックが用意されています。POST の再送による二重作成には <code>Idempotency-Key</code>、使いすぎには <code>429</code> + <code>Retry-After</code> を使います。</p>
+
+        <div class="scene" id="sc-conflict" data-title="412 Precondition Failed・Idempotency-Key・429">
+          <div class="stage" data-w="960" data-h="520">
+            <div class="node" data-el="al" style="left:20px;top:24px;width:190px">
+              <div class="node-h"><i data-icon="user"></i><b class="node-t">Alice</b></div>
+              <div class="node-s">管理画面 タブ A</div>
+            </div>
+            <div class="node c-orange" data-el="bo" style="left:20px;top:124px;width:190px">
+              <div class="node-h"><i data-icon="user"></i><b class="node-t">Bob</b></div>
+              <div class="node-s">管理画面 タブ B</div>
+            </div>
+            <div class="node" data-el="api" style="left:320px;top:74px;width:200px">
+              <div class="node-h"><i data-icon="server"></i><b class="node-t">API</b></div>
+              <div class="node-s">api.example.com</div>
+            </div>
+            <div class="file" data-el="row" style="left:600px;top:16px;width:340px">
+              <div class="file-h"><i data-icon="db"></i>users WHERE id = 42</div>
+              <div class="file-b">
+                <dl class="kv">
+                  <dt>name</dt><dd data-el="r-name">alice</dd>
+                  <dt>email</dt><dd data-el="r-email">alice@example.com</dd>
+                  <dt>version</dt><dd class="acc" data-el="r-ver">7 → ETag "v7"</dd>
+                </dl>
+              </div>
+            </div>
+            <div class="file hide" data-el="side" style="left:600px;top:150px;width:340px">
+              <div class="file-h" data-el="sideh">-</div>
+              <div data-el="sidebox"></div>
+            </div>
+            <div class="chip hide c-cyan" data-el="ea" style="left:226px;top:36px">ETag "v7"</div>
+            <div class="chip hide c-orange" data-el="eb" style="left:226px;top:136px">ETag "v7"</div>
+            <div class="file" data-el="msg" style="left:20px;top:236px;width:560px">
+              <div class="file-h" data-el="msgh">-</div>
+              <div data-el="msgbox"><pre data-lang="text"> </pre></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="tbl">
+          <table class="ref">
+            <thead><tr><th>仕組み</th><th>リクエスト側</th><th>サーバーの判定</th><th>失敗時</th></tr></thead>
+            <tbody>
+              <tr><td>楽観的ロック</td><td><code>If-Match: "v7"</code>（GET で得た ETag）</td><td>現在の ETag と<strong>強い比較</strong>で一致するか（弱い ETag <code>W/"…"</code> は一致しない）</td><td><code>412 Precondition Failed</code></td></tr>
+              <tr><td>条件必須化</td><td><code>If-Match</code> なし</td><td>API が条件付き更新を必須にしている</td><td><code>428 Precondition Required</code>（RFC 6585）</td></tr>
+              <tr><td>冪等キー</td><td><code>Idempotency-Key: "8e03978e-40d5-43e8-bc93-6894a57f9324"</code></td><td>同じキーの処理結果を保存し、再送には保存した応答を返す</td><td>別ボディで再利用 <code>422</code>／処理中 <code>409</code>／必須なのに無い <code>400</code></td></tr>
+              <tr><td>レート制限</td><td>—</td><td>一定時間あたりの回数を数える</td><td><code>429</code> + <code>Retry-After: 30</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="note"><b><code>Idempotency-Key</code> は IETF の Internet-Draft（draft-ietf-httpapi-idempotency-key-header、最新は -07）で、まだ RFC ではありません。</b>値は Structured Field の String（ダブルクォート付き）で、UUID の利用が推奨されています。上表のステータスはドラフトの記述（SHOULD）です。同じく <code>RateLimit-Policy</code> / <code>RateLimit</code> ヘッダ（例：<code>RateLimit: "default";r=0;t=30</code>）も draft-ietf-httpapi-ratelimit-headers（-11）の段階で、実運用では <code>X-RateLimit-Remaining</code> のような独自ヘッダもよく見かけます。</div>
+        <pre data-lang="js" data-title="クライアント：Retry-After を守って再試行（冪等なリクエストか、Idempotency-Key 付きのときだけ）">async function withRetry(doFetch, max = 4) {
+  for (let attempt = 0; ; attempt++) {
+    const res = await doFetch();
+    if (![429, 503].includes(res.status) || attempt === max) return res;
+    const ra = res.headers.get('Retry-After');            // "30" または HTTP-date
+    let sec = ra == null ? NaN : /^\d+$/.test(ra) ? Number(ra) : (Date.parse(ra) - Date.now()) / 1000;
+    if (!(sec >= 0)) sec = 2 ** attempt + Math.random();   // 指定がなければ指数バックオフ + ジッタ
+    await new Promise((r) => setTimeout(r, sec * 1000));
+  }
+}</pre>
+      </section>
+
+      <!-- 6. OpenAPI -->
+      <section class="chapter" id="openapi">
+        <h2>OpenAPI：openapi.yaml が API の「実物の契約」</h2>
+        <p><code>openapi.yaml</code> はパス・メソッド・パラメータ・リクエスト/レスポンスのスキーマ・認証方式を 1 ファイルに書いたものです。ドキュメント表示、リクエスト検証、クライアント生成、モックサーバーがすべてこのファイルから作れます。</p>
+
+        <div class="scene" id="sc-openapi" data-title="openapi.yaml と実際のリクエストの対応、そして 422">
+          <div class="stage" data-w="960" data-h="540">
+            <div class="file" data-el="yaml" style="left:20px;top:16px;width:490px">
+              <div class="file-h" data-el="yamlh">openapi.yaml</div>
+              <div data-el="yamlbox"><pre data-lang="yaml"> </pre></div>
+            </div>
+            <div class="file" data-el="req" style="left:526px;top:16px;width:414px">
+              <div class="file-h" data-el="reqh">実際のリクエスト</div>
+              <div data-el="reqbox"><pre data-lang="text"> </pre></div>
+            </div>
+            <div class="node hide" data-el="val" style="left:526px;top:250px;width:414px">
+              <div class="node-h"><i data-icon="search"></i><b class="node-t">request validation</b></div>
+              <div class="node-s" data-el="valv">schema と照合中…</div>
+            </div>
+            <div class="file hide" data-el="res" style="left:20px;top:16px;width:490px">
+              <div class="file-h" data-el="resh">response</div>
+              <div data-el="resbox"></div>
+            </div>
+          </div>
+        </div>
+
+        <pre data-lang="yaml" data-title="openapi.yaml（このページの API の全文）">openapi: 3.1.0
+info:
+  title: Example Users API
+  version: 1.4.0
+servers:
+  - url: https://api.example.com/v1
+security:
+  - bearerAuth: []
+paths:
+  /users:
+    get:
+      operationId: listUsers
+      parameters:
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+        - name: cursor
+          in: query
+          schema: { type: string }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UserPage' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      operationId: createUser
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/NewUser' }
+      responses:
+        '201':
+          description: Created
+          headers:
+            Location: { schema: { type: string }, example: /v1/users/144 }
+            ETag: { schema: { type: string } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/User' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '415': { $ref: '#/components/responses/Problem' }
+        '422': { $ref: '#/components/responses/Problem' }
+  /users/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: integer, minimum: 1 }
+    get:
+      operationId: getUser
+      responses:
+        '200':
+          description: OK
+          headers:
+            ETag: { schema: { type: string } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/User' }
+        '404': { $ref: '#/components/responses/Problem' }
+    patch:
+      operationId: updateUser
+      parameters:
+        - name: If-Match
+          in: header
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/merge-patch+json:
+            schema: { $ref: '#/components/schemas/UserPatch' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/User' }
+        '412': { $ref: '#/components/responses/Problem' }
+        '428': { $ref: '#/components/responses/Problem' }
+    delete:
+      operationId: deleteUser
+      responses:
+        '204': { description: No Content }
+        '403': { $ref: '#/components/responses/Problem' }
+        '404': { $ref: '#/components/responses/Problem' }
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+    apiKey:
+      type: apiKey
+      in: header
+      name: X-API-Key
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      schema: { type: string }
+  schemas:
+    NewUser:
+      type: object
+      required: [name, email]
+      additionalProperties: false
+      properties:
+        name: { type: string, minLength: 1, maxLength: 100 }
+        email: { type: string, format: email }
+    UserPatch:
+      type: object
+      additionalProperties: false
+      properties:
+        name: { type: string, minLength: 1, maxLength: 100 }
+        email: { type: string, format: email }
+    User:
+      type: object
+      required: [id, name, email, created_at]
+      properties:
+        id: { type: integer, readOnly: true }
+        name: { type: string }
+        email: { type: string, format: email }
+        created_at: { type: string, format: date-time, readOnly: true }
+    UserPage:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: array
+          items: { $ref: '#/components/schemas/User' }
+        next_cursor: { type: [string, 'null'] }
+    Problem:
+      type: object
+      properties:
+        type: { type: string, format: uri-reference, default: about:blank }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }
+        instance: { type: string, format: uri-reference }
+        errors:
+          type: array
+          items:
+            type: object
+            properties:
+              detail: { type: string }
+              pointer: { type: string }
+  responses:
+    Problem:
+      description: Problem Details (RFC 9457)
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    Unauthorized:
+      description: 認証情報がない・無効
+      headers:
+        WWW-Authenticate: { schema: { type: string } }
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }</pre>
+
+        <div class="tbl">
+          <table class="ref">
+            <thead><tr><th>openapi.yaml の場所</th><th>実際の HTTP での姿</th></tr></thead>
+            <tbody>
+              <tr><td><code>servers[0].url</code> + <code>paths./users/{id}</code></td><td><code>https://api.example.com/v1/users/42</code></td></tr>
+              <tr><td><code>parameters[in=path].name: id</code> + <code>type: integer</code></td><td><code>/users/abc</code> は検証で弾く</td></tr>
+              <tr><td><code>parameters[in=header].name: If-Match</code></td><td><code>If-Match: "v7"</code></td></tr>
+              <tr><td><code>requestBody.content.application/json</code></td><td>リクエストの <code>Content-Type: application/json</code>（それ以外は 415）</td></tr>
+              <tr><td><code>responses.'201'.headers.Location</code></td><td><code>Location: /v1/users/144</code></td></tr>
+              <tr><td><code>components.securitySchemes.bearerAuth</code> + ルートの <code>security</code></td><td><code>Authorization: Bearer eyJ…</code></td></tr>
+              <tr><td><code>responses.Problem.content.application/problem+json</code></td><td>エラー時の <code>Content-Type</code> と本文の形</td></tr>
+              <tr><td><code>format: date-time</code></td><td>RFC 3339 の <code>"2026-09-28T03:00:00Z"</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <pre data-lang="bash" data-title="openapi.yaml を検査・活用する">$ npx @redocly/cli lint openapi.yaml                 # 仕様として正しいか・ルール違反がないか
+$ npx @redocly/cli build-docs openapi.yaml -o docs.html   # HTML ドキュメント生成
+$ npx @openapitools/openapi-generator-cli generate \
+    -i openapi.yaml -g typescript-fetch -o ./client   # 型付きクライアント生成</pre>
+      </section>
+
+      <!-- 7. コマンド早見表 -->
+      <section class="chapter" id="cheatsheet">
+        <h2>API を叩く curl 早見表</h2>
+        <div class="tbl">
+          <table class="ref">
+            <thead><tr><th>やりたいこと</th><th>コマンド</th><th>ポイント</th></tr></thead>
+            <tbody>
+              <tr><td>認証付き GET</td><td><code>curl -s https://api.example.com/v1/users/42 -H "Authorization: Bearer $TOKEN"</code></td><td>トークンは環境変数に。履歴に残さない</td></tr>
+              <tr><td>ヘッダも見る</td><td><code>curl -si …</code> / <code>curl -sv … -o /dev/null</code></td><td><code>ETag</code> <code>Location</code> <code>Link</code> を確認</td></tr>
+              <tr><td>JSON で作成</td><td><code>curl -s … --json '{"name":"carol","email":"carol@example.com"}'</code></td><td><code>-d</code> だと form-urlencoded になる</td></tr>
+              <tr><td>ファイルの JSON を送る</td><td><code>curl -s … -H 'Content-Type: application/json' --data-binary @user.json</code></td><td><code>-d @file</code> は改行を除去する</td></tr>
+              <tr><td>部分更新（楽観的ロック）</td><td><code>curl -s -X PATCH … -H 'Content-Type: application/merge-patch+json' -H 'If-Match: "v7"' -d '{"email":"a@example.net"}'</code></td><td>ETag はダブルクォートごと</td></tr>
+              <tr><td>冪等キー付き POST</td><td><code>curl -s … -H "Idempotency-Key: \"$(uuidgen)\"" --json @user.json</code></td><td>再送時は同じキーを使う（ドラフト仕様）</td></tr>
+              <tr><td>削除</td><td><code>curl -si -X DELETE https://api.example.com/v1/users/144 -H "Authorization: Bearer $TOKEN"</code></td><td>成功は <code>204</code>（本文なし）</td></tr>
+              <tr><td>ステータスだけ</td><td><code>curl -s -o /dev/null -w '%{http_code}\n' …</code></td><td>シェルスクリプトの分岐に</td></tr>
+              <tr><td>失敗を終了コードに</td><td><code>curl -sS --fail-with-body …</code></td><td>4xx/5xx で exit 22、本文（problem+json）も出る</td></tr>
+              <tr><td>整形・抽出</td><td><code>curl -s … | jq '.data[].id'</code></td><td><code>jq -r</code> で文字列のクォートを外す</td></tr>
+              <tr><td>ページを辿る</td><td><code>curl -sI '…?page=2&amp;per_page=20' | grep -i '^link'</code></td><td><code>rel="next"</code> の URL を次に叩く</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- 8. 手元で試す -->
+      <section class="chapter" id="try">
+        <h2>手元で試す</h2>
+        <p><code>httpbin.org</code> は受け取ったリクエストをそのまま JSON で返す公開サービスです（落ちているときは <code>docker run --rm -p 8080:80 kennethreitz/httpbin</code> でローカルに立てて <code>http://localhost:8080</code> に置き換えます）。</p>
+        <pre data-lang="bash" data-title="1) 自分の送ったヘッダとボディを見る">$ curl -s https://httpbin.org/anything/v1/users \
+    -H 'Authorization: Bearer demo' \
+    --json '{"name":"carol","email":"carol@example.com"}'
+# "method": "POST", "headers": {"Content-Type": "application/json", "Authorization": "Bearer demo", …},
+# "json": {"name": "carol", …} が返る。"X-Amzn-Trace-Id" はロードバランサが付けたヘッダ</pre>
+        <pre data-lang="bash" data-title="2) ETag / If-Match / If-None-Match（/etag/{etag} エンドポイント）">$ curl -si https://httpbin.org/etag/v7 -H 'If-Match: "v6"' | head -1
+HTTP/1.1 412 PRECONDITION FAILED
+$ curl -si https://httpbin.org/etag/v7 -H 'If-None-Match: "v7"' | head -1
+HTTP/1.1 304 NOT MODIFIED
+# reason-phrase が大文字なのはこのサーバー（gunicorn）の癖。クライアントは数字だけを見る</pre>
+        <pre data-lang="bash" data-title="3) ステータスコードだけ確認する / 失敗を終了コードにする">$ curl -s -o /dev/null -w '%{http_code}\n' https://httpbin.org/status/429
+429
+$ curl -sS --fail-with-body https://httpbin.org/status/404; echo "exit=$?"
+curl: (22) The requested URL returned error: 404
+exit=22</pre>
+        <pre data-lang="bash" data-title="4) JWT のペイロードを覗く（署名検証はしない）">$ TOKEN='eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiI0MiIsInNjb3BlIjoidXNlcnM6cmVhZCB1c2Vyczp3cml0ZSIsImlhdCI6MTc5MDU2NDQwMCwiZXhwIjoxNzkwNTY4MDAwfQ.NXJtp6PdE6Y6VBHmvlWtTVkRcTYEYYSLbBfLXj3OEMk'
+$ p=$(printf '%s' "$TOKEN" | cut -d. -f2 | tr '_-' '/+'); while [ $(( ${#p} % 4 )) -ne 0 ]; do p="$p="; done
+$ printf '%s' "$p" | base64 -d; echo
+{"sub":"42","scope":"users:read users:write","iat":1790564400,"exp":1790568000}</pre>
+        <pre data-lang="bash" data-title="5) API キーのハッシュを計算する（DB にはこの値だけを保存）">$ printf '%s' 'demo_k7Qx2mN9pL4vR8sT1wZ3' | openssl dgst -sha256
+SHA2-256(stdin)= da5afbfff67793a050d96fceb39ad62025e5fb7e97d8fb01c04811fca8734f92   # OpenSSL 3.x の表示</pre>
+      </section>
+
+      <!-- 8. ハマりどころ -->
+      <section class="chapter" id="pitfalls">
+        <h2>ハマりどころ</h2>
+        <div class="note warn"><b>動詞の URL：</b><code>POST /v1/createUser</code>、<code>GET /v1/deleteUser?id=42</code> は、メソッドの意味（safe / idempotent）とキャッシュ・リトライの前提を壊します。特に GET で削除すると、クローラやプリフェッチが踏んだだけで消えます。</div>
+        <div class="note warn"><b>200 でエラーを返す：</b>監視・リトライ・<code>res.ok</code> がすべて「成功」と判定します。失敗はステータスコード＋ problem+json。</div>
+        <div class="note warn"><b>オフセットページングの重複・欠落：</b>1 ページ目を読んだ後に先頭へ 1 件追加されると、2 ページ目の先頭が 1 ページ目の末尾と重複します。並び順のキーが一意でない（<code>ORDER BY created_at</code> だけ）と、同じ時刻の行がページ間で入れ替わります。<code>ORDER BY created_at, id</code> のように一意にし、可能ならカーソル方式にします。</div>
+        <div class="note warn"><b>日時の形式とタイムゾーン：</b>JSON には RFC 3339（<code>2026-09-28T03:00:00Z</code> や <code>2026-09-28T12:00:00+09:00</code>）で、オフセット付きで入れます。<code>"2026/09/28 12:00"</code> のようなタイムゾーン不明の文字列や、ミリ秒か秒か分からない数値は避けます。PostgreSQL は <code>timestamptz</code> を使います。</div>
+        <div class="note warn"><b>PostgreSQL の <code>bigint</code> が文字列になる：</b>node-postgres は <code>int8</code> を精度を失わないよう既定で文字列として返すため、<code>"id":"42"</code> と <code>"id":42</code> が混在しがちです。スキーマ（<code>type: integer</code> / <code>string</code>）と実装を揃えます。</div>
+        <div class="note warn"><b><code>proxy_set_header</code> の継承：</b>nginx では <code>location</code> 内に 1 つでも <code>proxy_set_header</code> を書くと、上位（<code>server</code> / <code>http</code>）で書いた <code>proxy_set_header</code> は引き継がれません。<code>Host</code> を書き忘れるとアプリには <code>Host: 127.0.0.1:3000</code> 相当が届き、絶対 URL の生成を誤ります。</div>
+        <div class="note warn"><b>API キーをクエリに入れる：</b><code>?api_key=…</code> は nginx の access.log、ブラウザ履歴、<code>Referer</code> に残ります。ヘッダで送り、サーバーはハッシュで保存・照合します。</div>
+        <div class="note warn"><b>POST の自動リトライ：</b>タイムアウト＝失敗とは限りません（サーバーは処理済みで応答だけ失われたのかもしれない）。<code>Idempotency-Key</code> なしで POST を再送すると二重作成になります。</div>
+      </section>
+
+      <!-- 9. 仕様 -->
+      <section class="chapter" id="spec">
+        <h2>仕様・参考</h2>
+        <ul>
+          <li><a href="https://www.rfc-editor.org/rfc/rfc9110" target="_blank" rel="noopener">RFC 9110 — HTTP Semantics</a>（§9 メソッド、§13 条件付きリクエスト、§15 ステータス）</li>
+          <li><a href="https://www.rfc-editor.org/rfc/rfc9457" target="_blank" rel="noopener">RFC 9457 — Problem Details for HTTP APIs</a></li>
+          <li><a href="https://www.rfc-editor.org/rfc/rfc6750" target="_blank" rel="noopener">RFC 6750 — OAuth 2.0 Bearer Token Usage</a> / <a href="https://www.rfc-editor.org/rfc/rfc7519" target="_blank" rel="noopener">RFC 7519 — JWT</a></li>
+          <li><a href="https://www.rfc-editor.org/rfc/rfc8288" target="_blank" rel="noopener">RFC 8288 — Web Linking（Link ヘッダ）</a> / <a href="https://www.rfc-editor.org/rfc/rfc3339" target="_blank" rel="noopener">RFC 3339 — 日時の形式</a></li>
+          <li><a href="https://www.rfc-editor.org/rfc/rfc7396" target="_blank" rel="noopener">RFC 7396 — JSON Merge Patch</a> / <a href="https://www.rfc-editor.org/rfc/rfc6902" target="_blank" rel="noopener">RFC 6902 — JSON Patch</a> / <a href="https://www.rfc-editor.org/rfc/rfc6585" target="_blank" rel="noopener">RFC 6585 — 428 / 429</a></li>
+          <li><a href="https://datatracker.ietf.org/doc/draft-ietf-httpapi-idempotency-key-header/" target="_blank" rel="noopener">draft-ietf-httpapi-idempotency-key-header（Internet-Draft）</a> / <a href="https://datatracker.ietf.org/doc/draft-ietf-httpapi-ratelimit-headers/" target="_blank" rel="noopener">draft-ietf-httpapi-ratelimit-headers（Internet-Draft）</a></li>
+          <li><a href="https://spec.openapis.org/oas/v3.1.0" target="_blank" rel="noopener">OpenAPI Specification 3.1.0</a></li>
+          <li><a href="https://nginx.org/en/docs/http/ngx_http_proxy_module.html" target="_blank" rel="noopener">nginx ngx_http_proxy_module</a> / <a href="https://expressjs.com/en/guide/behind-proxies.html" target="_blank" rel="noopener">Express behind proxies（trust proxy）</a> / <a href="https://node-postgres.com/features/queries" target="_blank" rel="noopener">node-postgres Queries</a></li>
+          <li>関連ページ：<a href="../http/">HTTP</a> / <a href="../jwt/">JWT</a> / <a href="../oauth-oidc/">OAuth 2.0 / OIDC</a> / <a href="../cors/">CORS</a></li>
+        </ul>
+      </section>
+
+    </main>
+  </div>
+
+  <footer class="site-f"></footer>
+  <script src="../../assets/js/topics.js"></script>
+  <script src="../../assets/js/tim.js"></script>
+  <script src="scenes.js"></script>
+</body>
+</html>

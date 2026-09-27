@@ -1,0 +1,645 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>OAuth 2.0 / OIDC — Tech in Motion</title>
+  <meta name="description" content="OAuth 2.0 認可コードフロー + PKCE と OpenID Connect を、/authorize のリダイレクト、POST /token、id_token の検証までパラメータ単位で。state・PKCE・redirect_uri の攻撃ケースも。">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Space+Grotesk:wght@500;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="../../assets/css/tim.css">
+  <link rel="stylesheet" href="page.css">
+</head>
+<body data-root="../../" data-topic="oauth-oidc">
+  <header class="site-h"></header>
+
+  <div class="page">
+    <aside class="toc"></aside>
+    <main class="doc">
+
+      <!-- 0. HERO -->
+      <section class="hero">
+        <p class="kicker">Auth · OAuth 2.0 / OpenID Connect</p>
+        <h1>OAuth 2.0 / OIDC<small>認可コード + PKCE を、リダイレクトとトークン交換のパラメータ単位で</small></h1>
+        <p class="lead">
+          「Google でログイン」の裏では、ブラウザが 2 回リダイレクトされ、Web アプリのサーバーが IdP の <code>/token</code> を直接叩いています。
+          どのパラメータがブラウザ経由（フロントチャネル）で運ばれ、どれがサーバー間（バックチャネル）でしか流れないのか。
+          <code>state</code>・<code>code_verifier</code>・<code>nonce</code> がそれぞれどの攻撃を防ぐのか。実際の HTTP メッセージで追います。
+        </p>
+        <div class="facts">
+          <div class="fact"><span>フロントチャネル</span><b>ブラウザの 302 で運ぶ <code>/authorize?…</code> と <code>redirect_uri?code=…&amp;state=…</code></b></div>
+          <div class="fact"><span>バックチャネル</span><b>Client → AS の <code>POST /token</code>（クライアント認証 + <code>code_verifier</code>）</b></div>
+          <div class="fact"><span>検証する値</span><b><code>state</code> / PKCE <code>S256</code> / <code>id_token</code> の署名・<code>iss</code>・<code>aud</code>・<code>exp</code>・<code>nonce</code></b></div>
+          <div class="fact"><span>仕様</span><b>RFC 6749 / 6750 / 7636 / 9700・OpenID Connect Core 1.0</b></div>
+        </div>
+      </section>
+
+      <!-- 1. 登場人物 -->
+      <section class="chapter" id="roles">
+        <h2>登場人物と実エンドポイント</h2>
+        <p>
+          OAuth 2.0（RFC 6749 §1.1）の登場人物は 4 つです。OpenID Connect（OIDC）は OAuth 2.0 の上に「誰がログインしたか」を表す <code>id_token</code> を足した仕様で、
+          Authorization Server は OIDC では OpenID Provider（OP）、Client は Relying Party（RP）とも呼ばれます。エンドポイントの URL は
+          <code>/.well-known/openid-configuration</code>（OIDC Discovery）から機械的に取得できます。
+        </p>
+
+        <div class="scene" id="sc-roles" data-title="4 つの役割と Discovery のエンドポイント">
+          <div class="stage" data-w="960" data-h="480">
+            <div class="node" data-el="ro" style="left:16px;top:40px;width:160px">
+              <div class="node-h"><i data-icon="user"></i><b class="node-t">Resource Owner</b></div>
+              <div class="node-s">alice + ブラウザ</div>
+            </div>
+            <div class="node" data-el="as" style="left:296px;top:40px;width:160px">
+              <div class="node-h"><i data-icon="shield"></i><b class="node-t">Authorization Server</b></div>
+              <div class="node-s">https://idp.example</div>
+            </div>
+            <div class="node" data-el="cl" style="left:16px;top:320px;width:160px">
+              <div class="node-h"><i data-icon="server"></i><b class="node-t">Client</b></div>
+              <div class="node-s">https://app.example</div>
+            </div>
+            <div class="node" data-el="rs" style="left:296px;top:320px;width:160px">
+              <div class="node-h"><i data-icon="db"></i><b class="node-t">Resource Server</b></div>
+              <div class="node-s">https://api.example</div>
+            </div>
+            <div class="chip c-amber hide" data-el="lg1" style="left:16px;top:440px">━ フロントチャネル（ブラウザ経由）</div>
+            <div class="chip c-cyan hide" data-el="lg2" style="left:246px;top:440px">━ バックチャネル（サーバー間）</div>
+
+            <div class="file hide" data-el="disc" style="left:476px;top:16px;width:468px">
+              <div class="file-h">GET https://idp.example/.well-known/openid-configuration</div>
+              <pre data-lang="json">{
+  "issuer": "https://idp.example",
+  "authorization_endpoint": "https://idp.example/authorize",
+  "token_endpoint": "https://idp.example/token",
+  "userinfo_endpoint": "https://idp.example/userinfo",
+  "jwks_uri": "https://idp.example/.well-known/jwks.json",
+  "response_types_supported": ["code"],
+  "subject_types_supported": ["public"],
+  "id_token_signing_alg_values_supported": ["RS256"],
+  "code_challenge_methods_supported": ["S256"],
+  "scopes_supported": ["openid", "profile", "email"]
+}</pre>
+            </div>
+            <div class="file hide" data-el="reg" style="left:476px;top:292px;width:468px">
+              <div class="file-h">AS に登録済みのクライアント（RFC 7591 のメタデータ名）</div>
+              <pre data-lang="json">{
+  "client_id": "s6BhdRkqt3",
+  "client_secret": "gX1fBat3bV",
+  "redirect_uris": ["https://app.example/callback"],
+  "grant_types": ["authorization_code", "refresh_token"],
+  "token_endpoint_auth_method": "client_secret_basic"
+}</pre>
+            </div>
+          </div>
+        </div>
+
+        <div class="tbl">
+          <table class="ref">
+            <thead><tr><th>役割（RFC 6749）</th><th>OIDC での呼び名</th><th>このページの例</th><th>持っているもの / やること</th></tr></thead>
+            <tbody>
+              <tr><td>Resource Owner</td><td>End-User</td><td>alice（ブラウザを操作）</td><td>IdP のパスワード。ログインと同意画面の操作だけを行う</td></tr>
+              <tr><td>Client</td><td>Relying Party (RP)</td><td><code>https://app.example</code>（サーバーを持つ Web アプリ）</td><td><code>client_id</code> / <code>client_secret</code>、セッションに <code>state</code>・<code>nonce</code>・<code>code_verifier</code>。トークンを受け取り、<code>id_token</code> を検証</td></tr>
+              <tr><td>Authorization Server</td><td>OpenID Provider (OP)</td><td><code>https://idp.example</code></td><td>ユーザー認証、同意、<code>code</code> とトークンの発行、署名鍵（公開鍵は <code>jwks_uri</code>）</td></tr>
+              <tr><td>Resource Server</td><td>—</td><td><code>https://api.example</code></td><td><code>Authorization: Bearer</code> の access_token を検証して API を提供</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>Discovery 文書のうち、<code>issuer</code>・<code>authorization_endpoint</code>・<code>token_endpoint</code>・<code>jwks_uri</code>・<code>response_types_supported</code>・<code>subject_types_supported</code>・<code>id_token_signing_alg_values_supported</code> は OIDC Discovery 1.0 で必須です（<code>token_endpoint</code> は Implicit のみの OP を除く）。<code>code_challenge_methods_supported</code> は RFC 8414（OAuth 2.0 Authorization Server Metadata）で定義された項目です。</p>
+        <div class="note warn"><b><code>issuer</code> は完全一致で使います。</b>Discovery を取得した URL（<code>/.well-known/openid-configuration</code> を除いた部分）、文書中の <code>issuer</code>、<code>id_token</code> の <code>iss</code> は同一でなければなりません（末尾 <code>/</code> の有無も区別）。</div>
+      </section>
+
+      <!-- 2. 認可コード + PKCE -->
+      <section class="chapter" id="code-flow">
+        <h2>認可コードフロー + PKCE</h2>
+        <p>
+          現在推奨される唯一の対話型フローです（RFC 9700: OAuth 2.0 Security Best Current Practice）。
+          下のシーケンスでは<span class="fc">フロントチャネル（ブラウザのリダイレクトで運ばれる）</span>と<span class="bc">バックチャネル（Client のサーバーから AS へ直接）</span>を色分けしています。
+          <strong>トークンはバックチャネルでしか流れない</strong>ことに注目してください。
+        </p>
+
+        <div class="scene" id="sc-pkce" data-title="認可コード + PKCE：12 ステップのシーケンス">
+          <div class="stage" data-w="960" data-h="540">
+            <div class="node" data-el="br" style="left:20px;top:14px;width:160px">
+              <div class="node-h"><i data-icon="browser"></i><b class="node-t">Browser</b></div>
+              <div class="node-s">alice</div>
+            </div>
+            <div class="node" data-el="cl" style="left:240px;top:14px;width:160px">
+              <div class="node-h"><i data-icon="server"></i><b class="node-t">Client</b></div>
+              <div class="node-s">app.example</div>
+            </div>
+            <div class="node" data-el="as" style="left:460px;top:14px;width:160px">
+              <div class="node-h"><i data-icon="shield"></i><b class="node-t">AS / OP</b></div>
+              <div class="node-s">idp.example</div>
+            </div>
+            <div class="divider" style="left:100px;top:84px;height:420px"></div>
+            <div class="divider" style="left:320px;top:84px;height:420px"></div>
+            <div class="divider" style="left:540px;top:84px;height:420px"></div>
+
+            <div class="chip hide" data-el="a1" style="left:212px;top:92px;width:216px">verifier・state・nonce を生成</div>
+            <div class="chip hide" data-el="a2" style="left:204px;top:128px;width:232px">code_challenge = S256(verifier)</div>
+            <div class="chip hide" data-el="a5" style="left:460px;top:236px;width:160px">ログイン → 同意</div>
+            <div class="chip hide" data-el="a8" style="left:245px;top:344px;width:150px">state を照合</div>
+            <div class="chip hide" data-el="a10" style="left:465px;top:416px;width:150px">PKCE を検証</div>
+
+            <div class="chip c-amber hide" data-el="lg1" style="left:20px;top:514px">━ フロントチャネル</div>
+            <div class="chip c-cyan hide" data-el="lg2" style="left:170px;top:514px">━ バックチャネル</div>
+
+            <div class="file" data-el="sess" style="left:636px;top:14px;width:308px">
+              <div class="file-h">Client のセッション（サーバー側）</div>
+              <div class="file-b"><dl class="kv">
+                <dt>state</dt><dd data-el="v-st">—</dd>
+                <dt>nonce</dt><dd data-el="v-no">—</dd>
+                <dt>code_verifier</dt><dd data-el="v-cv">—</dd>
+                <dt>code_challenge</dt><dd data-el="v-cc">—</dd>
+              </dl></div>
+            </div>
+            <div class="file hide" data-el="asst" style="left:636px;top:180px;width:308px">
+              <div class="file-h">AS が code に紐付けて保存</div>
+              <div class="file-b"><dl class="kv">
+                <dt>client_id</dt><dd>s6BhdRkqt3</dd>
+                <dt>redirect_uri</dt><dd>https://app.example/callback</dd>
+                <dt>code_challenge</dt><dd>E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM</dd>
+                <dt>scope</dt><dd>openid profile email</dd>
+                <dt>nonce</dt><dd>n-0S6_WzA2Mj</dd>
+                <dt>code</dt><dd data-el="v-code">（未発行）</dd>
+              </dl></div>
+            </div>
+            <div class="file hide" data-el="tok" style="left:636px;top:388px;width:308px">
+              <div class="file-h">トークン（Client だけが持つ）</div>
+              <div class="file-b"><dl class="kv">
+                <dt>access_token</dt><dd>SlAV32hkKG</dd>
+                <dt>token_type</dt><dd>Bearer</dd>
+                <dt>expires_in</dt><dd>3600</dd>
+                <dt>refresh_token</dt><dd>8xLOxBtZp8</dd>
+                <dt>id_token</dt><dd>eyJhbGciOiJSUzI1NiIs…</dd>
+              </dl></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="lab" id="pkce-lab">
+          <div class="lab-h">PKCE LAB · WebCrypto で code_challenge を実際に計算</div>
+          <label for="pk-v">code_verifier（43〜128 文字。使える文字は A-Z a-z 0-9 - . _ ~）</label>
+          <input type="text" id="pk-v" spellcheck="false" autocomplete="off" value="dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk">
+          <div class="btns">
+            <button class="btn pri" type="button" id="pk-gen">crypto.getRandomValues で 32 バイト生成</button>
+            <button class="btn" type="button" id="pk-rfc">RFC 7636 付録 B の値に戻す</button>
+          </div>
+          <label>code_challenge = BASE64URL-ENCODE(SHA256(ASCII(code_verifier)))</label>
+          <div class="lab-out"><span id="pk-c">—</span></div>
+          <div id="pk-st" class="lab-st"></div>
+          <label>この値で組み立てた認可リクエスト（302 の Location）</label>
+          <pre data-lang="http" data-bare id="pk-url"></pre>
+        </div>
+        <p>
+          RFC 7636 付録 B のテストベクタでは、<code>code_verifier = dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk</code> に対して
+          <code>code_challenge = E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM</code> になります。上のラボはこの値をブラウザの <code>crypto.subtle.digest('SHA-256', …)</code> で実際に計算しています。
+        </p>
+
+        <h3>実物のメッセージ全文</h3>
+        <pre data-lang="http" data-title="① Client → Browser：認可エンドポイントへのリダイレクト（読みやすさのため改行。実際は 1 行）">HTTP/1.1 302 Found
+Location: https://idp.example/authorize?response_type=code
+    &amp;client_id=s6BhdRkqt3
+    &amp;redirect_uri=https%3A%2F%2Fapp.example%2Fcallback
+    &amp;scope=openid%20profile%20email
+    &amp;state=af0ifjsldkj
+    &amp;nonce=n-0S6_WzA2Mj
+    &amp;code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM
+    &amp;code_challenge_method=S256
+Set-Cookie: __Host-sid=q8Zk2nV0pXw4; Path=/; Secure; HttpOnly; SameSite=Lax</pre>
+        <pre data-lang="http" data-title="② AS → Browser：認可レスポンス（code は 1 回限り・短命）">HTTP/1.1 302 Found
+Location: https://app.example/callback?code=SplxlOBeZQQYbYS6WxSbIA&amp;state=af0ifjsldkj</pre>
+        <pre data-lang="http" data-title="③ Client → AS：トークンリクエスト（バックチャネル）">POST /token HTTP/1.1
+Host: idp.example
+Authorization: Basic czZCaGRSa3F0MzpnWDFmQmF0M2JW
+Content-Type: application/x-www-form-urlencoded
+
+grant_type=authorization_code&amp;code=SplxlOBeZQQYbYS6WxSbIA&amp;redirect_uri=https%3A%2F%2Fapp.example%2Fcallback&amp;code_verifier=dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk</pre>
+        <pre data-lang="http" data-title="④ AS → Client：トークンレスポンス">HTTP/1.1 200 OK
+Content-Type: application/json
+Cache-Control: no-store
+
+{
+  "access_token": "SlAV32hkKG",
+  "token_type": "Bearer",
+  "expires_in": 3600,
+  "refresh_token": "8xLOxBtZp8",
+  "id_token": "eyJhbGciOiJSUzI1NiIsImtpZCI6IjFlOWdkazciLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2lkcC5leGFtcGxlIiwic3ViIjoiMjQ0MDAzMjAiLCJhdWQiOiJzNkJoZFJrcXQzIiwiZXhwIjoxNzkwNTg2MDAwLCJpYXQiOjE3OTA1ODI0MDAsImF1dGhfdGltZSI6MTc5MDU4MjM5NSwibm9uY2UiOiJuLTBTNl9XekEyTWoifQ.Phe6lq4EzTuZhp5W8K2_Om-3TSVVF13MbosJFFeasDbP…",
+  "scope": "openid profile email"
+}</pre>
+        <p><code>Authorization: Basic czZCaGRSa3F0MzpnWDFmQmF0M2JW</code> は <code>s6BhdRkqt3:gX1fBat3bV</code>（<code>client_id:client_secret</code>）の Base64 です（RFC 6749 の例と同じ値。<code>client_secret_basic</code>）。値はすべてデモ用です。</p>
+      </section>
+
+      <!-- 3. トークン検証 -->
+      <section class="chapter" id="tokens">
+        <h2>id_token の検証と access_token の利用</h2>
+        <p>
+          Client が受け取った <code>id_token</code> は、<code>header.payload.signature</code> の JWT（JWS Compact Serialization）です。
+          Client は OIDC Core §3.1.3.7 の手順で検証してから「alice がログインした」とみなします。一方 <code>access_token</code> は <strong>API（Resource Server）が検証するもの</strong>で、Client は中身を解釈しません。
+          JWT の署名そのものの仕組みは <a href="../jwt/">JWT のページ</a>を参照してください。
+        </p>
+
+        <div class="scene" id="sc-verify" data-title="id_token 検証 → Bearer で API → 期限切れ → refresh_token">
+          <div class="stage" data-w="960" data-h="520">
+            <div class="node" data-el="cl" style="left:16px;top:30px;width:190px">
+              <div class="node-h"><i data-icon="server"></i><b class="node-t">Client</b></div>
+              <div class="node-s">app.example</div>
+            </div>
+            <div class="node" data-el="as" style="left:754px;top:30px;width:190px">
+              <div class="node-h"><i data-icon="shield"></i><b class="node-t">AS / OP</b></div>
+              <div class="node-s">idp.example</div>
+            </div>
+            <div class="node" data-el="rs" style="left:754px;top:410px;width:190px">
+              <div class="node-h"><i data-icon="db"></i><b class="node-t">Resource Server</b></div>
+              <div class="node-s">api.example</div>
+            </div>
+            <div class="chip hide" data-el="sub" style="left:16px;top:118px;width:190px">ログイン: sub=24400320</div>
+
+            <div class="seg hide" data-el="idt" style="left:226px;top:30px">
+              <span class="c-pink" data-el="p-h"><small>header</small>eyJhbGciOiJSUzI1…</span>
+              <span class="c-violet" data-el="p-p"><small>payload</small>eyJpc3MiOiJodHRw…</span>
+              <span class="c-cyan" data-el="p-s"><small>signature</small>Phe6lq4EzTuZhp5W…</span>
+            </div>
+            <div class="file hide" data-el="hdr" style="left:226px;top:100px;width:240px">
+              <div class="file-h">header（base64url デコード）</div>
+              <pre data-lang="json">{
+  "alg": "RS256",
+  "kid": "1e9gdk7",
+  "typ": "JWT"
+}</pre>
+            </div>
+            <div class="file hide" data-el="jwks" style="left:486px;top:100px;width:250px">
+              <div class="file-h">GET /.well-known/jwks.json</div>
+              <pre data-lang="json">{"keys": [{
+  "kty": "RSA",
+  "kid": "1e9gdk7",
+  "use": "sig",
+  "alg": "RS256",
+  "n": "0vx7agoebGcQSuuPiLJX…",
+  "e": "AQAB"
+}]}</pre>
+            </div>
+            <div class="file hide" data-el="pay" style="left:226px;top:244px;width:250px">
+              <div class="file-h">payload（base64url デコード）</div>
+              <pre data-lang="json">{
+  "iss": "https://idp.example",
+  "sub": "24400320",
+  "aud": "s6BhdRkqt3",
+  "exp": 1790586000,
+  "iat": 1790582400,
+  "auth_time": 1790582395,
+  "nonce": "n-0S6_WzA2Mj"
+}</pre>
+            </div>
+            <div class="file hide" data-el="chk" style="left:496px;top:300px;width:240px">
+              <div class="file-h">Client の検証結果</div>
+              <div class="file-b"><dl class="kv">
+                <dt>署名</dt><dd data-el="k-sig">—</dd>
+                <dt>iss</dt><dd data-el="k-iss">—</dd>
+                <dt>aud</dt><dd data-el="k-aud">—</dd>
+                <dt>exp</dt><dd data-el="k-exp">—</dd>
+                <dt>nonce</dt><dd data-el="k-non">—</dd>
+              </dl></div>
+            </div>
+
+            <div class="file hide" data-el="areq" style="left:226px;top:100px;width:510px">
+              <div class="file-h" data-el="areqh">リクエスト</div>
+              <pre data-lang="http" data-el="areqp">GET /v1/me HTTP/1.1</pre>
+            </div>
+            <div class="file hide" data-el="ares" style="left:226px;top:290px;width:510px">
+              <div class="file-h" data-el="aresh">レスポンス</div>
+              <pre data-lang="http" data-el="aresp">HTTP/1.1 200 OK</pre>
+            </div>
+          </div>
+        </div>
+
+        <h3>トークン種別の比較</h3>
+        <div class="tbl">
+          <table class="ref">
+            <thead><tr><th>トークン</th><th>誰が検証する</th><th>形式</th><th>送り先 / 用途</th><th>寿命の目安</th></tr></thead>
+            <tbody>
+              <tr><td><code>access_token</code></td><td>Resource Server（API）</td><td>AS 次第：opaque 文字列、または JWT（RFC 9068 の <code>typ: at+jwt</code>）</td><td><code>Authorization: Bearer …</code> で API へ。Client は中身を見ない</td><td>分〜1 時間程度（<code>expires_in</code>）</td></tr>
+              <tr><td><code>refresh_token</code></td><td>Authorization Server</td><td>多くは opaque</td><td><code>POST /token</code>（<code>grant_type=refresh_token</code>）でのみ使う。API には送らない</td><td>長め。ローテーションや失効あり</td></tr>
+              <tr><td><code>id_token</code></td><td>Client（RP）</td><td>必ず JWT（JWS）</td><td>「誰がいつどう認証したか」を Client に伝える。<strong>API の認可に使わない</strong></td><td>短命（受け取った直後に検証するだけ）</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <h3>id_token の検証項目（OIDC Core §3.1.3.7 より主要なもの）</h3>
+        <div class="tbl">
+          <table class="ref">
+            <thead><tr><th>項目</th><th>比較する値</th><th>失敗したら</th></tr></thead>
+            <tbody>
+              <tr><td><code>iss</code></td><td>Discovery の <code>issuer</code> と完全一致</td><td>拒否（別の IdP のトークン）</td></tr>
+              <tr><td><code>aud</code></td><td>自分の <code>client_id</code> を含む（複数なら <code>azp</code> も確認）</td><td>拒否（他のアプリ宛てのトークン）</td></tr>
+              <tr><td>署名 / <code>alg</code></td><td><code>kid</code> で <code>jwks_uri</code> の鍵を選び、想定した <code>alg</code>（既定 <code>RS256</code>）で検証。<code>none</code> は拒否</td><td>拒否（改ざん・偽造）</td></tr>
+              <tr><td><code>exp</code> / <code>iat</code></td><td>現在時刻 &lt; <code>exp</code>。<code>iat</code> が古すぎないか</td><td>拒否（期限切れ・再利用）</td></tr>
+              <tr><td><code>nonce</code></td><td>認可リクエストで送り、セッションに保存した値と一致</td><td>拒否（リプレイ・注入）</td></tr>
+              <tr><td><code>auth_time</code> / <code>acr</code></td><td><code>max_age</code> や <code>acr_values</code> を要求した場合に確認</td><td>再認証を要求</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="note">
+          OIDC Core では、Client が TLS でトークンエンドポイントから<strong>直接</strong>受け取った <code>id_token</code> については、署名検証の代わりに TLS サーバー検証で発行者を確かめてもよい（MAY）とされています。ただしライブラリは通常署名も検証しますし、フロントチャネルで受け取る <code>id_token</code>（Implicit / Hybrid）は必ず署名検証が必要です。
+        </div>
+      </section>
+
+      <!-- 4. 攻撃 -->
+      <section class="chapter" id="attacks">
+        <h2>攻撃・失敗ケース</h2>
+        <p>
+          フロントチャネルはブラウザ・URL・リダイレクトを通るため、攻撃者が値を差し込んだり盗み見たりできます。
+          <code>state</code>（CSRF）、PKCE（認可コードの横取り・注入）、<code>redirect_uri</code> の完全一致（コードの送り先すり替え）が、それぞれどこで何を止めるかを見ます。
+        </p>
+
+        <div class="scene" id="sc-attack" data-title="state 不一致・コード横取り・redirect_uri すり替え">
+          <div class="stage" data-w="960" data-h="520">
+            <div class="node" data-el="vb" style="left:16px;top:30px;width:180px">
+              <div class="node-h"><i data-icon="browser"></i><b class="node-t">Browser（被害者）</b></div>
+              <div class="node-s">alice</div>
+            </div>
+            <div class="node" data-el="cl" style="left:390px;top:30px;width:180px">
+              <div class="node-h"><i data-icon="server"></i><b class="node-t">Client</b></div>
+              <div class="node-s">app.example</div>
+            </div>
+            <div class="node" data-el="as" style="left:764px;top:30px;width:180px">
+              <div class="node-h"><i data-icon="shield"></i><b class="node-t">AS / OP</b></div>
+              <div class="node-s">idp.example</div>
+            </div>
+            <div class="node c-red" data-el="atk" style="left:16px;top:420px;width:180px">
+              <div class="node-h"><i data-icon="attacker"></i><b class="node-t">Attacker</b></div>
+              <div class="node-s">mallory / evil.example</div>
+            </div>
+            <div class="chip c-red hide" data-el="acode" style="left:16px;top:384px;width:180px">code=Hq3ZrV9xLw2PkT7s…</div>
+
+            <div class="file hide" data-el="stc" style="left:220px;top:130px;width:330px">
+              <div class="file-h">Client：state の照合</div>
+              <div class="file-b"><dl class="kv">
+                <dt>セッション</dt><dd data-el="st-s">—</dd>
+                <dt>クエリ</dt><dd data-el="st-q">—</dd>
+                <dt>判定</dt><dd data-el="st-r">—</dd>
+              </dl></div>
+            </div>
+            <div class="file hide" data-el="pkc" style="left:570px;top:130px;width:374px">
+              <div class="file-h">AS：PKCE の検証（トークンエンドポイント）</div>
+              <div class="file-b"><dl class="kv">
+                <dt>code_challenge</dt><dd>E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM</dd>
+                <dt>code_verifier</dt><dd data-el="pk-v">—</dd>
+                <dt>S256(verifier)</dt><dd data-el="pk-h">—</dd>
+                <dt>判定</dt><dd data-el="pk-r">—</dd>
+              </dl></div>
+            </div>
+            <div class="file hide" data-el="rdc" style="left:570px;top:130px;width:374px">
+              <div class="file-h">AS：redirect_uri の完全一致チェック</div>
+              <div class="file-b"><dl class="kv">
+                <dt>登録済み</dt><dd>https://app.example/callback</dd>
+                <dt>要求値</dt><dd data-el="rd-q">https://evil.example/cb</dd>
+                <dt>判定</dt><dd data-el="rd-r">—</dd>
+              </dl></div>
+            </div>
+            <div class="file hide" data-el="err" style="left:220px;top:320px;width:724px">
+              <div class="file-h" data-el="errh">エラーレスポンス</div>
+              <pre data-lang="http" data-el="errp">HTTP/1.1 400 Bad Request</pre>
+            </div>
+          </div>
+        </div>
+
+        <h3>エラーレスポンスの形式</h3>
+        <div class="cols">
+          <pre data-lang="http" data-title="トークンエンドポイント（RFC 6749 §5.2）">HTTP/1.1 400 Bad Request
+Content-Type: application/json
+Cache-Control: no-store
+
+{
+  "error": "invalid_grant",
+  "error_description": "code_verifier does not match code_challenge"
+}</pre>
+          <pre data-lang="http" data-title="認可エンドポイント（RFC 6749 §4.1.2.1）：同意拒否など">HTTP/1.1 302 Found
+Location: https://app.example/callback?error=access_denied
+    &amp;error_description=The%20user%20denied%20the%20request
+    &amp;state=af0ifjsldkj</pre>
+        </div>
+        <div class="tbl">
+          <table class="ref">
+            <thead><tr><th><code>error</code></th><th>返る場所</th><th>典型的な原因</th></tr></thead>
+            <tbody>
+              <tr><td><code>invalid_request</code></td><td>認可 / トークン</td><td>必須パラメータ欠落、重複、形式不正（<code>code_challenge</code> 必須の AS で欠落など）</td></tr>
+              <tr><td><code>invalid_client</code></td><td>トークン（400 または 401）</td><td>クライアント認証失敗（<code>client_secret</code> 誤り、認証方式の不一致）</td></tr>
+              <tr><td><code>invalid_grant</code></td><td>トークン</td><td><code>code</code> の期限切れ・再利用・別クライアント発行、<code>redirect_uri</code> 不一致、<code>code_verifier</code> 不一致、<code>refresh_token</code> 失効</td></tr>
+              <tr><td><code>unauthorized_client</code></td><td>認可 / トークン</td><td>そのクライアントに許可されていない grant / response_type</td></tr>
+              <tr><td><code>unsupported_grant_type</code></td><td>トークン</td><td>AS が対応していない <code>grant_type</code></td></tr>
+              <tr><td><code>unsupported_response_type</code></td><td>認可</td><td>AS が対応していない <code>response_type</code>（例：<code>token</code>）</td></tr>
+              <tr><td><code>invalid_scope</code></td><td>認可 / トークン</td><td>未知・過大なスコープ</td></tr>
+              <tr><td><code>access_denied</code></td><td>認可</td><td>ユーザーが同意を拒否</td></tr>
+              <tr><td><code>server_error</code> / <code>temporarily_unavailable</code></td><td>認可</td><td>AS 側の障害（リダイレクトで伝えるための専用コード）</td></tr>
+              <tr><td><code>invalid_token</code>（RFC 6750）</td><td>API の <code>WWW-Authenticate</code>（401）</td><td>access_token の期限切れ・失効・不正</td></tr>
+              <tr><td><code>insufficient_scope</code>（RFC 6750）</td><td>API の <code>WWW-Authenticate</code>（403）</td><td>スコープ不足</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="note bad">
+          <code>redirect_uri</code> が登録値と一致しない認可リクエストに対して、AS は<strong>そのリダイレクト先へエラーを返してはいけません</strong>（RFC 6749 §4.1.2.1：ユーザーにエラーを表示し、自動リダイレクトしない）。
+          一致判定は完全一致の文字列比較です（RFC 9700 §2.1。例外はネイティブアプリの <code>localhost</code> のポート番号のみ）。
+        </div>
+      </section>
+
+      <!-- 5. グラント種別 -->
+      <section class="chapter" id="grants">
+        <h2>グラント種別の比較</h2>
+        <p>ユーザーがいないサーバー間通信には <code>client_credentials</code>、ブラウザ操作が難しい端末（TV・CLI）には Device Authorization Grant（RFC 8628）を使います。Implicit と Resource Owner Password Credentials は現在使いません。</p>
+
+        <div class="scene" id="sc-grants" data-title="client_credentials と Device Authorization Grant、非推奨の 2 つ">
+          <div class="stage" data-w="960" data-h="500">
+            <div class="node" data-el="job" style="left:16px;top:30px;width:190px">
+              <div class="node-h"><i data-icon="gear"></i><b class="node-t">Client（バッチ）</b></div>
+              <div class="node-s">reports-job</div>
+            </div>
+            <div class="node" data-el="as" style="left:385px;top:30px;width:190px">
+              <div class="node-h"><i data-icon="shield"></i><b class="node-t">AS / OP</b></div>
+              <div class="node-s">idp.example</div>
+            </div>
+            <div class="node" data-el="rs" style="left:754px;top:30px;width:190px">
+              <div class="node-h"><i data-icon="db"></i><b class="node-t">Resource Server</b></div>
+              <div class="node-s">api.example</div>
+            </div>
+            <div class="node hide" data-el="dev" style="left:16px;top:250px;width:190px">
+              <div class="node-h"><i data-icon="terminal"></i><b class="node-t">Device（TV / CLI）</b></div>
+              <div class="node-s">client_id=tv-app</div>
+            </div>
+            <div class="big hide" data-el="uc" style="left:16px;top:330px;width:190px"><small>画面に表示</small>WDJB-MJHT</div>
+            <div class="node hide" data-el="ph" style="left:754px;top:250px;width:190px">
+              <div class="node-h"><i data-icon="phone"></i><b class="node-t">alice のスマホ</b></div>
+              <div class="node-s">idp.example/device</div>
+            </div>
+
+            <div class="file hide" data-el="card" style="left:226px;top:118px;width:508px">
+              <div class="file-h" data-el="cardh">—</div>
+              <pre data-lang="http" data-el="cardp">—</pre>
+            </div>
+            <div class="node sm c-red hide" data-el="imp" style="left:226px;top:410px;width:240px">
+              <div class="node-h"><i data-icon="x"></i><b class="node-t">Implicit</b></div>
+              <div class="node-s">response_type=token</div>
+            </div>
+            <div class="node sm c-red hide" data-el="ropc" style="left:494px;top:410px;width:240px">
+              <div class="node-h"><i data-icon="x"></i><b class="node-t">Password (ROPC)</b></div>
+              <div class="node-s">grant_type=password</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="tbl">
+          <table class="ref">
+            <thead><tr><th>grant / response_type</th><th>使う場面</th><th>トークン要求の要点</th><th>現在の扱い</th></tr></thead>
+            <tbody>
+              <tr><td><code>authorization_code</code> + PKCE</td><td>Web アプリ、SPA、モバイル／デスクトップアプリ（ユーザーあり）</td><td><code>code</code> + <code>redirect_uri</code> + <code>code_verifier</code></td><td>推奨。公開クライアントは PKCE 必須（RFC 9700 §2.1.1）</td></tr>
+              <tr><td><code>refresh_token</code></td><td>access_token の更新</td><td><code>refresh_token</code>（+ 任意で縮小した <code>scope</code>）</td><td>公開クライアントの refresh_token は送信者制約かローテーション必須（RFC 9700 §2.2.2）</td></tr>
+              <tr><td><code>client_credentials</code></td><td>バッチ・サーバー間（ユーザーなし）</td><td>クライアント認証 + <code>scope</code>。refresh_token は通常返らない</td><td>機密クライアントのみ</td></tr>
+              <tr><td><code>urn:ietf:params:oauth:grant-type:device_code</code></td><td>TV・CLI など入力が不自由な端末（RFC 8628）</td><td><code>device_code</code> をポーリング（<code>interval</code> 秒ごと）</td><td>利用可。フィッシング（user_code の騙し取り）に注意</td></tr>
+              <tr><td><code>response_type=token</code>（Implicit）</td><td>かつての SPA</td><td>access_token を URL フラグメントで直接受け取る</td><td>使うべきでない（SHOULD NOT、RFC 9700 §2.1.2）</td></tr>
+              <tr><td><code>password</code>（ROPC）</td><td>かつての自社アプリ</td><td>ユーザーのパスワードを Client が受け取って送る</td><td>使ってはならない（MUST NOT、RFC 9700 §2.4）</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- 6. パラメータ早見表 -->
+      <section class="chapter" id="params">
+        <h2>パラメータ早見表</h2>
+        <h3>認可リクエスト <code>GET /authorize</code>（フロントチャネル）</h3>
+        <div class="tbl">
+          <table class="ref">
+            <thead><tr><th>パラメータ</th><th>必須</th><th>値の例</th><th>意味・根拠</th></tr></thead>
+            <tbody>
+              <tr><td><code>response_type</code></td><td>必須</td><td><code>code</code></td><td>認可コードフロー（RFC 6749 §4.1.1）</td></tr>
+              <tr><td><code>client_id</code></td><td>必須</td><td><code>s6BhdRkqt3</code></td><td>AS に登録したクライアントの ID（秘密ではない）</td></tr>
+              <tr><td><code>redirect_uri</code></td><td>OAuth では条件付き / OIDC では必須</td><td><code>https://app.example/callback</code></td><td>登録値と完全一致。トークンリクエストでも同じ値を送る</td></tr>
+              <tr><td><code>scope</code></td><td>OIDC では <code>openid</code> 必須</td><td><code>openid profile email</code></td><td>スペース区切り。<code>offline_access</code> で refresh_token を求める AS もある</td></tr>
+              <tr><td><code>state</code></td><td>推奨</td><td><code>af0ifjsldkj</code></td><td>CSRF 対策。セッションに保存し、戻りのクエリと照合（PKCE / nonce で代替可：RFC 9700 §2.1）</td></tr>
+              <tr><td><code>nonce</code></td><td>OIDC（コードフローでは任意だが推奨）</td><td><code>n-0S6_WzA2Mj</code></td><td><code>id_token</code> の <code>nonce</code> と照合（リプレイ・注入対策）</td></tr>
+              <tr><td><code>code_challenge</code></td><td>PKCE</td><td><code>E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM</code></td><td><code>BASE64URL(SHA256(code_verifier))</code>（RFC 7636 §4.2）</td></tr>
+              <tr><td><code>code_challenge_method</code></td><td>PKCE</td><td><code>S256</code></td><td>省略時は <code>plain</code>。<code>S256</code> を使う</td></tr>
+              <tr><td><code>prompt</code> / <code>max_age</code> / <code>login_hint</code></td><td>任意（OIDC）</td><td><code>prompt=login</code>, <code>max_age=300</code></td><td>再ログイン強制、認証からの経過秒数上限、ユーザー名の事前入力</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <h3>トークンリクエスト <code>POST /token</code>（バックチャネル）</h3>
+        <div class="tbl">
+          <table class="ref">
+            <thead><tr><th>パラメータ / ヘッダ</th><th>grant_type</th><th>意味</th></tr></thead>
+            <tbody>
+              <tr><td><code>grant_type</code></td><td>全て</td><td><code>authorization_code</code> / <code>refresh_token</code> / <code>client_credentials</code> / <code>urn:ietf:params:oauth:grant-type:device_code</code></td></tr>
+              <tr><td><code>code</code></td><td>authorization_code</td><td>認可レスポンスで受け取った値（1 回限り）</td></tr>
+              <tr><td><code>redirect_uri</code></td><td>authorization_code</td><td>認可リクエストで送った値と同一</td></tr>
+              <tr><td><code>code_verifier</code></td><td>authorization_code</td><td>PKCE の元の乱数（43〜128 文字）</td></tr>
+              <tr><td><code>refresh_token</code></td><td>refresh_token</td><td>更新に使う refresh_token</td></tr>
+              <tr><td><code>scope</code></td><td>client_credentials / refresh_token</td><td>要求スコープ（refresh では元の範囲以下）</td></tr>
+              <tr><td><code>device_code</code></td><td>device_code</td><td><code>/device_authorization</code> で受け取った値</td></tr>
+              <tr><td><code>Authorization: Basic …</code></td><td>機密クライアント</td><td><code>client_secret_basic</code>。他に <code>client_secret_post</code>（本文に <code>client_id</code>/<code>client_secret</code>）、<code>private_key_jwt</code>（<code>client_assertion</code>）</td></tr>
+              <tr><td><code>client_id</code></td><td>公開クライアント</td><td>クライアント認証をしない場合は本文に入れる</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <h3>トークンレスポンス（RFC 6749 §5.1 + OIDC）</h3>
+        <div class="tbl">
+          <table class="ref">
+            <thead><tr><th>フィールド</th><th>意味</th></tr></thead>
+            <tbody>
+              <tr><td><code>access_token</code></td><td>API に送るトークン</td></tr>
+              <tr><td><code>token_type</code></td><td><code>Bearer</code>（RFC 6750）。DPoP を使う場合は <code>DPoP</code>（RFC 9449）</td></tr>
+              <tr><td><code>expires_in</code></td><td>access_token の有効秒数（推奨）</td></tr>
+              <tr><td><code>refresh_token</code></td><td>任意。AS のポリシー次第</td></tr>
+              <tr><td><code>scope</code></td><td>要求と異なる場合は必須、同じなら省略可</td></tr>
+              <tr><td><code>id_token</code></td><td>OIDC（<code>scope</code> に <code>openid</code> を含むとき）</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>トークンを含むレスポンスには <code>Cache-Control: no-store</code> が付きます（RFC 6749 §5.1 は <code>Pragma: no-cache</code> も併記）。</p>
+      </section>
+
+      <!-- 7. 手元で試す -->
+      <section class="chapter" id="try">
+        <h2>手元で試す</h2>
+        <h3>PKCE の値を openssl で作る</h3>
+        <pre data-lang="bash" data-title="code_verifier / code_challenge">$ verifier=$(openssl rand -base64 32 | tr '+/' '-_' | tr -d '=')
+$ echo -n "$verifier" | wc -c
+43
+$ challenge=$(printf '%s' "$verifier" | openssl dgst -sha256 -binary | openssl base64 -A | tr '+/' '-_' | tr -d '=')
+$ echo "$challenge"
+
+# RFC 7636 付録 B のテストベクタで検算
+$ printf '%s' 'dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk' | openssl dgst -sha256 -binary | openssl base64 -A | tr '+/' '-_' | tr -d '='
+E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM</pre>
+        <h3>Discovery → トークン交換 → API を curl で</h3>
+        <pre data-lang="bash" data-title="curl + jq">$ curl -s https://idp.example/.well-known/openid-configuration \
+    | jq '{issuer, authorization_endpoint, token_endpoint, jwks_uri}'
+
+# ブラウザで /authorize を開いてログイン → リダイレクト先 URL の code= を控える
+$ curl -s https://idp.example/token \
+    -u 's6BhdRkqt3:gX1fBat3bV' \
+    -d grant_type=authorization_code \
+    -d code=SplxlOBeZQQYbYS6WxSbIA \
+    --data-urlencode redirect_uri=https://app.example/callback \
+    -d code_verifier="$verifier" | tee token.json | jq .
+
+# id_token の payload を読む（base64url → base64 に直してパディング補完）
+$ b64url_d() { local s; s=$(printf '%s' "$1" | tr '_-' '/+'); while (( ${#s} % 4 )); do s+='='; done; printf '%s' "$s" | base64 -d; }
+$ b64url_d "$(jq -r .id_token token.json | cut -d. -f2)" | jq .
+
+# access_token で API、期限切れなら refresh
+$ curl -i https://api.example/v1/me -H "Authorization: Bearer $(jq -r .access_token token.json)"
+$ curl -s https://idp.example/token -u 's6BhdRkqt3:gX1fBat3bV' \
+    -d grant_type=refresh_token -d refresh_token="$(jq -r .refresh_token token.json)" | jq .</pre>
+        <h3>ローカルに IdP を立てる（Keycloak）</h3>
+        <p>Keycloak 26 系をコンテナで起動すると、実物の Discovery 文書・JWKS・トークンエンドポイントを手元で観察できます（開発モード。管理者の環境変数名は 26 系のもの）。</p>
+        <pre data-lang="bash" data-title="Keycloak 26（開発モード）">$ docker run --rm -p 8080:8080 \
+    -e KC_BOOTSTRAP_ADMIN_USERNAME=admin -e KC_BOOTSTRAP_ADMIN_PASSWORD=admin \
+    quay.io/keycloak/keycloak:26.0.0 start-dev
+$ curl -s http://localhost:8080/realms/master/.well-known/openid-configuration | jq .token_endpoint
+"http://localhost:8080/realms/master/protocol/openid-connect/token"</pre>
+      </section>
+
+      <!-- 8. ハマりどころ -->
+      <section class="chapter" id="pitfalls">
+        <h2>ハマりどころ</h2>
+        <div class="note warn">
+          <ul>
+            <li><b>Client で access_token を検証・解釈しない</b>：access_token は API 向け。形式は AS の都合で変わります（opaque ↔ JWT）。Client がユーザー情報を知りたいなら <code>id_token</code> か <code>userinfo_endpoint</code> を使います。</li>
+            <li><b>id_token を API の認可に使わない</b>：<code>aud</code> は Client の <code>client_id</code> で、API 宛てではありません。API には access_token を送ります。</li>
+            <li><b>トークンの保管場所</b>：ブラウザの <code>localStorage</code> に置いたトークンは XSS で盗まれます。サーバーを持つ Web アプリはトークンをサーバー側に置き、ブラウザには <code>HttpOnly; Secure; SameSite</code> のセッション Cookie だけを渡す（BFF パターン）のが堅実です。</li>
+            <li><b><code>state</code> をセッションに紐付けていない</b>：固定値や、Cookie に紐付かない保存場所（全ユーザー共通のキャッシュ等）では CSRF を防げません。1 回使ったら消します。</li>
+            <li><b><code>redirect_uri</code> の表記ゆれ</b>：末尾 <code>/</code>、大文字小文字、<code>http</code>/<code>https</code>、ポート、クエリの有無で不一致になります。登録値をコピーして使います。</li>
+            <li><b><code>code</code> の再利用</b>：認可コードは 1 回限り。二重送信（リロード・リトライ）で <code>invalid_grant</code> になり、AS によってはそのコードで発行済みのトークンも失効させます（RFC 6749 §4.1.2）。</li>
+            <li><b>時計のずれ</b>：<code>exp</code>/<code>iat</code> の検証でサーバーの時刻がずれていると失敗します。NTP を確認し、許容スキューは数十秒程度に留めます。</li>
+            <li><b>JWKS のキャッシュと鍵ローテーション</b>：未知の <code>kid</code> が来たら JWKS を再取得します。ただし毎回取得すると AS に負荷がかかるのでレート制限付きで。</li>
+            <li><b>Basic 認証のエンコード</b>：RFC 6749 §2.3.1 では <code>client_id</code>・<code>client_secret</code> を <code>application/x-www-form-urlencoded</code> でエンコードしてから Base64 します。記号を含むシークレットで <code>invalid_client</code> になる典型原因です。</li>
+            <li><b>SPA から <code>/token</code> を直接呼ぶ</b>：ブラウザからの <code>POST /token</code> はクロスオリジンなので、AS 側の CORS 許可が必要です（<a href="../cors/">CORS のページ</a>）。SPA は公開クライアントなので <code>client_secret</code> を埋め込まず、PKCE を使います。</li>
+          </ul>
+        </div>
+      </section>
+
+      <!-- 9. 仕様 -->
+      <section class="chapter" id="spec">
+        <h2>仕様・参考</h2>
+        <ul>
+          <li><a href="https://www.rfc-editor.org/rfc/rfc6749" target="_blank" rel="noopener">RFC 6749 — The OAuth 2.0 Authorization Framework</a>（§4.1 認可コード、§4.4 client_credentials、§5 トークンレスポンス／エラー、§6 refresh、§10.12 CSRF）</li>
+          <li><a href="https://www.rfc-editor.org/rfc/rfc6750" target="_blank" rel="noopener">RFC 6750 — Bearer Token Usage</a>（<code>Authorization: Bearer</code>、<code>WWW-Authenticate</code> のエラー）</li>
+          <li><a href="https://www.rfc-editor.org/rfc/rfc7636" target="_blank" rel="noopener">RFC 7636 — Proof Key for Code Exchange (PKCE)</a>（§4.1 code_verifier、§4.2 S256、付録 B テストベクタ）</li>
+          <li><a href="https://www.rfc-editor.org/rfc/rfc8414" target="_blank" rel="noopener">RFC 8414 — OAuth 2.0 Authorization Server Metadata</a></li>
+          <li><a href="https://www.rfc-editor.org/rfc/rfc8628" target="_blank" rel="noopener">RFC 8628 — OAuth 2.0 Device Authorization Grant</a></li>
+          <li><a href="https://www.rfc-editor.org/rfc/rfc9700" target="_blank" rel="noopener">RFC 9700 — Best Current Practice for OAuth 2.0 Security</a>（2025 年 1 月）</li>
+          <li><a href="https://www.rfc-editor.org/rfc/rfc7662" target="_blank" rel="noopener">RFC 7662 — Token Introspection</a> / <a href="https://www.rfc-editor.org/rfc/rfc9068" target="_blank" rel="noopener">RFC 9068 — JWT Profile for Access Tokens</a> / <a href="https://www.rfc-editor.org/rfc/rfc7591" target="_blank" rel="noopener">RFC 7591 — Dynamic Client Registration</a></li>
+          <li><a href="https://openid.net/specs/openid-connect-core-1_0.html" target="_blank" rel="noopener">OpenID Connect Core 1.0</a>（§3.1 Authorization Code Flow、§3.1.3.7 ID Token Validation）</li>
+          <li><a href="https://openid.net/specs/openid-connect-discovery-1_0.html" target="_blank" rel="noopener">OpenID Connect Discovery 1.0</a>（§3 Provider Metadata、§4 <code>/.well-known/openid-configuration</code>）</li>
+          <li><a href="https://www.rfc-editor.org/rfc/rfc7517" target="_blank" rel="noopener">RFC 7517 — JSON Web Key (JWK)</a>（JWKS の <code>n</code> の例はこの RFC の付録 A.1 から）</li>
+          <li>関連：<a href="../jwt/">JWT</a>、<a href="../cors/">CORS</a></li>
+        </ul>
+      </section>
+
+    </main>
+  </div>
+
+  <footer class="site-f"></footer>
+  <script src="../../assets/js/topics.js"></script>
+  <script src="../../assets/js/tim.js"></script>
+  <script src="scenes.js"></script>
+</body>
+</html>

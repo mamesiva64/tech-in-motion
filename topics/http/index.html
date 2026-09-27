@@ -1,0 +1,650 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>HTTP — Tech in Motion</title>
+  <meta name="description" content="HTTP のリクエスト／レスポンスを、TCP 上を流れるバイト列・curl -v の出力・ステータスコードの発生源・キャッシュの 304・HTTP/2 のフレームまで、実物のまま動かして見るページ。">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Space+Grotesk:wght@500;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="../../assets/css/tim.css">
+  <link rel="stylesheet" href="page.css">
+</head>
+<body data-root="../../" data-topic="http">
+  <header class="site-h"></header>
+
+  <div class="page">
+    <aside class="toc"></aside>
+    <main class="doc">
+
+      <!-- 0. HERO -->
+      <section class="hero">
+        <p class="kicker">Web / HTTP · Request / Response</p>
+        <h1>HTTP<small>TCP の上を流れる「テキストの行」と、それを返すのは誰か</small></h1>
+        <p class="lead">HTTP/1.1 のメッセージは、<code>GET /index.html HTTP/1.1</code> で始まり <code>\r\n</code> で区切られた行の並びにすぎません。このページでは <code>curl -v</code> の <code>&gt;</code> <code>&lt;</code> 行、ワイヤ上の 16 進ダンプ、nginx とアプリのどちらが <code>502</code> や <code>415</code> を返したのか、<code>ETag</code> から <code>304</code> が生まれる瞬間、HTTP/2 の 9 バイトのフレームヘッダまでを、実物のまま順に再生します。</p>
+        <div class="facts">
+          <div class="fact"><span>どこで</span><b>クライアント（curl / ブラウザ）→ TCP :80 / TLS :443 → nginx → アプリ</b></div>
+          <div class="fact"><span>何を</span><b>リクエストライン + ヘッダ + 空行 <code>\r\n</code> + ボディ</b></div>
+          <div class="fact"><span>どうやって見る</span><b><code>curl -v</code> / <code>curl --trace-ascii -</code> / <code>-w '%{http_code}'</code></b></div>
+          <div class="fact"><span>仕様</span><b>RFC 9110（意味論）/ 9111（キャッシュ）/ 9112（HTTP/1.1）/ 9113（HTTP/2）/ 9114（HTTP/3）</b></div>
+        </div>
+      </section>
+
+      <!-- 1. 全体像：メッセージの実物 -->
+      <section class="chapter" id="overview">
+        <h2>全体像：curl -v の 1 往復を分解する</h2>
+        <p>HTTP/1.1 では、TCP 接続（HTTPS なら TLS の中）にテキストの行をそのまま書き込みます。改行は必ず <code>CR LF</code>（<code>0d 0a</code>）で、<strong>空行（<code>\r\n</code> だけの行）がヘッダの終わり</strong>です。ボディの長さは <code>Content-Length</code> か <code>Transfer-Encoding: chunked</code> で決まります。</p>
+
+        <div class="scene" id="sc-msg" data-title="curl -v の 1 往復：ワイヤを流れるバイト列">
+          <div class="stage" data-w="960" data-h="520">
+            <div class="node" data-el="cli" style="left:20px;top:16px;width:230px">
+              <div class="node-h"><i data-icon="terminal"></i><b class="node-t">curl 8.21.0</b></div>
+              <div class="node-s">client · 192.168.1.10</div>
+            </div>
+            <div class="node" data-el="srv" style="left:710px;top:16px;width:230px">
+              <div class="node-h"><i data-icon="server"></i><b class="node-t">nginx</b></div>
+              <div class="node-s">www.example.com<br>203.0.113.10 · TCP :80</div>
+            </div>
+
+            <div class="term" data-el="t" style="left:20px;top:112px;width:440px;height:350px">
+              <div class="term-h">bash — curl -sv</div>
+              <div class="term-b"></div>
+            </div>
+
+            <div class="file hide" data-el="req" style="left:480px;top:112px;width:460px">
+              <div class="file-h">送信バイト列 192.168.1.10 → 203.0.113.10:80<small>89 bytes</small></div>
+              <div class="file-b wire-b">
+                <div class="wl hide" data-el="rq1"><b>GET</b> /index.html HTTP/1.1<i class="crlf">\r\n</i></div>
+                <div class="wl hide" data-el="rq2">Host: www.example.com<i class="crlf">\r\n</i></div>
+                <div class="wl hide" data-el="rq2">User-Agent: curl/8.21.0<i class="crlf">\r\n</i></div>
+                <div class="wl hide" data-el="rq2">Accept: */*<i class="crlf">\r\n</i></div>
+                <div class="wl hide" data-el="rq3"><i class="crlf" style="margin-left:0">\r\n</i>  <em>← 空行＝ヘッダ終端（GET なのでボディなし）</em></div>
+              </div>
+            </div>
+
+            <div class="file hide" data-el="res" style="left:480px;top:112px;width:460px">
+              <div class="file-h">受信バイト列 203.0.113.10:80 → 192.168.1.10</div>
+              <div class="file-b wire-b">
+                <div class="wl hide" data-el="rs1"><b>HTTP/1.1 200 OK</b><i class="crlf">\r\n</i></div>
+                <div class="wl hide" data-el="rs2">Server: nginx/1.27.2<i class="crlf">\r\n</i></div>
+                <div class="wl hide" data-el="rs2">Date: Mon, 28 Sep 2026 03:00:00 GMT<i class="crlf">\r\n</i></div>
+                <div class="wl hide" data-el="rs2">Content-Type: text/html<i class="crlf">\r\n</i></div>
+                <div class="wl hide" data-el="rs2">Content-Length: 1256<i class="crlf">\r\n</i></div>
+                <div class="wl hide" data-el="rs2">Last-Modified: Fri, 25 Sep 2026 09:30:00 GMT<i class="crlf">\r\n</i></div>
+                <div class="wl hide" data-el="rs2">ETag: "6ab63f18-4e8"<i class="crlf">\r\n</i></div>
+                <div class="wl hide" data-el="rs3"><i class="crlf" style="margin-left:0">\r\n</i>  <em>← 空行</em></div>
+                <div class="wl hide" data-el="rs4">&lt;!doctype html&gt;&lt;html&gt;…  <em>ちょうど 1256 バイト</em></div>
+              </div>
+            </div>
+
+            <div class="file hide" data-el="bad" style="left:480px;top:112px;width:460px">
+              <div class="file-h">Host を付けずに送った場合</div>
+              <div class="file-b wire-b">
+                <div class="wl"><b>GET</b> /index.html HTTP/1.1<i class="crlf">\r\n</i></div>
+                <div class="wl"><i class="crlf" style="margin-left:0">\r\n</i>  <em>← Host ヘッダなしで空行</em></div>
+                <div class="wl hide" data-el="bd1"> </div>
+                <div class="wl hide" data-el="bd1"><b style="color:var(--red)">HTTP/1.1 400 Bad Request</b><i class="crlf">\r\n</i></div>
+                <div class="wl hide" data-el="bd1">Server: nginx/1.27.2<i class="crlf">\r\n</i></div>
+                <div class="wl hide" data-el="bd1">Content-Type: text/html<i class="crlf">\r\n</i></div>
+                <div class="wl hide" data-el="bd1">Connection: close<i class="crlf">\r\n</i></div>
+              </div>
+            </div>
+
+            <div class="seg hide" data-el="rlseg" style="left:480px;top:268px;width:460px">
+              <span class="c-lime" style="flex:0 0 96px"><small>method</small>GET</span>
+              <span class="c-cyan" style="flex:1 1 auto"><small>request-target</small>/index.html</span>
+              <span class="c-violet" style="flex:0 0 126px"><small>HTTP-version</small>HTTP/1.1</span>
+            </div>
+            <div class="note-s hide" data-el="hosttip" style="left:480px;top:330px;width:460px">HTTP/1.1 のクライアントは <code>Host</code> を必ず送る（RFC 9112 §3.2）。1 つの IP で複数サイトを配信する nginx は、この値で <code>server_name</code> を選びます。</div>
+
+            <div class="bytes hide" data-el="hex" style="left:480px;top:268px;width:460px">0050: 3a 20 2a 2f 2a <b>0d 0a 0d 0a</b>
+      :  ␠  *  /  *  <b>\r \n \r \n</b>
+「Accept: */*」の行末 CRLF に続けて、もう一度 CRLF ＝ 空行</div>
+
+            <div class="seg hide" data-el="slseg" style="left:480px;top:332px;width:460px">
+              <span class="c-violet" style="flex:0 0 126px"><small>HTTP-version</small>HTTP/1.1</span>
+              <span class="c-green" style="flex:0 0 120px"><small>status-code</small>200</span>
+              <span class="c-gray" style="flex:1 1 auto"><small>reason-phrase</small>OK（飾り）</span>
+            </div>
+            <div class="note-s hide" data-el="bodytip" style="left:480px;top:396px;width:460px">ボディの終わりは <code>Content-Length: 1256</code> で分かります（長さ不明なら <code>Transfer-Encoding: chunked</code>）。だから同じ TCP 接続で次のリクエストを送れます。</div>
+          </div>
+        </div>
+
+        <h3>curl -v の行頭記号</h3>
+        <div class="tbl">
+          <table class="ref">
+            <thead><tr><th>行頭</th><th>意味</th><th>例</th></tr></thead>
+            <tbody>
+              <tr><td><code>*</code></td><td>curl 自身の情報（名前解決・接続・TLS・接続の再利用）</td><td><code>* Established connection to www.example.com (203.0.113.10 port 80) …</code></td></tr>
+              <tr><td><code>&gt;</code></td><td>送信したリクエストラインとヘッダ（最後の <code>&gt;</code> だけの行が空行）</td><td><code>&gt; GET /index.html HTTP/1.1</code></td></tr>
+              <tr><td><code>&lt;</code></td><td>受信したステータスラインとヘッダ</td><td><code>&lt; HTTP/1.1 200 OK</code></td></tr>
+              <tr><td><code>}</code></td><td>送信したボディのバイト数（<code>-d</code> などでボディを送ったとき）</td><td><code>} [16 bytes data]</code></td></tr>
+              <tr><td><code>{</code></td><td>受信したボディのバイト数（<code>-o</code> で本文をファイルへ逃がしたとき）</td><td><code>{ [1256 bytes data]</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="note">上のシーンの <code>*</code> 行は curl 8.21.0 の実際の出力形式です。<code>* Connected to … port 80</code>（旧）／<code>* Established connection to …</code>（新）など、<b>文言は curl のバージョンで変わります</b>。<code>&gt;</code> <code>&lt;</code> 行の中身はワイヤ上のバイト列そのものです。</div>
+      </section>
+
+      <!-- 2. メッセージの構造 -->
+      <section class="chapter" id="anatomy">
+        <h2>メッセージの構造（RFC 9112）</h2>
+        <p>RFC 9112 §2.1 の ABNF がすべてです。リクエストとレスポンスは開始行（start-line）だけが違います。</p>
+        <pre data-lang="text" data-title="RFC 9112 §2.1 / §3 / §4">HTTP-message   = start-line CRLF
+                 *( field-line CRLF )
+                 CRLF
+                 [ message-body ]
+start-line     = request-line / status-line
+request-line   = method SP request-target SP HTTP-version
+status-line    = HTTP-version SP status-code SP [ reason-phrase ]</pre>
+
+        <div class="tbl">
+          <table class="ref">
+            <thead><tr><th>部品</th><th>リクエストでの実物</th><th>レスポンスでの実物</th><th>メモ</th></tr></thead>
+            <tbody>
+              <tr><td>start-line</td><td><code>GET /index.html HTTP/1.1</code></td><td><code>HTTP/1.1 200 OK</code></td><td>区切りは SP 1 個。reason-phrase は無視してよい（<code>412 PRECONDITION FAILED</code> のように大文字で返すサーバーもある）</td></tr>
+              <tr><td>field-line</td><td><code>Host: www.example.com</code></td><td><code>Content-Type: text/html</code></td><td>名前は大文字小文字を区別しない。<code>:</code> の前に空白は不可</td></tr>
+              <tr><td>空行</td><td colspan="2"><code>\r\n</code>（<code>0d 0a</code>）だけの行</td><td>これがないとサーバーはヘッダの続きを待ち続ける</td></tr>
+              <tr><td>message-body</td><td>POST/PUT/PATCH の JSON など</td><td>HTML・JSON・画像など</td><td>長さは <code>Content-Length</code> か <code>Transfer-Encoding: chunked</code>。<code>HEAD</code> への応答と <code>204</code> / <code>304</code> はボディなし</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="cols">
+          <pre data-lang="http" data-title="リクエスト（POST, JSON ボディ付き）">POST /v1/users HTTP/1.1
+Host: api.example.com
+User-Agent: curl/8.21.0
+Accept: application/json
+Content-Type: application/json
+Content-Length: 16
+
+{"name":"alice"}</pre>
+          <pre data-lang="http" data-title="レスポンス（chunked）">HTTP/1.1 201 Created
+Location: /v1/users/42
+Content-Type: application/json
+Transfer-Encoding: chunked
+
+18
+{"id":42,"name":"alice"}
+0
+</pre>
+        </div>
+        <p>chunked の <code>18</code> は 16 進のチャンク長（24 バイト＝<code>{"id":42,"name":"alice"}</code>）で、長さ <code>0</code> のチャンクと空行で終わります。各行末はすべて <code>\r\n</code> です。</p>
+
+        <pre data-lang="bash" data-title="送ったバイト列を 16 進で見る（curl --trace -）">$ curl -s --trace - -o /dev/null http://www.example.com/index.html
+=> Send header, 89 bytes (0x59)
+0000: 47 45 54 20 2f 69 6e 64 65 78 2e 68 74 6d 6c 20 GET /index.html
+0010: 48 54 54 50 2f 31 2e 31 0d 0a 48 6f 73 74 3a 20 HTTP/1.1..Host:
+0020: 77 77 77 2e 65 78 61 6d 70 6c 65 2e 63 6f 6d 0d www.example.com.
+0030: 0a 55 73 65 72 2d 41 67 65 6e 74 3a 20 63 75 72 .User-Agent: cur
+0040: 6c 2f 38 2e 32 31 2e 30 0d 0a 41 63 63 65 70 74 l/8.21.0..Accept
+0050: 3a 20 2a 2f 2a ⟪0d 0a 0d 0a⟫                      : */*....</pre>
+      </section>
+
+      <!-- 3. メソッド -->
+      <section class="chapter" id="methods">
+        <h2>メソッドと冪等性（safe / idempotent）</h2>
+        <p>RFC 9110 §9.2.2 の定義では、<strong>idempotent（冪等）とは「同じリクエストを何回送っても、サーバー上の意図した効果が 1 回のときと同じ」</strong>ことです。レスポンスが同じである必要はありません（2 回目の <code>DELETE</code> が <code>404</code> でも冪等）。冪等なメソッドは、接続が切れたときにクライアントやプロキシが自動で再送できます。</p>
+
+        <div class="scene" id="sc-methods" data-title="同じリクエストを 2 回送ると何が起きるか">
+          <div class="stage" data-w="960" data-h="500">
+            <div class="node" data-el="cli" style="left:20px;top:20px;width:190px">
+              <div class="node-h"><i data-icon="terminal"></i><b class="node-t">curl</b></div>
+              <div class="node-s">client</div>
+            </div>
+            <div class="node" data-el="api" style="left:330px;top:20px;width:210px">
+              <div class="node-h"><i data-icon="server"></i><b class="node-t">API server</b></div>
+              <div class="node-s">api.example.com :443</div>
+            </div>
+            <div class="term" data-el="t" style="left:20px;top:112px;width:520px;height:328px">
+              <div class="term-h">bash</div>
+              <div class="term-b"></div>
+            </div>
+            <div class="file" data-el="db" style="left:570px;top:20px;width:370px">
+              <div class="file-h"><i data-icon="db"></i>サーバーの状態：users テーブル</div>
+              <div class="file-b" data-el="rows" style="min-height:92px"><div class="wl">42 {"name":"alice","email":"alice@example.com"}</div></div>
+            </div>
+            <div data-el="dbst" data-overlap-ok style="left:880px;top:20px;width:60px;height:20px"></div>
+            <div class="file hide" data-el="reqf" style="left:570px;top:160px;width:370px">
+              <div class="file-h">送ったリクエスト</div>
+              <div data-el="reqbox"></div>
+            </div>
+            <dl class="kv hide" data-el="props" style="left:570px;top:400px;width:370px">
+              <dt>safe</dt><dd data-el="p-safe">-</dd>
+              <dt>idempotent</dt><dd data-el="p-idem">-</dd>
+            </dl>
+          </div>
+        </div>
+
+        <div class="tbl">
+          <table class="ref">
+            <thead><tr><th>メソッド</th><th>用途</th><th>リクエストボディ</th><th>safe</th><th>idempotent</th><th>典型的な成功レスポンス</th></tr></thead>
+            <tbody>
+              <tr><td><code>GET</code></td><td>表現（representation）の取得</td><td>意味を持たない（送らない）</td><td>✓</td><td>✓</td><td><code>200 OK</code> / 条件付きなら <code>304</code></td></tr>
+              <tr><td><code>HEAD</code></td><td>GET と同じヘッダだけ取得</td><td>送らない</td><td>✓</td><td>✓</td><td><code>200 OK</code>（ボディなし）</td></tr>
+              <tr><td><code>OPTIONS</code></td><td>使えるメソッドの問い合わせ。CORS のプリフライト</td><td>通常なし</td><td>✓</td><td>✓</td><td><code>204</code> / <code>200</code> + <code>Allow</code></td></tr>
+              <tr><td><code>PUT</code></td><td>対象 URI の状態を送った表現で<strong>丸ごと置き換え</strong>（無ければ作成）</td><td>完全な表現</td><td>✗</td><td>✓</td><td><code>200</code> / <code>204</code>、新規作成なら <code>201</code></td></tr>
+              <tr><td><code>DELETE</code></td><td>対象 URI の関連付けを削除</td><td>通常なし</td><td>✗</td><td>✓</td><td><code>204 No Content</code> / <code>200</code> / <code>202</code></td></tr>
+              <tr><td><code>POST</code></td><td>対象リソースに処理させる（コレクションへの作成など）</td><td>任意</td><td>✗</td><td>✗</td><td><code>201 Created</code> + <code>Location</code> / <code>200</code></td></tr>
+              <tr><td><code>PATCH</code></td><td>部分更新（RFC 5789）。差分の書式は <code>Content-Type</code> で指定</td><td>パッチ文書</td><td>✗</td><td>✗（操作次第）</td><td><code>200</code> / <code>204</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="cols">
+          <pre data-lang="http" data-title="JSON Merge Patch（RFC 7396）">PATCH /users/42 HTTP/1.1
+Host: api.example.com
+Content-Type: ⟪application/merge-patch+json⟫
+
+{"name":"Alice","email":null,"tags":[]}
+# null はメンバー削除、配列は丸ごと置換</pre>
+          <pre data-lang="http" data-title="JSON Patch（RFC 6902）">PATCH /users/42 HTTP/1.1
+Host: api.example.com
+Content-Type: ⟪application/json-patch+json⟫
+
+[
+  {"op":"test","path":"/name","value":"Alice"},
+  {"op":"add","path":"/tags/-","value":"vip"}
+]</pre>
+        </div>
+        <p>JSON Patch の <code>op</code> は <code>add</code> <code>remove</code> <code>replace</code> <code>move</code> <code>copy</code> <code>test</code> の 6 種で、<code>path</code> は JSON Pointer（RFC 6901）です。<code>test</code> が失敗すると文書全体が適用されません。</p>
+      </section>
+
+      <!-- 4. キャッシュ -->
+      <section class="chapter" id="cache">
+        <h2>キャッシュと条件付きリクエスト（RFC 9111 / RFC 9110 §13）</h2>
+        <p>レスポンスの <code>Cache-Control: max-age=60</code> が「60 秒は再確認なしで使ってよい（fresh）」を意味します。期限切れ（stale）になると、ブラウザは保存しておいた <code>ETag</code> を <code>If-None-Match</code> に入れて<strong>条件付き GET</strong> を送り、変わっていなければサーバーはボディなしの <code>304 Not Modified</code> を返します。</p>
+
+        <div class="scene" id="sc-cache" data-title="max-age → stale → If-None-Match → 304">
+          <div class="stage" data-w="960" data-h="500">
+            <div class="node" data-el="br" style="left:20px;top:20px;width:230px">
+              <div class="node-h"><i data-icon="browser"></i><b class="node-t">Browser</b></div>
+              <div class="node-s">https://www.example.com/</div>
+            </div>
+            <div class="chip" data-el="clk" style="left:274px;top:36px"><i data-icon="clock"></i><span data-el="clkv">t = 0 s</span></div>
+            <div class="node" data-el="srv" style="left:700px;top:20px;width:240px">
+              <div class="node-h"><i data-icon="server"></i><b class="node-t">nginx (origin)</b></div>
+              <div class="node-s">/usr/share/nginx/html/app.css</div>
+            </div>
+            <div class="chip hide" data-el="cmp" style="left:470px;top:36px"><span data-el="cmpv">-</span></div>
+
+            <div class="file hide" data-el="cache" style="left:20px;top:112px;width:350px">
+              <div class="file-h"><i data-icon="db"></i>HTTP キャッシュ（ブラウザ側）</div>
+              <div class="file-b">
+                <dl class="kv">
+                  <dt>key</dt><dd>GET /app.css</dd>
+                  <dt>max-age</dt><dd>60</dd>
+                  <dt>age</dt><dd data-el="c-age">0 s</dd>
+                  <dt>ETag</dt><dd class="acc" data-el="c-etag">"6ab63f18-4e8"</dd>
+                  <dt>Last-Modified</dt><dd data-el="c-lm">Fri, 25 Sep 2026 09:30:00 GMT</dd>
+                  <dt>body</dt><dd data-el="c-body">1256 B</dd>
+                  <dt>状態</dt><dd data-el="c-state">fresh</dd>
+                </dl>
+              </div>
+            </div>
+            <div class="note-s hide" data-el="why" style="left:20px;top:318px;width:350px">-</div>
+
+            <div class="file hide" data-el="msg" style="left:390px;top:112px;width:550px">
+              <div class="file-h" data-el="msgh">HTTP</div>
+              <div data-el="msgbox"></div>
+            </div>
+            <div class="file hide" data-el="dev" style="left:390px;top:370px;width:550px">
+              <div class="file-h">DevTools › Network（Status / Size 列）</div>
+              <div class="file-b"><div class="wl" data-el="devrow">-</div></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="tbl">
+          <table class="ref">
+            <thead><tr><th>Cache-Control</th><th>意味（RFC 9111 §5.2）</th><th>使いどころ</th></tr></thead>
+            <tbody>
+              <tr><td><code>max-age=60</code></td><td>生成から 60 秒は fresh</td><td>HTML・API の短期キャッシュ</td></tr>
+              <tr><td><code>s-maxage=300</code></td><td>共有キャッシュ（CDN・プロキシ）だけに効く max-age</td><td>CDN だけ長めに持たせる</td></tr>
+              <tr><td><code>no-cache</code></td><td>保存してよいが、使う前に<strong>毎回</strong>オリジンで再検証</td><td>常に最新を確認したい（304 で軽くする）</td></tr>
+              <tr><td><code>no-store</code></td><td>保存しない</td><td>個人情報・ワンタイム値を含む応答</td></tr>
+              <tr><td><code>private</code></td><td>ブラウザ（私的キャッシュ）だけ保存可、CDN は不可</td><td>ログインユーザー固有のページ</td></tr>
+              <tr><td><code>must-revalidate</code></td><td>stale になったら再検証なしで使ってはいけない</td><td>古い値を出すと困る応答</td></tr>
+              <tr><td><code>immutable</code></td><td>fresh の間は再読み込み時も再検証しない（RFC 8246）</td><td><code>app.3f9c1a.js</code> のようなハッシュ付きファイル</td></tr>
+              <tr><td><code>stale-while-revalidate=30</code></td><td>stale 後 30 秒は古い値を返しつつ裏で再検証（RFC 5861）</td><td>体感速度優先の CDN</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="note"><code>Cache-Control</code> も <code>Expires</code> もなく <code>Last-Modified</code> だけがある場合、キャッシュは経過時間の一部（RFC 9111 §4.2.2 は「典型的には 10%」と記述）を鮮度として<strong>推測</strong>してよいことになっています。意図しないキャッシュを避けるには、必ず <code>Cache-Control</code> を明示します。</div>
+      </section>
+
+      <!-- 5. ステータスコード -->
+      <section class="chapter" id="status">
+        <h2>ステータスコードはどこで生まれるか（失敗ケース）</h2>
+        <p>同じ「エラー」でも、<strong>返したのがリバースプロキシ（nginx）なのか、アプリなのか</strong>で調べるログが変わります。<code>502</code> / <code>504</code> はプロキシがアプリとの通信に失敗したときに<strong>プロキシ自身が作る</strong>レスポンスで、アプリのログには何も残らないこともあります。</p>
+
+        <div class="scene" id="sc-status" data-title="誰がそのステータスコードを返したのか">
+          <div class="stage" data-w="960" data-h="520">
+            <div class="zone" data-el="host" data-label="web01 · 203.0.113.10" style="left:222px;top:44px;width:718px;height:124px"></div>
+            <div class="node" data-el="cli" style="left:20px;top:74px;width:176px">
+              <div class="node-h"><i data-icon="terminal"></i><b class="node-t">curl</b></div>
+              <div class="node-s">192.168.1.10</div>
+            </div>
+            <div class="node" data-el="ngx" style="left:242px;top:74px;width:200px">
+              <div class="node-h"><i data-icon="shield"></i><b class="node-t">nginx</b></div>
+              <div class="node-s">:80 / :443 reverse proxy</div>
+            </div>
+            <div class="node" data-el="app" style="left:486px;top:74px;width:200px">
+              <div class="node-h"><i data-icon="code"></i><b class="node-t">app (Node.js)</b></div>
+              <div class="node-s">127.0.0.1:3000</div>
+            </div>
+            <div class="node" data-el="db" style="left:730px;top:74px;width:190px">
+              <div class="node-h"><i data-icon="db"></i><b class="node-t">PostgreSQL</b></div>
+              <div class="node-s">127.0.0.1:5432</div>
+            </div>
+            <div class="chip hide c-amber" data-el="timer" style="left:512px;top:186px"><i data-icon="clock"></i><span data-el="timerv">0 s</span> / proxy_read_timeout 60s</div>
+
+            <div class="file" data-el="res" style="left:20px;top:222px;width:470px">
+              <div class="file-h" data-el="resh">レスポンス</div>
+              <div data-el="resbox"><pre data-lang="text">（ここに返ってきたレスポンスが出ます）</pre></div>
+            </div>
+            <div class="term" data-el="log" style="left:510px;top:222px;width:430px;height:236px">
+              <div class="term-h" data-el="logh">log</div>
+              <div class="term-b"></div>
+            </div>
+          </div>
+        </div>
+
+        <h3>主要ステータスコード早見表</h3>
+        <div class="tbl">
+          <table class="ref">
+            <thead><tr><th>コード</th><th>意味</th><th>よく返す場所</th><th>一緒に付くヘッダ・実例</th></tr></thead>
+            <tbody>
+              <tr><td><code>200 OK</code></td><td>成功（ボディあり）</td><td>アプリ / 静的配信</td><td><code>Content-Type</code>, <code>ETag</code></td></tr>
+              <tr><td><code>201 Created</code></td><td>作成した</td><td>アプリ</td><td><code>Location: /v1/users/42</code></td></tr>
+              <tr><td><code>204 No Content</code></td><td>成功・ボディなし</td><td>アプリ</td><td>DELETE、OPTIONS の応答</td></tr>
+              <tr><td><code>206 Partial Content</code></td><td>Range の一部を返した</td><td>静的配信</td><td><code>Content-Range: bytes 0-1023/1256</code></td></tr>
+              <tr><td><code>301 Moved Permanently</code></td><td>恒久移動</td><td>nginx（<code>return 301</code>）</td><td><code>Location</code>。POST が GET に変わりうる</td></tr>
+              <tr><td><code>302 Found</code></td><td>一時移動</td><td>アプリ（ログイン後の遷移など）</td><td><code>Location</code>。POST が GET に変わりうる</td></tr>
+              <tr><td><code>303 See Other</code></td><td>結果は別 URI を GET せよ</td><td>アプリ（フォーム POST 後）</td><td><code>Location</code>。必ず GET に変わる</td></tr>
+              <tr><td><code>304 Not Modified</code></td><td>条件付き GET で未変更</td><td>nginx / CDN / アプリ</td><td><code>ETag</code>, <code>Cache-Control</code>。ボディなし</td></tr>
+              <tr><td><code>307 Temporary Redirect</code></td><td>一時移動・メソッド維持</td><td>nginx / アプリ</td><td><code>Location</code></td></tr>
+              <tr><td><code>308 Permanent Redirect</code></td><td>恒久移動・メソッド維持</td><td>nginx（<code>return 308</code>）</td><td><code>Location</code>。API の http→https に向く</td></tr>
+              <tr><td><code>400 Bad Request</code></td><td>構文が壊れている</td><td>nginx（Host なし等）/ アプリ（不正 JSON）</td><td>problem+json で理由を返す</td></tr>
+              <tr><td><code>401 Unauthorized</code></td><td>認証情報がない・無効</td><td>アプリ / 認証プロキシ</td><td><code>WWW-Authenticate</code>（必須）</td></tr>
+              <tr><td><code>403 Forbidden</code></td><td>誰かは分かったが権限がない</td><td>アプリ / nginx（<code>deny</code>）</td><td><code>WWW-Authenticate: Bearer error="insufficient_scope"</code></td></tr>
+              <tr><td><code>404 Not Found</code></td><td>リソース（またはルート）がない</td><td>アプリ / 静的配信</td><td>—</td></tr>
+              <tr><td><code>405 Method Not Allowed</code></td><td>このリソースにそのメソッドは不可</td><td>アプリ / nginx 静的配信への POST</td><td><code>Allow: GET, POST</code>（必須）</td></tr>
+              <tr><td><code>409 Conflict</code></td><td>現在の状態と衝突</td><td>アプリ</td><td>一意制約違反、処理中の同一キー</td></tr>
+              <tr><td><code>412 Precondition Failed</code></td><td><code>If-Match</code> 等の前提が偽</td><td>アプリ / nginx</td><td>楽観的ロックの失敗</td></tr>
+              <tr><td><code>413 Content Too Large</code></td><td>ボディが大きすぎる</td><td>nginx（<code>client_max_body_size</code>、既定 1m）</td><td>—</td></tr>
+              <tr><td><code>415 Unsupported Media Type</code></td><td>ボディの形式を受け付けない</td><td>アプリ</td><td><code>curl -d</code> の既定 <code>Content-Type</code> が原因になりがち</td></tr>
+              <tr><td><code>422 Unprocessable Content</code></td><td>構文は正しいが値が不正</td><td>アプリ（バリデーション）</td><td>problem+json の <code>errors[]</code></td></tr>
+              <tr><td><code>429 Too Many Requests</code></td><td>レート制限（RFC 6585）</td><td>nginx <code>limit_req</code> / API ゲートウェイ / アプリ</td><td><code>Retry-After: 30</code></td></tr>
+              <tr><td><code>500 Internal Server Error</code></td><td>アプリ内部の例外</td><td>アプリ</td><td>スタックトレースはログへ、レスポンスには出さない</td></tr>
+              <tr><td><code>502 Bad Gateway</code></td><td>上流から不正な応答／接続できない</td><td>nginx / LB</td><td><code>connect() failed (111: Connection refused)</code></td></tr>
+              <tr><td><code>503 Service Unavailable</code></td><td>一時的に処理できない</td><td>アプリ（メンテ中）/ nginx <code>limit_req</code> の既定値</td><td><code>Retry-After</code></td></tr>
+              <tr><td><code>504 Gateway Timeout</code></td><td>上流から時間内に応答がない</td><td>nginx / LB</td><td><code>upstream timed out (110: …)</code>。nginx の表示は <code>504 Gateway Time-out</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>リダイレクトでメソッドは変わるか</h3>
+        <div class="tbl">
+          <table class="ref">
+            <thead><tr><th>コード</th><th>恒久 / 一時</th><th>POST のあと（RFC 9110）</th><th><code>curl -L -d …</code> の実際</th></tr></thead>
+            <tbody>
+              <tr><td><code>301</code></td><td>恒久</td><td>歴史的理由で GET に変えてよい（MAY）</td><td>GET</td></tr>
+              <tr><td><code>302</code></td><td>一時</td><td>歴史的理由で GET に変えてよい（MAY）</td><td>GET</td></tr>
+              <tr><td><code>303</code></td><td>—</td><td>GET（HEAD 以外）で取りに行く</td><td>GET</td></tr>
+              <tr><td><code>307</code></td><td>一時</td><td>メソッドとボディを変えてはならない</td><td>POST</td></tr>
+              <tr><td><code>308</code></td><td>恒久</td><td>メソッドとボディを変えてはならない</td><td>POST</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>右端の列は <code>httpbin.org/redirect-to</code> に対して実際に <code>curl -sL -d 'a=1'</code> を送り、最終的に届いたメソッドを確かめた結果です（「手元で試す」に同じコマンドがあります）。</p>
+      </section>
+
+      <!-- 6. 接続 -->
+      <section class="chapter" id="connection">
+        <h2>接続：keep-alive・HTTP/2・HTTP/3</h2>
+        <p>HTTP/1.1 は 1 本の TCP 接続を使い回せますが（持続的接続がデフォルト）、1 本の上では応答が順番にしか返りません。HTTP/2 は同じ意味論（メソッド・ヘッダ・ステータス）を<strong>バイナリのフレーム</strong>に載せ替えて 1 本の接続で多重化し、HTTP/3 はそれを TCP ではなく <strong>QUIC（UDP）</strong> に載せます。</p>
+
+        <div class="scene" id="sc-conn" data-title="HTTP/1.1 keep-alive → HTTP/2 多重化 → HTTP/3 (QUIC)">
+          <div class="stage" data-w="960" data-h="540">
+            <div class="node sm hide" data-el="l1" style="left:20px;top:26px;width:170px">
+              <div class="node-h"><i data-icon="network"></i><b class="node-t">HTTP/1.1</b></div>
+              <div class="node-s">TCP :80 · keep-alive</div>
+            </div>
+            <div class="zone hide" data-el="z1" data-label="1 本の TCP 接続 · 応答は順番どおり" style="left:206px;top:20px;width:734px;height:76px"></div>
+            <div class="node sm hide c-cyan" data-el="l2" style="left:20px;top:126px;width:170px">
+              <div class="node-h"><i data-icon="layers"></i><b class="node-t">HTTP/2</b></div>
+              <div class="node-s">TLS + ALPN h2 · :443</div>
+            </div>
+            <div class="zone hide c-cyan" data-el="z2" data-label="1 本の TCP 接続 · ストリームを多重化" style="left:206px;top:120px;width:734px;height:76px"></div>
+            <div class="node sm hide c-violet" data-el="l3" style="left:20px;top:226px;width:170px">
+              <div class="node-h"><i data-icon="network"></i><b class="node-t">HTTP/3</b></div>
+              <div class="node-s">QUIC · UDP :443</div>
+            </div>
+            <div class="zone hide c-violet" data-el="z3" data-label="QUIC 接続 · ストリームごとに独立して再送" style="left:206px;top:220px;width:734px;height:76px"></div>
+
+            <!-- lane 1 -->
+            <span class="chip fr hide" data-el="a1" style="left:222px;top:44px">→ /index.html</span>
+            <span class="chip fr hide c-green" data-el="a2" style="left:330px;top:44px">← 200</span>
+            <span class="chip fr hide" data-el="a3" style="left:394px;top:44px">→ /app.css</span>
+            <span class="chip fr hide c-green" data-el="a4" style="left:486px;top:44px">← 200</span>
+            <span class="chip fr hide" data-el="a5" style="left:550px;top:44px">→ /app.js</span>
+            <span class="chip fr hide c-green" data-el="a6" style="left:636px;top:44px">← 200</span>
+            <span class="chip fr hide c-amber" data-el="a7" style="left:700px;top:44px">次の要求は応答完了まで待つ</span>
+            <!-- lane 2 -->
+            <span class="chip fr hide c-gray" data-el="b0" style="left:222px;top:144px">PREFACE</span>
+            <span class="chip fr hide c-gray" data-el="b1" style="left:292px;top:144px">SETTINGS</span>
+            <span class="chip fr hide c-lime" data-el="b2" style="left:370px;top:144px">HEADERS 1</span>
+            <span class="chip fr hide c-cyan" data-el="b3" style="left:454px;top:144px">HEADERS 3</span>
+            <span class="chip fr hide c-violet" data-el="b4" style="left:538px;top:144px">HEADERS 5</span>
+            <span class="chip fr hide c-cyan" data-el="b5" style="left:622px;top:144px">DATA 3</span>
+            <span class="chip fr hide c-lime" data-el="b6" style="left:688px;top:144px">DATA 1</span>
+            <span class="chip fr hide c-violet" data-el="b7" style="left:754px;top:144px">DATA 5</span>
+            <span class="chip fr hide c-cyan" data-el="b8" style="left:820px;top:144px">DATA 3</span>
+            <span class="chip fr hide c-red" data-el="bx" style="left:622px;top:170px">✕ TCP セグメント欠落 → 後続すべて待ち</span>
+            <!-- lane 3 -->
+            <span class="chip fr hide c-gray" data-el="d0" style="left:222px;top:244px">Initial / Handshake</span>
+            <span class="chip fr hide c-lime" data-el="d1" style="left:376px;top:244px">STREAM 0</span>
+            <span class="chip fr hide c-cyan" data-el="d2" style="left:452px;top:244px">STREAM 4</span>
+            <span class="chip fr hide c-violet" data-el="d3" style="left:528px;top:244px">STREAM 8</span>
+            <span class="chip fr lost hide c-red" data-el="d4" style="left:604px;top:244px">STREAM 4 ✕</span>
+            <span class="chip fr hide c-lime" data-el="d5" style="left:694px;top:244px">STREAM 0</span>
+            <span class="chip fr hide c-violet" data-el="d6" style="left:770px;top:244px">STREAM 8</span>
+            <span class="chip fr hide c-cyan" data-el="d7" style="left:604px;top:270px">STREAM 4 再送（0 と 8 は待たない）</span>
+
+            <div class="file" data-el="det" style="left:20px;top:320px;width:560px">
+              <div class="file-h" data-el="deth">detail</div>
+              <div data-el="detbox" style="min-height:120px"></div>
+            </div>
+            <div class="term" data-el="t" style="left:600px;top:320px;width:340px;height:162px">
+              <div class="term-h">bash</div>
+              <div class="term-b"></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="tbl">
+          <table class="ref">
+            <thead><tr><th>項目</th><th>HTTP/1.1（RFC 9112）</th><th>HTTP/2（RFC 9113）</th><th>HTTP/3（RFC 9114）</th></tr></thead>
+            <tbody>
+              <tr><td>トランスポート</td><td>TCP（HTTPS は TLS over TCP）</td><td>TCP + TLS（実運用はほぼ TLS 必須）</td><td>QUIC（UDP 上、TLS 1.3 を内蔵。RFC 9000/9001）</td></tr>
+              <tr><td>メッセージ形式</td><td>テキスト行 + CRLF</td><td>バイナリフレーム（9 バイトヘッダ）</td><td>QUIC ストリーム上のフレーム</td></tr>
+              <tr><td>ヘッダ</td><td><code>Host: …</code> をそのまま送る</td><td>HPACK（RFC 7541）。<code>:method</code> <code>:path</code> <code>:authority</code> 等の疑似ヘッダ、名前は小文字</td><td>QPACK（RFC 9204）</td></tr>
+              <tr><td>多重化</td><td>なし（1 接続 1 往復ずつ）</td><td>ストリーム（クライアント発は奇数 ID）</td><td>ストリーム（クライアント発の双方向は 0, 4, 8, …）</td></tr>
+              <tr><td>パケット損失の影響</td><td>その接続が止まる</td><td>TCP 層で全ストリームが止まる</td><td>失ったストリームだけ止まる</td></tr>
+              <tr><td>使い始め方</td><td>そのまま</td><td>TLS の ALPN で <code>h2</code> を合意</td><td><code>Alt-Svc: h3=":443"</code> や DNS の HTTPS レコードで発見</td></tr>
+              <tr><td>curl</td><td><code>--http1.1</code></td><td><code>--http2</code>（https は ALPN、http は Upgrade を試行）</td><td><code>--http3</code>（失敗時は旧版へフォールバック）/ <code>--http3-only</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="note warn"><code>--http2</code> / <code>--http3</code> は <b>libcurl が HTTP/2（nghttp2）・HTTP/3 対応でビルドされている場合だけ</b>使えます。<code>curl -V</code> の <code>Features:</code> に <code>HTTP2</code> / <code>HTTP3</code> があるか確認してください。非対応ビルドでは <code>curl: option --http3: the installed libcurl version does not support this</code> で終了します（Windows 同梱の curl 8.21.0 で確認）。</div>
+      </section>
+
+      <!-- 7. ヘッダ早見表 -->
+      <section class="chapter" id="headers">
+        <h2>主要ヘッダ早見表</h2>
+        <div class="cols">
+          <div class="tbl">
+            <table class="ref">
+              <thead><tr><th>リクエスト</th><th>例</th><th>役割</th></tr></thead>
+              <tbody>
+                <tr><td><code>Host</code></td><td><code>www.example.com</code></td><td>宛先ホスト。HTTP/1.1 で必須（HTTP/2 は <code>:authority</code>）</td></tr>
+                <tr><td><code>User-Agent</code></td><td><code>curl/8.21.0</code></td><td>クライアント識別</td></tr>
+                <tr><td><code>Accept</code></td><td><code>application/json</code></td><td>欲しいメディアタイプ</td></tr>
+                <tr><td><code>Accept-Encoding</code></td><td><code>gzip, br, zstd</code></td><td>受け取れる圧縮（<code>curl --compressed</code>）</td></tr>
+                <tr><td><code>Content-Type</code></td><td><code>application/json</code></td><td>送るボディの形式</td></tr>
+                <tr><td><code>Content-Length</code></td><td><code>16</code></td><td>ボディのバイト数</td></tr>
+                <tr><td><code>Authorization</code></td><td><code>Bearer eyJhbGciOi…</code></td><td>認証情報（<code>Basic</code> / <code>Bearer</code>）</td></tr>
+                <tr><td><code>Cookie</code></td><td><code>sid=31d4d96e407aad42</code></td><td><code>Set-Cookie</code> で受け取った値</td></tr>
+                <tr><td><code>If-None-Match</code></td><td><code>"6ab63f18-4e8"</code></td><td>ETag が一致すれば 304</td></tr>
+                <tr><td><code>If-Modified-Since</code></td><td><code>Fri, 25 Sep 2026 09:30:00 GMT</code></td><td>以後に変更なしなら 304</td></tr>
+                <tr><td><code>If-Match</code></td><td><code>"v7"</code></td><td>一致しなければ 412（楽観的ロック）</td></tr>
+                <tr><td><code>Range</code></td><td><code>bytes=0-1023</code></td><td>一部だけ取得（206）</td></tr>
+                <tr><td><code>Origin</code></td><td><code>https://app.example.com</code></td><td>CORS 判定に使う（<a href="../cors/">CORS</a>）</td></tr>
+                <tr><td><code>Connection</code></td><td><code>close</code></td><td>この応答後に接続を閉じる（HTTP/1.1）</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="tbl">
+            <table class="ref">
+              <thead><tr><th>レスポンス</th><th>例</th><th>役割</th></tr></thead>
+              <tbody>
+                <tr><td><code>Content-Type</code></td><td><code>text/html; charset=utf-8</code></td><td>ボディの形式</td></tr>
+                <tr><td><code>Content-Length</code></td><td><code>1256</code></td><td>ボディのバイト数</td></tr>
+                <tr><td><code>Transfer-Encoding</code></td><td><code>chunked</code></td><td>長さ未定のボディを分割送信（HTTP/1.1）</td></tr>
+                <tr><td><code>Content-Encoding</code></td><td><code>gzip</code></td><td>ボディに掛けた圧縮</td></tr>
+                <tr><td><code>Location</code></td><td><code>/v1/users/42</code></td><td>3xx の転送先 / 201 の作成先</td></tr>
+                <tr><td><code>Cache-Control</code></td><td><code>max-age=60</code></td><td>キャッシュ指示</td></tr>
+                <tr><td><code>ETag</code></td><td><code>"6ab63f18-4e8"</code></td><td>表現のバージョン識別子（弱い ETag は <code>W/"…"</code>）</td></tr>
+                <tr><td><code>Last-Modified</code></td><td><code>Fri, 25 Sep 2026 09:30:00 GMT</code></td><td>最終更新（秒精度）</td></tr>
+                <tr><td><code>Age</code></td><td><code>7655</code></td><td>共有キャッシュに入ってからの秒数</td></tr>
+                <tr><td><code>Vary</code></td><td><code>Accept-Encoding</code></td><td>キャッシュキーに含めるリクエストヘッダ</td></tr>
+                <tr><td><code>Set-Cookie</code></td><td><code>sid=31d4…; HttpOnly; Secure</code></td><td>Cookie の保存指示</td></tr>
+                <tr><td><code>WWW-Authenticate</code></td><td><code>Bearer realm="api"</code></td><td>401 で必須。認証方式の提示</td></tr>
+                <tr><td><code>Allow</code></td><td><code>GET, HEAD</code></td><td>405 で必須。使えるメソッド</td></tr>
+                <tr><td><code>Retry-After</code></td><td><code>30</code></td><td>429 / 503 で再試行までの秒数（または日時）</td></tr>
+                <tr><td><code>Alt-Svc</code></td><td><code>h3=":443"; ma=86400</code></td><td>HTTP/3 で同じ内容を出せる場所の広告（RFC 7838）</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <!-- 8. curl 早見表 -->
+      <section class="chapter" id="curl">
+        <h2>curl フラグ早見表</h2>
+        <div class="tbl">
+          <table class="ref">
+            <thead><tr><th>フラグ</th><th>何が起きるか</th><th>例</th></tr></thead>
+            <tbody>
+              <tr><td><code>-v</code></td><td>送受信ヘッダと接続情報を stderr に出す（<code>*</code> <code>&gt;</code> <code>&lt;</code>）</td><td><code>curl -v https://example.com/</code></td></tr>
+              <tr><td><code>-i</code></td><td>レスポンスヘッダも stdout に含める</td><td><code>curl -i https://example.com/</code></td></tr>
+              <tr><td><code>-I</code></td><td><code>HEAD</code> を送ってヘッダだけ表示</td><td><code>curl -I https://example.com/</code></td></tr>
+              <tr><td><code>-X</code></td><td>メソッド文字列を上書き（リダイレクト後もそのまま使われる）</td><td><code>curl -X DELETE …/users/44</code></td></tr>
+              <tr><td><code>-H</code></td><td>ヘッダを追加・上書き（<code>'Name:'</code> で削除）</td><td><code>-H 'Accept: application/json'</code></td></tr>
+              <tr><td><code>-d</code></td><td>POST ボディ。<strong><code>Content-Type: application/x-www-form-urlencoded</code> が付く</strong>。<code>@file</code> 読み込み時は改行を除去</td><td><code>-d 'a=1&amp;b=2'</code></td></tr>
+              <tr><td><code>--data-binary</code></td><td>ボディをそのまま送る（改行を保持）</td><td><code>--data-binary @body.json</code></td></tr>
+              <tr><td><code>--json</code></td><td>ボディ + <code>Content-Type: application/json</code> + <code>Accept: application/json</code>（curl 7.82.0+）</td><td><code>--json '{"name":"alice"}'</code></td></tr>
+              <tr><td><code>-F</code></td><td><code>multipart/form-data</code> で送る（ファイルアップロード）</td><td><code>-F 'file=@avatar.png'</code></td></tr>
+              <tr><td><code>-L</code></td><td><code>Location</code> を追う。301/302/303 では POST が GET に変わる</td><td><code>curl -L http://example.com/</code></td></tr>
+              <tr><td><code>-o</code></td><td>本文をファイルへ（<code>/dev/null</code> で捨てる）</td><td><code>-o index.html</code></td></tr>
+              <tr><td><code>-s</code></td><td>進捗表示・エラー表示を消す</td><td><code>-sS</code> でエラーだけ表示</td></tr>
+              <tr><td><code>-w</code></td><td>完了後に変数を出力</td><td><code>-w '%{http_code} %{http_version} %{time_total}\n'</code></td></tr>
+              <tr><td><code>--compressed</code></td><td><code>Accept-Encoding</code> を付け、受信後に自動展開</td><td><code>curl --compressed -I …</code></td></tr>
+              <tr><td><code>-u</code></td><td><code>Authorization: Basic base64(user:pass)</code> を付ける</td><td><code>-u alice:s3cret</code></td></tr>
+              <tr><td><code>--trace-ascii -</code></td><td>送受信した全バイトをダンプ（<code>--trace</code> は 16 進）</td><td><code>curl --trace-ascii - …</code></td></tr>
+              <tr><td><code>--fail-with-body</code></td><td>4xx/5xx で終了コード 22 にしつつ本文も出す</td><td>CI のスモークテスト</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- 9. 手元で試す -->
+      <section class="chapter" id="try">
+        <h2>手元で試す</h2>
+        <pre data-lang="bash" data-title="1) 生のリクエストを手で打つ（nc）">$ printf 'GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n' | nc example.com 80
+# HTTP/1.1 200 OK から始まるレスポンスがそのまま表示されます
+$ printf 'GET / HTTP/1.1\r\n\r\n' | nc example.com 80
+# Host なし → HTTP/1.1 400 Bad Request
+$ curl -si -H 'Host:' http://example.com/ | head -1      # nc がなければ curl で Host を削除
+HTTP/1.1 400 Bad Request</pre>
+
+        <pre data-lang="bash" data-title="2) curl -v / --trace-ascii / -w">$ curl -sv -o /dev/null http://example.com/
+$ curl -s --trace-ascii - -o /dev/null http://example.com/ | head -20
+$ curl -s -o /dev/null -w '%{http_code} %{http_version} %{time_total}\n' https://example.com/
+$ curl -I https://example.com/          # HEAD</pre>
+
+        <pre data-lang="bash" data-title="3) curl -d と --json の Content-Type の違い">$ curl -s https://httpbin.org/anything -d '{"name":"alice"}' | grep '"Content-Type"'
+#     "Content-Type": "application/x-www-form-urlencoded",
+$ curl -s https://httpbin.org/anything --json '{"name":"alice"}' | grep '"Content-Type"'
+#     "Content-Type": "application/json",</pre>
+
+        <pre data-lang="bash" data-title="4) リダイレクトで POST がどうなるか（httpbin.org）">$ for c in 301 302 303 307 308; do
+    printf "$c -> "
+    curl -sL -d 'a=1' "https://httpbin.org/redirect-to?url=/anything&amp;status_code=$c" | grep '"method"'
+  done
+# 301 ->   "method": "GET",
+# 302 ->   "method": "GET",
+# 303 ->   "method": "GET",
+# 307 ->   "method": "POST",
+# 308 ->   "method": "POST",</pre>
+
+        <pre data-lang="bash" data-title="5) ETag と 304 を nginx で再現（Docker）">$ docker run --rm -d -p 8080:80 --name web nginx:1.27
+$ curl -sI http://localhost:8080/ | grep -iE '^(etag|last-modified|content-length)'
+$ etag=$(curl -sI http://localhost:8080/ | tr -d '\r' | awk 'tolower($1)=="etag:"{print $2}')
+$ curl -s -o /dev/null -w '%{http_code}\n' -H "If-None-Match: $etag" http://localhost:8080/
+# 304
+$ curl -s -o /dev/null -w '%{http_code}\n' -H 'If-None-Match: "nope"' http://localhost:8080/
+# 200
+$ curl -si -X POST http://localhost:8080/ | head -1
+# 静的ファイルへの POST → 405
+$ docker stop web</pre>
+
+        <pre data-lang="bash" data-title="6) HTTP/2・HTTP/3（curl のビルド次第）">$ curl -V | grep -oE 'HTTP2|HTTP3'
+$ curl -s -o /dev/null -w '%{http_version}\n' --http2 https://www.cloudflare.com/
+# 2
+$ curl -sI https://www.cloudflare.com/ | grep -i '^alt-svc'
+# alt-svc: h3=":443"; ma=86400
+$ curl -sI --http3 https://www.cloudflare.com/ | head -1
+# HTTP/3 200（非対応ビルドでは "option --http3: the installed libcurl version does not support this"）</pre>
+      </section>
+
+      <!-- 10. ハマりどころ -->
+      <section class="chapter" id="pitfalls">
+        <h2>ハマりどころ</h2>
+        <div class="note warn"><b><code>curl -d</code> で JSON を送ると form 扱い：</b><code>-d</code> は <code>Content-Type: application/x-www-form-urlencoded</code> を付けます。JSON なら <code>--json</code> か <code>-H 'Content-Type: application/json'</code>。サーバーが 415 を返すか、<code>req.body</code> が空になります。</div>
+        <div class="note warn"><b><code>-X POST</code> と <code>-L</code> の組み合わせ：</b><code>-X</code> はリダイレクト後のリクエストにも適用されるので、301 の先にも POST を送ります（curl は <code>Note: Unnecessary use of -X or --request, POST is already inferred.</code> と警告します）。<code>-d</code> を付けていれば <code>-X POST</code> は不要です。</div>
+        <div class="note warn"><b>API の http→https に <code>301</code> を使う：</b>POST が GET に変わってボディが消え、アプリには「GET /v1/users」だけが届きます。メソッドを保つ <code>308</code> を使うか、そもそも http を受けないようにします。</div>
+        <div class="note warn"><b>改行が LF だけ：</b>手書きのリクエストで <code>\n</code> しか送らないと、サーバーによって 400 になるか、ヘッダ終端を認識できずに待ち続けます。<code>printf</code> で <code>\r\n</code> を明示します。</div>
+        <div class="note warn"><b>502 と 504 をアプリのログで探す：</b>nginx が作った 502/504 はアプリのログに出ないことがあります。まず <code>/var/log/nginx/error.log</code> の <code>connect() failed</code> / <code>upstream timed out</code> を見ます。504 の後もアプリ側のクエリは走り続けている点にも注意します。</div>
+        <div class="note warn"><b><code>no-cache</code> は「キャッシュしない」ではない：</b>保存したうえで毎回再検証する指示です。保存させたくないなら <code>no-store</code>。</div>
+        <div class="note warn"><b><code>Cache-Control</code> を付けずに配信：</b><code>Last-Modified</code> だけだとブラウザがヒューリスティックに鮮度を決め、デプロイ直後に古い JS/CSS が使われ続けることがあります。</div>
+        <div class="note warn"><b>ヘッダ名の大文字小文字：</b>HTTP/1.1 では区別しませんが、HTTP/2・HTTP/3 では小文字で送る規則です（<code>content-type</code>）。HTTP/2 で受けると <code>curl -v</code> の <code>&lt;</code> 行はすべて小文字になり、HTTP/1.1 でも小文字で返すサーバーがあります。ヘッダ名を文字列比較するコードは小文字に揃えてから比較します。</div>
+      </section>
+
+      <!-- 11. 仕様 -->
+      <section class="chapter" id="spec">
+        <h2>仕様・参考</h2>
+        <ul>
+          <li><a href="https://www.rfc-editor.org/rfc/rfc9110" target="_blank" rel="noopener">RFC 9110 — HTTP Semantics</a>（§9 メソッド、§13 条件付きリクエスト、§15 ステータスコード）</li>
+          <li><a href="https://www.rfc-editor.org/rfc/rfc9111" target="_blank" rel="noopener">RFC 9111 — HTTP Caching</a></li>
+          <li><a href="https://www.rfc-editor.org/rfc/rfc9112" target="_blank" rel="noopener">RFC 9112 — HTTP/1.1</a>（メッセージ構文、Host 必須、chunked）</li>
+          <li><a href="https://www.rfc-editor.org/rfc/rfc9113" target="_blank" rel="noopener">RFC 9113 — HTTP/2</a> / <a href="https://www.rfc-editor.org/rfc/rfc7541" target="_blank" rel="noopener">RFC 7541 — HPACK</a></li>
+          <li><a href="https://www.rfc-editor.org/rfc/rfc9114" target="_blank" rel="noopener">RFC 9114 — HTTP/3</a> / <a href="https://www.rfc-editor.org/rfc/rfc9000" target="_blank" rel="noopener">RFC 9000 — QUIC</a> / <a href="https://www.rfc-editor.org/rfc/rfc9204" target="_blank" rel="noopener">RFC 9204 — QPACK</a></li>
+          <li><a href="https://www.rfc-editor.org/rfc/rfc5789" target="_blank" rel="noopener">RFC 5789 — PATCH</a> / <a href="https://www.rfc-editor.org/rfc/rfc7396" target="_blank" rel="noopener">RFC 7396 — JSON Merge Patch</a> / <a href="https://www.rfc-editor.org/rfc/rfc6902" target="_blank" rel="noopener">RFC 6902 — JSON Patch</a></li>
+          <li><a href="https://www.rfc-editor.org/rfc/rfc6585" target="_blank" rel="noopener">RFC 6585 — 429 Too Many Requests など</a> / <a href="https://www.rfc-editor.org/rfc/rfc7838" target="_blank" rel="noopener">RFC 7838 — Alt-Svc</a> / <a href="https://www.rfc-editor.org/rfc/rfc8246" target="_blank" rel="noopener">RFC 8246 — immutable</a></li>
+          <li><a href="https://curl.se/docs/manpage.html" target="_blank" rel="noopener">curl man page</a> / <a href="https://nginx.org/en/docs/http/ngx_http_proxy_module.html" target="_blank" rel="noopener">nginx ngx_http_proxy_module</a> / <a href="https://nginx.org/en/docs/http/ngx_http_limit_req_module.html" target="_blank" rel="noopener">ngx_http_limit_req_module</a></li>
+          <li>関連ページ：<a href="../webapi/">Web API (REST)</a> / <a href="../https-tls/">HTTPS / TLS 1.3</a> / <a href="../cors/">CORS</a></li>
+        </ul>
+      </section>
+
+    </main>
+  </div>
+
+  <footer class="site-f"></footer>
+  <script src="../../assets/js/topics.js"></script>
+  <script src="../../assets/js/tim.js"></script>
+  <script src="scenes.js"></script>
+</body>
+</html>

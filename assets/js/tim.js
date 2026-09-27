@@ -507,11 +507,13 @@
     fly(from, to, o = {}) {
       if (!this.alive) return Promise.resolve();
       const a = this.pt(from), b = this.pt(to);
+      if (o.text != null) o = Object.assign({}, o, { label: esc(o.text) });
       const hasLabel = o.label != null && o.label !== '';
       const p = h('div', 'packet ' + (hasLabel ? '' : 'dot ') + (o.cls || ''), hasLabel ? o.label : '');
       if (o.id) p.dataset.el = o.id;
       p.style.left = a.x + 'px';
       p.style.top = a.y + 'px';
+      prep(p);
       this.fx.appendChild(p);
       const land = () => {
         if (o.keep) { p.style.left = b.x + 'px'; p.style.top = b.y + 'px'; } else p.remove();
@@ -539,6 +541,7 @@
 
     line(from, to, o = {}) {
       if (!this.alive) return Promise.resolve();
+      if (o.text != null) o = Object.assign({}, o, { label: esc(o.text) });
       const a = this.pt(from), b = this.pt(to);
       const dx = b.x - a.x, dy = b.y - a.y, len = Math.hypot(dx, dy) || 1;
       let dp, mid;
@@ -644,13 +647,31 @@
     stamp(sel, text, o = {}) {
       return Promise.all(this.$(sel).map((e) => {
         const st = h('div', 'stamp ' + (o.cls || 'st-ok') + (o.pos ? ' at-' + o.pos : ''), text);
-        e.appendChild(st);
+        if (o.layer === 'fx') {
+          // place on the top-level fx layer so parents with overflow:hidden don't clip it
+          const b = this.box(e);
+          st.classList.add('in-fx');
+          st.dataset.for = e.dataset.el || '';
+          st.style.left = b.x + b.w - 10 + 'px';
+          st.style.top = b.y - 14 + 'px';
+          this.fx.appendChild(st);
+        } else e.appendChild(st);
         return this._a(st, [{ opacity: 0, scale: '2.4', rotate: '-20deg' }, { opacity: 1, scale: '1', rotate: '0deg' }], { dur: 440, delay: o.delay || 0, ease: EASE.back });
       }));
     }
     unstamp(sel) {
-      this.$(sel).forEach((e) => e.querySelectorAll(':scope > .stamp').forEach((st) => st.remove()));
+      this.$(sel).forEach((e) => {
+        e.querySelectorAll(':scope > .stamp').forEach((st) => st.remove());
+        if (e.dataset.el) this.fx.querySelectorAll('.stamp.in-fx[data-for="' + e.dataset.el + '"]').forEach((st) => st.remove());
+      });
       return Promise.resolve();
+    }
+    /** replace a stage <pre> (or any element) with highlighted code */
+    code(sel, src, lang) {
+      return Promise.all(this.$(sel).map((e) => {
+        e.innerHTML = codeLines(dedent(src), lang || e.dataset.lang || 'text');
+        return this._a(e, [{ opacity: 0.35 }, { opacity: 1 }], { dur: 380 });
+      }));
     }
     caption(html, o = {}) {
       if (!this.alive) return Promise.resolve();
@@ -914,7 +935,7 @@
       this.stepDone = false;
       this.renderStep(n);
       this.sync();
-      await this.runStep(n, new Ctx(this, tok, !!opt.instant || REDUCED, false));
+      await this.runStep(n, new Ctx(this, tok, !!opt.instant || REDUCED || TIM.instant === true, false));
       if (tok !== this.token) return;
       this.stepDone = true;
       if (this.playing) this.schedule();
@@ -1153,6 +1174,35 @@
     }
     const uniq = Array.from(new Set(out));
     return uniq.length ? uniq : 'OK: ' + TIM.scenes.length + ' scenes, ' + TIM.scenes.reduce((n, s) => n + s.steps.length, 0) + ' steps, no issues';
+  };
+
+  /**
+   * TIM.inspect(sceneIndex, stepIndex, {x, y, scale}): 開発用。自動再生を止め、指定ステップの最終状態を
+   * 画面全体に原寸（または scale 倍）で表示する。小さいプレビューでもレイアウトを目視確認できる。
+   * クリックで閉じる。TIM.inspect() で閉じる。
+   */
+  TIM.inspect = async function (i, k, o) {
+    o = o || {};
+    const old = d.getElementById('tim-inspect');
+    if (old) old.remove();
+    if (i == null) return 'closed';
+    const sc = TIM.scenes[i];
+    if (!sc) return 'no scene ' + i;
+    sc.started = true;
+    sc.pause();
+    await sc.go(k || 0, { instant: true });
+    const ov = h('div');
+    ov.id = 'tim-inspect';
+    ov.style.cssText = 'position:fixed;inset:0;z-index:9999;background:#070b14;overflow:hidden;cursor:zoom-out';
+    const c = sc.stage.cloneNode(true);
+    const s = o.scale || Math.min(1, window.innerWidth / sc.W);
+    c.style.position = 'absolute';
+    c.style.transformOrigin = '0 0';
+    c.style.transform = 'scale(' + s + ') translate(' + -(o.x || 0) + 'px,' + -(o.y || 0) + 'px)';
+    ov.appendChild(c);
+    d.body.appendChild(ov);
+    ov.addEventListener('click', () => ov.remove());
+    return sc.title + ' · step ' + ((k || 0) + 1) + '/' + sc.steps.length;
   };
 
   TIM.highlight = highlight;

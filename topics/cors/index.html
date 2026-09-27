@@ -1,0 +1,698 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CORS — Tech in Motion</title>
+  <meta name="description" content="CORS を実物の HTTP ヘッダで。Origin・プリフライト(OPTIONS)・Access-Control-* ヘッダが、どこで付き、どこで判定され、なぜブロックされるのかをステップ再生で見せます。">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Space+Grotesk:wght@500;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="../../assets/css/tim.css">
+  <link rel="stylesheet" href="page.css">
+</head>
+<body data-root="../../" data-topic="cors">
+  <header class="site-h"></header>
+
+  <div class="page">
+    <aside class="toc"></aside>
+    <main class="doc">
+
+      <!-- 0. HERO -->
+      <section class="hero">
+        <p class="kicker">Web / HTTP · Cross-Origin Resource Sharing</p>
+        <h1>CORS<small>リクエストは届いている。止めているのはブラウザ</small></h1>
+        <p class="lead">
+          CORS は「サーバーがアクセスを拒否する仕組み」ではありません。ブラウザがクロスオリジンのリクエストに <code>Origin</code> ヘッダを付けて送り、
+          返ってきた <code>Access-Control-Allow-Origin</code> などのヘッダを見て、<strong>レスポンスを JavaScript に渡してよいか</strong>をブラウザ自身が判定する仕組みです。
+          このページでは、その判定がどこで・どのヘッダで行われるのかを、実際の HTTP メッセージとコンソールエラーで追います。
+        </p>
+        <div class="facts">
+          <div class="fact"><span>判定する場所</span><b>ブラウザの Fetch 実装（CORS check）</b></div>
+          <div class="fact"><span>ブラウザが送る</span><b><code>Origin</code> / <code>Access-Control-Request-Method</code> / <code>-Headers</code></b></div>
+          <div class="fact"><span>サーバーが返す</span><b><code>Access-Control-Allow-Origin</code> / <code>-Credentials</code> / <code>-Methods</code> / <code>-Headers</code></b></div>
+          <div class="fact"><span>仕様</span><b>WHATWG Fetch Standard「CORS protocol」</b></div>
+        </div>
+      </section>
+
+      <!-- 1. オリジン -->
+      <section class="chapter" id="origin">
+        <h2>オリジン = scheme + host + port</h2>
+        <p>
+          CORS の「クロス」は<strong>オリジン（origin）</strong>が違うことを指します。オリジンは URL の <code>scheme</code>・<code>host</code>・<code>port</code> の 3 つ組で、
+          path・query・fragment は含みません。3 つのうち 1 つでも違えば別オリジンです。
+        </p>
+
+        <div class="scene" id="sc-origin" data-title="オリジンの分解と同一/クロス判定">
+          <div class="stage" data-w="960" data-h="440">
+            <div class="label acc" style="left:24px;top:18px">基準：このページ（document）の URL</div>
+            <div class="seg" data-el="url" style="left:24px;top:42px">
+              <span class="c-lime"><small>scheme</small>https://</span>
+              <span class="c-cyan"><small>host</small>app.example.com</span>
+              <span class="c-violet"><small>port</small>(443)</span>
+              <span class="c-gray" data-el="u-r"><small>path?query</small>/dashboard?tab=1</span>
+            </div>
+            <div class="chip hide" data-el="ser" style="left:24px;top:108px">location.origin → "https://app.example.com"</div>
+
+            <div class="file hide" data-el="hdr" style="left:560px;top:14px;width:380px">
+              <div class="file-h">cross-origin の fetch に付くヘッダ</div>
+              <pre data-lang="http">GET /v1/items HTTP/1.1
+Host: api.example.com
+Origin: https://app.example.com
+Sec-Fetch-Mode: cors
+Sec-Fetch-Site: same-site</pre>
+            </div>
+
+            <div class="cmp hide" data-el="r1" style="left:24px;top:156px;width:912px">
+              <span class="u">https://app.example.com<b>/api/users</b></span>
+              <span class="chip c-green">SAME-ORIGIN</span>
+              <span class="txt">path だけが違う。path・query はオリジンに含まれない</span>
+            </div>
+            <div class="cmp hide" data-el="r2" style="left:24px;top:200px;width:912px">
+              <span class="u"><b>http</b>://app.example.com/</span>
+              <span class="chip c-red">CROSS-ORIGIN</span>
+              <span class="txt">scheme が違う（https ≠ http）。暗黙の port も 443 ≠ 80</span>
+            </div>
+            <div class="cmp hide" data-el="r3" style="left:24px;top:244px;width:912px">
+              <span class="u">https://app.example.com<b>:8443</b>/</span>
+              <span class="chip c-red">CROSS-ORIGIN</span>
+              <span class="txt">port が違う（443 ≠ 8443）</span>
+            </div>
+            <div class="cmp hide" data-el="r4" style="left:24px;top:288px;width:912px">
+              <span class="u">https://<b>api</b>.example.com/</span>
+              <span class="chip c-red">CROSS-ORIGIN</span>
+              <span class="txt">host が違う。ただし登録可能ドメインが同じなので same-site</span>
+            </div>
+            <div class="cmp hide" data-el="r5" style="left:24px;top:332px;width:912px">
+              <span class="u">https://app.example.com<b>:443</b>/</span>
+              <span class="chip c-green">SAME-ORIGIN</span>
+              <span class="txt">https の既定 port は 443。明示しても同じオリジン</span>
+            </div>
+            <div class="cmp hide" data-el="r6" style="left:24px;top:376px;width:912px">
+              <span class="u">https://example.com/</span>
+              <span class="chip c-red">CROSS-ORIGIN</span>
+              <span class="txt">親ドメインでも host が一致しなければ別オリジン</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="tbl">
+          <table class="ref">
+            <thead><tr><th>比較対象（基準 <code>https://app.example.com</code>）</th><th>同一オリジン？</th><th>same-site？</th><th>理由</th></tr></thead>
+            <tbody>
+              <tr><td><code>https://app.example.com/api/users</code></td><td>はい</td><td>はい</td><td>path はオリジンに含まれない</td></tr>
+              <tr><td><code>https://app.example.com:443/</code></td><td>はい</td><td>はい</td><td>https の既定 port 443 を明示しただけ</td></tr>
+              <tr><td><code>http://app.example.com/</code></td><td>いいえ</td><td>いいえ</td><td>scheme が違う（same-site も scheme を比較する “schemeful same-site”）</td></tr>
+              <tr><td><code>https://app.example.com:8443/</code></td><td>いいえ</td><td>はい</td><td>port が違う（site は port を見ない）</td></tr>
+              <tr><td><code>https://api.example.com/</code></td><td>いいえ</td><td>はい</td><td>host が違う。登録可能ドメイン <code>example.com</code> は同じ</td></tr>
+              <tr><td><code>https://api.example/</code>（<code>https://app.example</code> から）</td><td>いいえ</td><td>いいえ</td><td>登録可能ドメインが <code>app.example</code> と <code>api.example</code> で別</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="note">
+          <b>same-origin と same-site は別物です。</b>CORS が見るのは <strong>origin</strong>（scheme + host + port の完全一致）。
+          Cookie の <code>SameSite</code> 属性や <code>Sec-Fetch-Site</code> ヘッダが見るのは <strong>site</strong>（scheme + 登録可能ドメイン。Public Suffix List で判定）です。
+          <code>https://app.example.com</code> → <code>https://api.example.com</code> は「cross-origin だが same-site」になります。
+        </div>
+      </section>
+
+      <!-- 2. 単純リクエスト -->
+      <section class="chapter" id="simple">
+        <h2>全体像：単純リクエスト</h2>
+        <p>
+          以降のシーンでは、<code>https://app.example</code> で動く JavaScript が <code>https://api.example</code> の API を呼びます。
+          メソッドが <code>GET</code>/<code>HEAD</code>/<code>POST</code> で、ヘッダが CORS-safelisted なものだけなら、プリフライトなしで<strong>いきなり本リクエストが送られます</strong>。
+          サーバーはそれを受け取って処理し、レスポンスを返します。<strong>ブロックはその後、ブラウザの中で起きます。</strong>
+        </p>
+
+        <div class="scene" id="sc-simple" data-title="単純リクエスト：届くのはサーバー、止めるのはブラウザ">
+          <div class="stage" data-w="960" data-h="520">
+            <div class="zone" data-label="Browser (Chrome)" style="left:16px;top:24px;width:424px;height:480px"></div>
+            <div class="node" data-el="js" style="left:36px;top:52px;width:176px">
+              <div class="node-h"><i data-icon="code"></i><b class="node-t">JavaScript</b></div>
+              <div class="node-s">https://app.example</div>
+            </div>
+            <div class="node" data-el="net" style="left:276px;top:52px;width:148px">
+              <div class="node-h"><i data-icon="shield"></i><b class="node-t">CORS check</b></div>
+              <div class="node-s">Fetch（ブラウザ内部）</div>
+            </div>
+            <div class="file hide" data-el="app" style="left:36px;top:136px;width:388px">
+              <div class="file-h">app.js（https://app.example で実行）</div>
+              <pre data-lang="js">fetch('https://api.example/v1/items')
+  .then(r => r.json()).then(console.log);</pre>
+            </div>
+            <div class="file hide" data-el="chk" style="left:36px;top:222px;width:388px">
+              <div class="file-h">CORS check（レスポンス受信時に判定）</div>
+              <div class="file-b"><dl class="kv">
+                <dt>Origin</dt><dd>https://app.example</dd>
+                <dt>ACAO</dt><dd data-el="ka">—</dd>
+                <dt>判定</dt><dd data-el="kr">—</dd>
+              </dl></div>
+            </div>
+            <div class="term" data-el="con" style="left:36px;top:330px;width:388px;height:166px">
+              <div class="term-h">DevTools — Console</div>
+              <div class="term-b" data-el="conb"></div>
+            </div>
+
+            <div class="node" data-el="api" style="left:732px;top:52px;width:212px">
+              <div class="node-h"><i data-icon="server"></i><b class="node-t">api.example</b></div>
+              <div class="node-s">Express :8080</div>
+            </div>
+            <div class="term" data-el="log" style="left:732px;top:136px;width:212px;height:140px">
+              <div class="term-h">access log</div>
+              <div class="term-b"></div>
+            </div>
+            <div class="file hide" data-el="req" style="left:456px;top:136px;width:262px">
+              <div class="file-h">ブラウザが送るリクエスト</div>
+              <pre data-lang="http">GET /v1/items HTTP/1.1
+Host: api.example
+⟪Origin: https://app.example⟫
+Sec-Fetch-Mode: cors
+Sec-Fetch-Site: cross-site</pre>
+            </div>
+            <div class="file hide" data-el="res" style="left:456px;top:300px;width:420px">
+              <div class="file-h">サーバーのレスポンス</div>
+              <pre data-lang="http" data-el="resp">HTTP/1.1 200 OK
+Content-Type: application/json
+⟪Access-Control-Allow-Origin: https://app.example⟫
+Vary: Origin
+
+{"items":[{"id":42,"name":"pen"}]}</pre>
+            </div>
+          </div>
+        </div>
+
+        <h3>「単純リクエスト」になる条件</h3>
+        <p>Fetch Standard では「単純リクエスト」という用語は使わず、次の条件を<strong>すべて</strong>満たすリクエストはプリフライト（CORS-preflight request）を省略する、と定義されています（MDN では simple request と呼ばれます）。</p>
+        <div class="tbl">
+          <table class="ref">
+            <thead><tr><th>項目</th><th>プリフライトなしで送れる値</th><th>プリフライトが必要になる例</th></tr></thead>
+            <tbody>
+              <tr><td>メソッド</td><td>CORS-safelisted method：<code>GET</code> / <code>HEAD</code> / <code>POST</code></td><td><code>PUT</code>, <code>PATCH</code>, <code>DELETE</code></td></tr>
+              <tr><td>ヘッダ</td><td>CORS-safelisted request-header：<code>Accept</code>, <code>Accept-Language</code>, <code>Content-Language</code>, <code>Content-Type</code>（下記の値のみ）, <code>Range</code>（単一の bytes 範囲）</td><td><code>Authorization</code>, <code>X-Requested-With</code>, <code>X-Api-Key</code> など独自ヘッダ全般</td></tr>
+              <tr><td><code>Content-Type</code></td><td><code>application/x-www-form-urlencoded</code> / <code>multipart/form-data</code> / <code>text/plain</code></td><td><code>application/json</code></td></tr>
+              <tr><td>値の長さ</td><td>各値 128 バイト以下、safelisted ヘッダ値の合計 1024 バイト以下</td><td>長すぎる <code>Accept</code> など</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="note warn">
+          プリフライトが省略されるのは「このリクエストは HTML の <code>&lt;form&gt;</code> でも昔から送れたから、送ること自体は今さら防げない」という互換性上の理由です。
+          <strong>安全だから省略されるのではありません。</strong>単純リクエストはサーバーに届き、副作用（書き込み）も実行されます。
+        </div>
+      </section>
+
+      <!-- 3. プリフライト -->
+      <section class="chapter" id="preflight">
+        <h2>プリフライト（OPTIONS）</h2>
+        <p>
+          <code>PUT</code> や <code>Content-Type: application/json</code>、<code>Authorization</code> ヘッダを使うと、ブラウザは本リクエストの前に
+          <code>OPTIONS</code> メソッドの<strong>プリフライト</strong>を送り、「このオリジンから、このメソッドとヘッダで送ってよいか」をサーバーに問い合わせます。
+          許可が返らなければ<strong>本リクエストは送信されません</strong>（単純リクエストとの大きな違い）。
+        </p>
+
+        <div class="scene" id="sc-preflight" data-title="プリフライト：OPTIONS → 204 → 本リクエスト → キャッシュ">
+          <div class="stage" data-w="960" data-h="540">
+            <div class="zone" data-label="Browser (Chrome)" style="left:16px;top:24px;width:424px;height:500px"></div>
+            <div class="node" data-el="js" style="left:36px;top:52px;width:176px">
+              <div class="node-h"><i data-icon="code"></i><b class="node-t">JavaScript</b></div>
+              <div class="node-s">https://app.example</div>
+            </div>
+            <div class="node" data-el="net" style="left:276px;top:52px;width:148px">
+              <div class="node-h"><i data-icon="shield"></i><b class="node-t">CORS check</b></div>
+              <div class="node-s">Fetch（ブラウザ内部）</div>
+            </div>
+            <div class="file hide" data-el="app" style="left:36px;top:132px;width:388px">
+              <div class="file-h">app.js</div>
+              <pre data-lang="js">fetch('https://api.example/v1/items/42', {
+  method: 'PUT',
+  headers: { 'Content-Type': 'application/json',
+             'Authorization': `Bearer ${token}` },
+  body: JSON.stringify({ name: 'pen' }) });</pre>
+            </div>
+            <div class="label hide" data-el="nl" style="left:36px;top:268px">CORS-safelisted ではない要素</div>
+            <div class="chip c-amber hide" data-el="c1" style="left:36px;top:290px">method: PUT</div>
+            <div class="chip c-amber hide" data-el="c3" style="left:150px;top:290px">Authorization</div>
+            <div class="chip c-amber hide" data-el="c2" style="left:36px;top:320px">Content-Type: application/json</div>
+            <div class="chip c-red hide" data-el="c4" style="left:272px;top:290px">X-Trace-Id</div>
+            <div class="file hide" data-el="cache" style="left:36px;top:356px;width:388px">
+              <div class="file-h">preflight cache（ブラウザ内部）</div>
+              <div class="file-b"><dl class="kv">
+                <dt>origin</dt><dd>https://app.example</dd>
+                <dt>url</dt><dd>https://api.example/v1/items/42</dd>
+                <dt>method</dt><dd>PUT</dd>
+                <dt>headers</dt><dd>authorization, content-type</dd>
+                <dt>max-age</dt><dd data-el="ttl">600 秒</dd>
+              </dl></div>
+            </div>
+
+            <div class="node" data-el="api" style="left:732px;top:52px;width:212px">
+              <div class="node-h"><i data-icon="server"></i><b class="node-t">api.example</b></div>
+              <div class="node-s">Express + cors :8080</div>
+            </div>
+            <div class="file hide" data-el="req" style="left:456px;top:132px;width:488px">
+              <div class="file-h" data-el="reqh">プリフライト（ブラウザが自動送信）</div>
+              <pre class="sm" data-lang="http" data-el="reqp">⟪OPTIONS⟫ /v1/items/42 HTTP/1.1
+Host: api.example
+Origin: https://app.example
+⟪Access-Control-Request-Method: PUT⟫
+⟪Access-Control-Request-Headers: authorization,content-type⟫</pre>
+            </div>
+            <div class="file hide" data-el="res" style="left:456px;top:272px;width:488px">
+              <div class="file-h" data-el="resh">プリフライトへの応答</div>
+              <pre data-lang="http" data-el="resp">HTTP/1.1 204 No Content
+Access-Control-Allow-Origin: https://app.example
+⟪Access-Control-Allow-Methods: GET,HEAD,PUT,PATCH,POST,DELETE⟫
+⟪Access-Control-Allow-Headers: Authorization,Content-Type⟫
+⟪Access-Control-Max-Age: 600⟫
+Vary: Origin</pre>
+            </div>
+            <div class="term" data-el="log" style="left:456px;top:432px;width:488px;height:96px">
+              <div class="term-h">api.example — access log</div>
+              <div class="term-b"></div>
+            </div>
+          </div>
+        </div>
+
+        <h3>実物のメッセージ（プリフライト → 本リクエスト）</h3>
+        <div class="cols">
+          <pre data-lang="http" data-title="① プリフライト（ブラウザ → サーバー）">OPTIONS /v1/items/42 HTTP/1.1
+Host: api.example
+Origin: https://app.example
+Access-Control-Request-Method: PUT
+Access-Control-Request-Headers: authorization,content-type
+Sec-Fetch-Mode: cors
+Sec-Fetch-Site: cross-site
+Sec-Fetch-Dest: empty</pre>
+          <pre data-lang="http" data-title="② プリフライト応答（サーバー → ブラウザ）">HTTP/1.1 204 No Content
+Access-Control-Allow-Origin: https://app.example
+Access-Control-Allow-Methods: GET,HEAD,PUT,PATCH,POST,DELETE
+Access-Control-Allow-Headers: Authorization,Content-Type
+Access-Control-Max-Age: 600
+Vary: Origin
+Content-Length: 0</pre>
+          <pre data-lang="http" data-title="③ 本リクエスト（ブラウザ → サーバー）">PUT /v1/items/42 HTTP/1.1
+Host: api.example
+Origin: https://app.example
+Authorization: Bearer eyJhbGciOiJSUzI1NiJ9…
+Content-Type: application/json
+Content-Length: 14
+
+{"name":"pen"}</pre>
+          <pre data-lang="http" data-title="④ 本レスポンス（ここにも ACAO が必要）">HTTP/1.1 200 OK
+Access-Control-Allow-Origin: https://app.example
+Vary: Origin
+Content-Type: application/json
+
+{"id":42,"name":"pen"}</pre>
+        </div>
+        <p>
+          <code>Access-Control-Request-Headers</code> には、CORS-safelisted ではないヘッダ名だけが<strong>小文字化・ソートされ、カンマ区切り</strong>で入ります（上の例では <code>Content-Type: application/json</code> は safelisted な値ではないので含まれます）。
+          プリフライト自体には Cookie や <code>Authorization</code> は付きません。サーバーがプリフライトにも認証を要求すると失敗します（§5）。
+        </p>
+
+        <div class="lab" id="pf-lab">
+          <div class="lab-h">PREFLIGHT LAB · このリクエストはプリフライトされる？</div>
+          <div class="lab-grid">
+            <div>
+              <label for="pf-m">method</label>
+              <select id="pf-m">
+                <option>GET</option><option>HEAD</option><option selected>POST</option><option>PUT</option><option>PATCH</option><option>DELETE</option>
+              </select>
+              <label for="pf-ct">Content-Type</label>
+              <select id="pf-ct">
+                <option value="">（なし）</option>
+                <option>application/x-www-form-urlencoded</option>
+                <option>multipart/form-data; boundary=----x</option>
+                <option>text/plain;charset=UTF-8</option>
+                <option selected>application/json</option>
+                <option>application/xml</option>
+              </select>
+              <label>追加ヘッダ / オプション</label>
+              <div class="opts">
+                <label class="opt"><input type="checkbox" id="pf-auth"> Authorization</label>
+                <label class="opt"><input type="checkbox" id="pf-xrw"> X-Requested-With</label>
+                <label class="opt"><input type="checkbox" id="pf-al"> Accept-Language</label>
+                <label class="opt"><input type="checkbox" id="pf-cred"> credentials: 'include'</label>
+              </div>
+            </div>
+            <div>
+              <div id="pf-verdict" class="verdict">—</div>
+              <ul id="pf-why" class="lab-why"></ul>
+              <pre data-lang="http" data-bare id="pf-out"></pre>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- 4. 資格情報 -->
+      <section class="chapter" id="credentials">
+        <h2>資格情報付きリクエスト（Cookie）</h2>
+        <p>
+          <code>fetch()</code> の既定 <code>credentials: 'same-origin'</code> では、クロスオリジンのリクエストに Cookie は付きません。
+          <code>credentials: 'include'</code> を指定すると Cookie が付き、代わりにサーバー側の条件が厳しくなります：
+          <code>Access-Control-Allow-Origin</code> に <code>*</code> は使えず、<code>Access-Control-Allow-Credentials: true</code> が必須です。
+        </p>
+
+        <div class="scene" id="sc-cred" data-title="credentials: 'include' と Allow-Credentials / Vary: Origin">
+          <div class="stage" data-w="960" data-h="540">
+            <div class="zone" data-el="bz" data-label="Browser (Chrome)" style="left:16px;top:24px;width:424px;height:500px"></div>
+            <div class="node" data-el="js" style="left:36px;top:52px;width:176px">
+              <div class="node-h"><i data-icon="code"></i><b class="node-t">JavaScript</b></div>
+              <div class="node-s">https://app.example</div>
+            </div>
+            <div class="node c-red hide" data-el="evil" style="left:36px;top:52px;width:176px">
+              <div class="node-h"><i data-icon="attacker"></i><b class="node-t">罠ページ</b></div>
+              <div class="node-s">https://evil.example</div>
+            </div>
+            <div class="node" data-el="net" style="left:276px;top:52px;width:148px">
+              <div class="node-h"><i data-icon="shield"></i><b class="node-t">CORS check</b></div>
+              <div class="node-s">Fetch（ブラウザ内部）</div>
+            </div>
+            <div class="file hide" data-el="app" style="left:36px;top:132px;width:388px">
+              <div class="file-h" data-el="apph">app.js</div>
+              <pre data-lang="js">fetch('https://api.example/v1/me', {
+  ⟪credentials: 'include'⟫,  // 既定は 'same-origin'
+});</pre>
+            </div>
+            <div class="file hide" data-el="jar" style="left:36px;top:236px;width:388px">
+              <div class="file-h">Cookie jar（api.example 用）</div>
+              <div class="file-b"><dl class="kv">
+                <dt>sid</dt><dd>8f2c1e9a7b40d3</dd>
+                <dt>属性</dt><dd>Path=/; Secure; HttpOnly; SameSite=None</dd>
+              </dl></div>
+            </div>
+            <div class="term" data-el="con" style="left:36px;top:322px;width:388px;height:190px">
+              <div class="term-h">DevTools — Console</div>
+              <div class="term-b" data-el="conb"></div>
+            </div>
+
+            <div class="node" data-el="api" style="left:732px;top:52px;width:212px">
+              <div class="node-h"><i data-icon="server"></i><b class="node-t">api.example</b></div>
+              <div class="node-s">Express :8080</div>
+            </div>
+            <div class="node sm c-violet hide" data-el="cdn" style="left:500px;top:48px;width:170px">
+              <div class="node-h"><i data-icon="layers"></i><b class="node-t">CDN / cache</b></div>
+              <div class="node-s">key: URL + Origin</div>
+            </div>
+            <div class="file hide" data-el="req" style="left:456px;top:132px;width:488px">
+              <div class="file-h">ブラウザが送るリクエスト</div>
+              <pre data-lang="http" data-el="reqp">GET /v1/me HTTP/1.1
+Host: api.example
+Origin: https://app.example
+⟪Cookie: sid=8f2c1e9a7b40d3⟫
+Sec-Fetch-Site: cross-site</pre>
+            </div>
+            <div class="file hide" data-el="res" style="left:456px;top:272px;width:488px">
+              <div class="file-h">サーバーのレスポンス</div>
+              <pre data-lang="http" data-el="resp">HTTP/1.1 200 OK
+⟪Access-Control-Allow-Origin: *⟫
+Content-Type: application/json
+
+{"user":"alice","email":"alice@example.com"}</pre>
+            </div>
+            <div class="term" data-el="log" style="left:456px;top:446px;width:488px;height:82px">
+              <div class="term-h">api.example — access log</div>
+              <div class="term-b"></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="tbl">
+          <table class="ref">
+            <thead><tr><th><code>credentials</code></th><th>クロスオリジンで Cookie を送る？</th><th>レスポンスを読むための条件</th></tr></thead>
+            <tbody>
+              <tr><td><code>'omit'</code></td><td>送らない（Set-Cookie も無視）</td><td><code>Access-Control-Allow-Origin</code> が <code>*</code> またはリクエストの Origin と一致</td></tr>
+              <tr><td><code>'same-origin'</code>（既定）</td><td>送らない（同一オリジンなら送る）</td><td>同上</td></tr>
+              <tr><td><code>'include'</code></td><td>送る（Cookie の <code>SameSite</code> 等の条件を満たす場合）</td><td>ACAO が Origin と<strong>完全一致</strong>（<code>*</code> 不可）かつ <code>Access-Control-Allow-Credentials: true</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="note">
+          <code>XMLHttpRequest</code> では <code>xhr.withCredentials = true</code> が <code>credentials: 'include'</code> に相当します。
+          資格情報付きモードでは <code>Access-Control-Allow-Headers</code> / <code>-Methods</code> / <code>-Expose-Headers</code> の <code>*</code> もワイルドカードではなく「<code>*</code> という名前」として扱われます。
+        </div>
+      </section>
+
+      <!-- 5. 失敗 -->
+      <section class="chapter" id="failures">
+        <h2>失敗・設定ミス・誤解</h2>
+        <p>
+          CORS エラーはブラウザのコンソールに出ますが、原因の多くはサーバー設定にあります。また「CORS でブロックされた＝サーバーは何もしていない」という誤解が、
+          CSRF の見落としにつながります。実際のエラー文とサーバーログを並べて見ます。
+        </p>
+
+        <div class="scene" id="sc-fail" data-title="コンソールのエラー文とサーバーログを突き合わせる">
+          <div class="stage" data-w="960" data-h="540">
+            <div class="zone" data-label="Browser (Chrome)" style="left:16px;top:24px;width:424px;height:500px"></div>
+            <div class="node" data-el="js" style="left:36px;top:52px;width:176px">
+              <div class="node-h"><i data-icon="code"></i><b class="node-t">JavaScript</b></div>
+              <div class="node-s">https://app.example</div>
+            </div>
+            <div class="node c-red hide" data-el="evil" style="left:36px;top:52px;width:176px">
+              <div class="node-h"><i data-icon="attacker"></i><b class="node-t">罠ページ</b></div>
+              <div class="node-s">https://evil.example</div>
+            </div>
+            <div class="node" data-el="net" style="left:276px;top:52px;width:148px">
+              <div class="node-h"><i data-icon="shield"></i><b class="node-t">CORS check</b></div>
+              <div class="node-s">Fetch（ブラウザ内部）</div>
+            </div>
+            <div class="term" data-el="con" style="left:36px;top:132px;width:388px;height:380px">
+              <div class="term-h">DevTools — Console</div>
+              <div class="term-b" data-el="conb"></div>
+            </div>
+
+            <div class="node" data-el="api" style="left:732px;top:52px;width:212px">
+              <div class="node-h"><i data-icon="server"></i><b class="node-t">api.example</b></div>
+              <div class="node-s">nginx → app :8080</div>
+            </div>
+            <div class="file hide" data-el="res" style="left:456px;top:132px;width:488px">
+              <div class="file-h" data-el="resh">サーバーのレスポンス</div>
+              <pre data-lang="http" data-el="resp">HTTP/1.1 200 OK</pre>
+            </div>
+            <div class="file hide" data-el="ngx" style="left:456px;top:300px;width:488px">
+              <div class="file-h">/etc/nginx/conf.d/api.conf</div>
+              <pre class="sm" data-lang="text" data-el="ngxp">location /v1/ {
+  add_header Access-Control-Allow-Origin https://app.example;
+  proxy_pass http://127.0.0.1:8080;
+}</pre>
+            </div>
+            <div class="term hide" data-el="sh" style="left:456px;top:132px;width:488px;height:284px">
+              <div class="term-h">bash — curl 8.x（ブラウザではない HTTP クライアント）</div>
+              <div class="term-b"></div>
+            </div>
+            <div class="term" data-el="log" style="left:456px;top:430px;width:488px;height:98px">
+              <div class="term-h">api.example — /var/log/nginx/access.log</div>
+              <div class="term-b"></div>
+            </div>
+          </div>
+        </div>
+
+        <h3>Chrome のエラー文 → 原因 → 直し方</h3>
+        <p>Chrome / Edge では <code>Access to fetch at '&lt;URL&gt;' from origin '&lt;Origin&gt;' has been blocked by CORS policy:</code> に続けて理由が表示されます（文言はバージョンで変わることがあります）。</p>
+        <div class="tbl">
+          <table class="ref">
+            <thead><tr><th>理由部分（Chrome）</th><th>原因</th><th>直し方（サーバー側）</th></tr></thead>
+            <tbody>
+              <tr><td><code>No 'Access-Control-Allow-Origin' header is present on the requested resource.</code></td><td>レスポンスに ACAO がない。エラー応答（4xx/5xx）にだけ付いていないことも多い</td><td>許可する Origin を返す。nginx は <code>add_header … always</code></td></tr>
+              <tr><td><code>Response to preflight request doesn't pass access control check: It does not have HTTP ok status.</code></td><td>OPTIONS が 2xx 以外（401/404/405 など）</td><td>OPTIONS を認証・ルーティングより前で 204 にする</td></tr>
+              <tr><td><code>Request header field authorization is not allowed by Access-Control-Allow-Headers in preflight response.</code></td><td><code>Access-Control-Allow-Headers</code> に <code>Authorization</code> がない（<code>*</code> でも Authorization は許可されない）</td><td><code>Access-Control-Allow-Headers: Authorization, Content-Type</code></td></tr>
+              <tr><td><code>Method PUT is not allowed by Access-Control-Allow-Methods in preflight response.</code></td><td>メソッドが許可リストにない</td><td><code>Access-Control-Allow-Methods</code> に追加</td></tr>
+              <tr><td><code>The value of the 'Access-Control-Allow-Origin' header in the response must not be the wildcard '*' when the request's credentials mode is 'include'.</code></td><td>資格情報付きなのに <code>*</code></td><td>Origin を許可リストで照合して、その値を返す</td></tr>
+              <tr><td><code>The value of the 'Access-Control-Allow-Credentials' header in the response is '' which must be 'true' when the request's credentials mode is 'include'.</code></td><td>資格情報付きなのに ACAC がない</td><td><code>Access-Control-Allow-Credentials: true</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>Firefox では <code>Cross-Origin Request Blocked: The Same Origin Policy disallows reading the remote resource at &lt;URL&gt;. (Reason: CORS header 'Access-Control-Allow-Origin' missing).</code> のように、<code>Reason:</code> の後に理由が出ます。</p>
+        <div class="note bad">
+          <b>CORS は CSRF 対策ではありません。</b>CORS が止めるのは「レスポンスを読むこと」だけで、単純リクエスト（form 相当の <code>POST</code>）は Cookie 付きでサーバーに届き、処理されます。
+          CSRF には Cookie の <code>SameSite=Lax</code>/<code>Strict</code>、CSRF トークン、サーバーでの <code>Origin</code> / <code>Sec-Fetch-Site</code> 検査を使います。
+        </div>
+      </section>
+
+      <!-- 6. ヘッダ早見表 -->
+      <section class="chapter" id="headers">
+        <h2>ヘッダ早見表</h2>
+        <h3>ブラウザが付けるリクエストヘッダ（JS からは設定不可）</h3>
+        <div class="tbl">
+          <table class="ref">
+            <thead><tr><th>ヘッダ</th><th>いつ付く</th><th>値の例</th></tr></thead>
+            <tbody>
+              <tr><td><code>Origin</code></td><td>クロスオリジンの CORS リクエスト、プリフライト、同一オリジンでも GET/HEAD 以外</td><td><code>https://app.example</code>（path なし。サンドボックス iframe などでは <code>null</code>）</td></tr>
+              <tr><td><code>Access-Control-Request-Method</code></td><td>プリフライトのみ</td><td><code>PUT</code></td></tr>
+              <tr><td><code>Access-Control-Request-Headers</code></td><td>プリフライトのみ（safelisted でないヘッダがあるとき）</td><td><code>authorization,content-type</code>（小文字・ソート済み）</td></tr>
+              <tr><td><code>Sec-Fetch-Mode</code> / <code>Sec-Fetch-Site</code></td><td>Fetch Metadata（対応ブラウザ）</td><td><code>cors</code> / <code>cross-site</code>, <code>same-site</code>, <code>same-origin</code>, <code>none</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <h3>サーバーが返すレスポンスヘッダ</h3>
+        <div class="tbl">
+          <table class="ref">
+            <thead><tr><th>ヘッダ</th><th>返す場所</th><th>値と意味</th></tr></thead>
+            <tbody>
+              <tr><td><code>Access-Control-Allow-Origin</code></td><td>プリフライト応答 + 本レスポンス</td><td><code>https://app.example</code>（1 つだけ。カンマ区切りの複数指定は不可）または <code>*</code></td></tr>
+              <tr><td><code>Access-Control-Allow-Credentials</code></td><td>プリフライト応答 + 本レスポンス</td><td><code>true</code> のみ有効。資格情報付きモードで必須</td></tr>
+              <tr><td><code>Access-Control-Allow-Methods</code></td><td>プリフライト応答</td><td><code>GET, PUT, DELETE</code>。safelisted method（GET/HEAD/POST）は書かなくても通る</td></tr>
+              <tr><td><code>Access-Control-Allow-Headers</code></td><td>プリフライト応答</td><td><code>Authorization, Content-Type</code>。<code>*</code> は資格情報なしのときだけワイルドカード、かつ <code>Authorization</code> は含まない</td></tr>
+              <tr><td><code>Access-Control-Max-Age</code></td><td>プリフライト応答</td><td>キャッシュ秒数。省略時 5 秒。上限は Chromium 7200 秒、Firefox 86400 秒</td></tr>
+              <tr><td><code>Access-Control-Expose-Headers</code></td><td>本レスポンス</td><td><code>X-Request-Id, ETag</code>。書かないと JS からは safelisted な応答ヘッダ（<code>Content-Type</code> 等）しか読めない</td></tr>
+              <tr><td><code>Vary</code></td><td>Origin によって応答が変わるとき</td><td><code>Vary: Origin</code>。共有キャッシュ（CDN・プロキシ）が別 Origin 向けの応答を使い回さないように</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- 7. サーバー設定例 -->
+      <section class="chapter" id="server">
+        <h2>サーバー設定例</h2>
+        <p>どれも「許可するオリジンの一覧と照合し、一致したときだけその Origin を ACAO に返す」形にしています。Origin を無条件に反射する設定は避けてください（§4 のシーン最終ステップ）。</p>
+        <pre data-lang="text" data-title="nginx — /etc/nginx/conf.d/api.conf">map $http_origin $cors_origin {
+    default                "";          # 空文字なら add_header は出力されない
+    "https://app.example"  $http_origin;
+    "https://admin.example" $http_origin;
+}
+
+server {
+    listen 443 ssl;
+    server_name api.example;
+
+    location /v1/ {
+        if ($request_method = OPTIONS) {
+            add_header Access-Control-Allow-Origin      $cors_origin always;
+            add_header Access-Control-Allow-Credentials "true" always;
+            add_header Access-Control-Allow-Methods     "GET, POST, PUT, DELETE" always;
+            add_header Access-Control-Allow-Headers     "Authorization, Content-Type" always;
+            add_header Access-Control-Max-Age           600 always;
+            add_header Vary                             Origin always;
+            return 204;
+        }
+        # ⟪always⟫ がないと 4xx/5xx 応答に付かず、本当のエラーが CORS エラーに化ける
+        add_header Access-Control-Allow-Origin      $cors_origin ⟪always⟫;
+        add_header Access-Control-Allow-Credentials "true" always;
+        add_header Vary                             Origin always;
+        proxy_pass http://127.0.0.1:8080;
+    }
+}</pre>
+        <div class="cols">
+          <pre data-lang="js" data-title="Express — cors ミドルウェア（npm i cors）">const express = require('express');
+const cors = require('cors');
+const app = express();
+
+app.use('/v1', cors({
+  // 配列: 一致した Origin だけを ACAO に反射（Vary: Origin も付く）
+  origin: ['https://app.example', 'https://admin.example'],
+  methods: ['GET', 'POST', 'PUT', 'DELETE'],
+  allowedHeaders: ['Authorization', 'Content-Type'],
+  exposedHeaders: ['X-Request-Id'],
+  credentials: true,   // Access-Control-Allow-Credentials: true
+  maxAge: 600,         // Access-Control-Max-Age: 600
+}));                   // OPTIONS には既定で 204 を返す
+
+app.put('/v1/items/:id', express.json(), (req, res) =&gt; {
+  res.json({ id: Number(req.params.id), ...req.body });
+});
+app.listen(8080);</pre>
+          <pre data-lang="py" data-title="FastAPI — CORSMiddleware（Starlette）">from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+
+app = FastAPI()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["https://app.example", "https://admin.example"],
+    allow_credentials=True,  # True のとき "*" は使わず明示する
+    allow_methods=["GET", "POST", "PUT", "DELETE"],
+    allow_headers=["Authorization", "Content-Type"],
+    expose_headers=["X-Request-Id"],
+    max_age=600,             # 既定も 600
+)
+
+@app.put("/v1/items/{item_id}")
+async def put_item(item_id: int, body: dict):
+    return {"id": item_id, **body}</pre>
+        </div>
+      </section>
+
+      <!-- 8. 手元で試す -->
+      <section class="chapter" id="try">
+        <h2>手元で試す</h2>
+        <h3>curl で CORS ヘッダを確認する</h3>
+        <p>curl は CORS を<strong>強制しません</strong>（ブラウザではないため）。ここでは「サーバーがどのヘッダを返すか」を観察するためだけに使います。</p>
+        <pre data-lang="bash" data-title="単純リクエスト / プリフライトを手で再現">$ curl -si https://api.example/v1/items -H 'Origin: https://app.example' | grep -i '^access-control'
+access-control-allow-origin: https://app.example
+
+# プリフライトを再現（ブラウザが送るものと同じヘッダ）
+$ curl -si -X OPTIONS https://api.example/v1/items/42 \
+    -H 'Origin: https://app.example' \
+    -H 'Access-Control-Request-Method: PUT' \
+    -H 'Access-Control-Request-Headers: authorization,content-type'
+HTTP/2 204
+access-control-allow-origin: https://app.example
+access-control-allow-methods: GET,HEAD,PUT,PATCH,POST,DELETE
+access-control-allow-headers: Authorization,Content-Type
+access-control-max-age: 600
+
+# 許可していない Origin には ACAO が返らないこと（データ自体は返ってくる点にも注目）
+$ curl -si https://api.example/v1/items -H 'Origin: https://evil.example' | grep -ci '^access-control-allow-origin'
+0</pre>
+        <h3>ローカルで CORS エラーを再現する（Python だけで）</h3>
+        <p>port が違えば別オリジンです。<code>python3 -m http.server</code> は CORS ヘッダを付けないので、そのままエラーを観察できます。</p>
+        <pre data-lang="bash" data-title="2 つのオリジンを立てる">$ mkdir -p /tmp/cors-demo && cd /tmp/cors-demo
+$ echo '{"items":[{"id":42}]}' > items.json
+$ python3 -m http.server 9000        # API 役:  http://localhost:9000
+# 別ターミナルで
+$ python3 -m http.server 8000        # ページ役: http://localhost:8000
+# ブラウザで http://localhost:8000/ を開き、DevTools の Console で:
+#   await fetch('http://localhost:9000/items.json')
+# → "No 'Access-Control-Allow-Origin' header is present..." のエラー
+# → しかし 9000 番のターミナルには "GET /items.json HTTP/1.1" 200 が出ている</pre>
+        <h3>DevTools で見る場所</h3>
+        <ul>
+          <li><b>Network</b> パネル：フィルタを <code>Fetch/XHR</code> ではなく <code>All</code> にすると、同じ URL の <code>OPTIONS</code>（プリフライト）が本リクエストと別の行で見えます。行をクリック → <b>Headers</b> で <code>Access-Control-*</code> を確認。</li>
+          <li><b>Console</b>：上表のエラー文。ブロックされた本リクエストは <code>net::ERR_FAILED</code> と表示され、サーバーが返したステータス（例 <code>200</code>）が併記されることがあります。</li>
+          <li><b>Issues</b> パネル：CORS の問題がリクエスト単位でまとめて表示されます。</li>
+        </ul>
+      </section>
+
+      <!-- 9. ハマりどころ -->
+      <section class="chapter" id="pitfalls">
+        <h2>ハマりどころ</h2>
+        <div class="note warn">
+          <ul>
+            <li><b>エラー応答に CORS ヘッダがない</b>：アプリが 500 を返したとき、nginx の <code>add_header</code>（<code>always</code> なし）やフレームワークの例外ハンドラが ACAO を付けないと、コンソールには本当の原因ではなく CORS エラーが出ます。サーバーログを先に見ます。</li>
+            <li><b>OPTIONS に認証をかけている</b>：プリフライトには <code>Authorization</code> も Cookie も付きません。認証ミドルウェアより前で OPTIONS を処理します。</li>
+            <li><b>ACAO を複数値にしている</b>：<code>Access-Control-Allow-Origin: https://a.example, https://b.example</code> は無効。リクエストの <code>Origin</code> を許可リストと照合して 1 つ返します。</li>
+            <li><b>Origin を無条件に反射 + <code>Allow-Credentials: true</code></b>：任意のサイトがログイン中ユーザーのデータを読めます。部分一致（<code>endsWith('example.com')</code> → <code>evilexample.com</code> が通る）や正規表現のドット未エスケープにも注意。</li>
+            <li><b><code>Origin: null</code> を許可しない</b>：サンドボックス iframe や <code>file://</code> から送られる <code>null</code> を許可すると、攻撃者も <code>null</code> を作れます。</li>
+            <li><b><code>Vary: Origin</code> 忘れ</b>：CDN が「https://app.example 向けの ACAO 付き応答」を他のオリジンに返し、別のオリジンで CORS エラーになる（あるいはその逆）。</li>
+            <li><b>レスポンスヘッダが読めない</b>：<code>res.headers.get('X-Request-Id')</code> が <code>null</code> なのは CORS の仕様。<code>Access-Control-Expose-Headers</code> が必要です。</li>
+            <li><b><code>mode: 'no-cors'</code> で「直した」つもり</b>：レスポンスは <code>type: "opaque"</code>、<code>status: 0</code>、本文は読めません。エラーが消えるだけです。</li>
+            <li><b>クロスサイトの Cookie が送られない</b>：<code>credentials: 'include'</code> でも、Cookie が <code>SameSite=Lax</code> や <code>Strict</code> だったり（Chrome は <code>SameSite</code> 未指定の Cookie を Lax として扱います）、ブラウザのサードパーティ Cookie 制限に当たると付きません。API を同じサイト（例 <code>app.example.com</code> と <code>api.example.com</code>）に置くのが確実です。</li>
+            <li><b>開発時だけプロキシで回避</b>：Vite の <code>server.proxy</code> などで同一オリジンに見せると CORS は発生しません。本番構成と差が出る点に注意します。</li>
+          </ul>
+        </div>
+      </section>
+
+      <!-- 10. 仕様 -->
+      <section class="chapter" id="spec">
+        <h2>仕様・参考</h2>
+        <ul>
+          <li><a href="https://fetch.spec.whatwg.org/#http-cors-protocol" target="_blank" rel="noopener">WHATWG Fetch Standard — CORS protocol</a>（<a href="https://fetch.spec.whatwg.org/#cors-check" target="_blank" rel="noopener">CORS check</a> / <a href="https://fetch.spec.whatwg.org/#cors-preflight-fetch" target="_blank" rel="noopener">CORS-preflight fetch</a> / <a href="https://fetch.spec.whatwg.org/#cors-preflight-cache" target="_blank" rel="noopener">CORS-preflight cache</a> / <a href="https://fetch.spec.whatwg.org/#cors-safelisted-request-header" target="_blank" rel="noopener">CORS-safelisted request-header</a>）</li>
+          <li><a href="https://html.spec.whatwg.org/multipage/browsers.html#origin" target="_blank" rel="noopener">WHATWG HTML Standard — Origin / Site</a></li>
+          <li><a href="https://www.rfc-editor.org/rfc/rfc6454" target="_blank" rel="noopener">RFC 6454 — The Web Origin Concept</a></li>
+          <li><a href="https://www.rfc-editor.org/rfc/rfc9110#field.vary" target="_blank" rel="noopener">RFC 9110 §12.5.5 — Vary</a></li>
+          <li><a href="https://w3c.github.io/webappsec-fetch-metadata/" target="_blank" rel="noopener">W3C Fetch Metadata Request Headers（Sec-Fetch-*）</a></li>
+          <li><a href="https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/CORS" target="_blank" rel="noopener">MDN — Cross-Origin Resource Sharing (CORS)</a> / <a href="https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/CORS/Errors" target="_blank" rel="noopener">CORS errors</a> / <a href="https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Access-Control-Max-Age" target="_blank" rel="noopener">Access-Control-Max-Age</a></li>
+          <li><a href="https://nginx.org/en/docs/http/ngx_http_headers_module.html#add_header" target="_blank" rel="noopener">nginx — add_header（always パラメータ）</a></li>
+          <li><a href="https://github.com/expressjs/cors" target="_blank" rel="noopener">expressjs/cors</a> / <a href="https://fastapi.tiangolo.com/tutorial/cors/" target="_blank" rel="noopener">FastAPI — CORS (Cross-Origin Resource Sharing)</a></li>
+          <li>関連：<a href="../oauth-oidc/">OAuth 2.0 / OIDC</a>（SPA からトークンエンドポイントを呼ぶときにも CORS が関わります）、<a href="../jwt/">JWT</a></li>
+        </ul>
+      </section>
+
+    </main>
+  </div>
+
+  <footer class="site-f"></footer>
+  <script src="../../assets/js/topics.js"></script>
+  <script src="../../assets/js/tim.js"></script>
+  <script src="scenes.js"></script>
+</body>
+</html>

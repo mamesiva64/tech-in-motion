@@ -180,9 +180,14 @@ TIM.scene('#sc-flow', {
 | `s.camera({scale, x, y, to, dur})` | カメラズーム／パン。引数なしで戻す |
 | `s.spawn(html, {x, y, into, fx})` | 要素を動的生成して返す（同期） |
 | `s.hl(lines, blockIndex)` | 下部コードパネルの行をハイライト（1 始まり） |
+| `s.code(sel, src, lang)` | ステージ内の `pre` をハイライト付きコードで差し替え |
 | `s.wait(ms)` | 待機 |
 
 - 座標指定 `from/to` は `'name'`（中心）、`'name:r'`（右端中央。`c t b l r tl tr bl br`）、または `{x, y}`。
+- `fly` / `line` の `label` は **HTML として**挿入される（アイコン等を入れられる）。`<` を含む生テキストは `{ text: '...' }` を使う（自動エスケープ）。
+- `s.stamp(sel, text, { layer: 'fx' })` で判子を最上位レイヤーに置く（親の `overflow:hidden` で切れない）。`.file` は判子がはみ出せる。
+- `.zone` のラベルは大文字表示。URL など大小文字が意味を持つラベルは `class="zone raw"`。
+- 確認用：`await TIM.inspect(sceneIndex, stepIndex, { x, y, scale })` で指定ステップの最終状態を画面全体に拡大表示（クリックで閉じる）。`TIM.instant = true` にすると以降のステップ再生がすべて瞬時モードになる（非表示タブで WAAPI が進まない環境での検証用）。
 - 色バリエーションは親や要素に `c-cyan c-lime c-violet c-pink c-amber c-blue c-orange c-green c-red` を付ける（`--accent` が切り替わる）。
 
 ### 7.4 下部パネルのコード `code`
@@ -226,6 +231,8 @@ TIM.scene('#sc-flow', {
 4. コマンド・フラグ・ヘッダ名・ファイルパスが実在すること（記憶に頼らず、不確かなら書かない）。
 5. トップページのカードから遷移でき、ヘッダの TOPICS メニューから他ページへ移動できること。
 6. 相対パス：トピックページは `data-root="../../"`、アセットは `../../assets/...`。
+
+内蔵ブラウザで確認するときは、自分専用のタブを 1 つだけ開き、**確認が終わったら `tabs_close` で閉じる**（タブ数には上限があり、並行作業者が使えなくなる）。
 
 ローカル確認は同梱の簡易サーバーを使う（Python/Node 不要）：
 

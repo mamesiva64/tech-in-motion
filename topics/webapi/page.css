@@ -1,0 +1,17 @@
+/* topics/webapi/page.css — Web API ページ固有のステージ部品 */
+
+/* 1 行ずつの等幅テキスト（DB の行・ワイヤ上の行など） */
+.wl { white-space: pre; font: 11.5px/1.6 var(--mono); color: #cfd8ee; }
+.wl.hd { color: var(--tx3); }
+.wl.new { color: var(--lime); }
+.wl.gone { color: var(--red); text-decoration: line-through; opacity: 0.75; }
+.wl.upd { color: var(--amber); }
+
+/* ステージ内の小さな説明テキスト */
+.stage .note-s { font: 11.5px/1.6 var(--sans); color: var(--tx2); }
+.stage .note-s code { font-size: 10.5px; padding: 0 4px; }
+
+/* .big のステータス表示 */
+.stage .big.st-ok { color: var(--green); }
+.stage .big.st-bad { color: var(--red); }
+.stage .big.st-warn { color: var(--amber); }

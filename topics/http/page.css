@@ -1,0 +1,27 @@
+/* topics/http/page.css — HTTP ページ固有のステージ部品 */
+
+/* ワイヤ上のバイト列（1 行 = 1 フィールド行。CRLF を可視化） */
+.wire-b { padding: 8px 12px; }
+.wl { white-space: pre; font: 11.5px/1.6 var(--mono); color: #cfd8ee; }
+.wl b { color: var(--lime); font-weight: 700; }
+.wl em { font-style: normal; color: var(--tx3); font: 11px var(--sans); }
+.crlf {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 0 4px;
+  font: 600 9.5px/14px var(--mono);
+  font-style: normal;
+  color: var(--amber);
+  background: rgba(251, 191, 36, 0.1);
+  border: 1px solid rgba(251, 191, 36, 0.45);
+  border-radius: 4px;
+  vertical-align: 1px;
+}
+
+/* 接続レーンに並べる小さなフレーム／メッセージ */
+.fr { padding: 2px 8px; font-size: 10.5px; }
+.fr.lost { text-decoration: line-through; opacity: 0.8; }
+
+/* ステージ内の小さな説明テキスト */
+.stage .note-s { font: 11.5px/1.55 var(--sans); color: var(--tx2); }
+.stage .note-s code { font-size: 10.5px; padding: 0 4px; }

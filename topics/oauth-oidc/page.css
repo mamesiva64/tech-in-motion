@@ -1,0 +1,29 @@
+/* OAuth 2.0 / OIDC page — page-specific parts */
+
+/* front-channel / back-channel legend in prose */
+.doc .fc { color: var(--amber); font-weight: 700; }
+.doc .bc { color: var(--cyan); font-weight: 700; }
+
+/* sequence lifelines */
+.stage .divider { border-left: 1.5px dashed #41557f; }
+.stage .chip.ctr, .stage .chip[style*="width"] { justify-content: center; }
+
+.stage .kv dd.ok { color: var(--green); }
+.stage .kv dd.bad { color: var(--red); }
+.stage .kv dd.warn { color: var(--amber); }
+.stage .big small { white-space: nowrap; }
+
+/* PKCE lab */
+.lab-out {
+  padding: 10px 12px;
+  font: 600 13px/1.5 var(--mono);
+  color: var(--accent);
+  background: #060a12;
+  border: 1px solid var(--line2);
+  border-radius: 9px;
+  word-break: break-all;
+}
+.lab-st { margin-top: 8px; font: 12.5px/1.6 var(--mono); color: var(--tx3); }
+.lab-st.ok { color: var(--green); }
+.lab-st.bad { color: var(--red); }
+#pk-url { margin-top: 4px; border: 1px solid var(--line); border-radius: 9px; background: #060a12; min-height: 60px; }

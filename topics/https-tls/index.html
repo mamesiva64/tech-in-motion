@@ -1,0 +1,770 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>HTTPS / TLS 1.3 — Tech in Motion</title>
+  <meta name="description" content="curl -v と openssl s_client -trace の実測出力で追う TLS 1.3。ClientHello の拡張をバイト単位で読み、key_share から HKDF 鍵スケジュール、CertificateVerify・Finished の検証、MITM が止まる場所、nginx 設定と SSLKEYLOGFILE まで。">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Space+Grotesk:wght@500;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="../../assets/css/tim.css">
+  <link rel="stylesheet" href="page.css">
+</head>
+<body data-root="../../" data-topic="https-tls">
+  <header class="site-h"></header>
+
+  <div class="page">
+    <aside class="toc"></aside>
+    <main class="doc">
+
+      <!-- 0. HERO -->
+      <section class="hero">
+        <p class="kicker">Crypto / PKI · TLS 1.3</p>
+        <h1>HTTPS / TLS 1.3<small>ClientHello から Finished まで、バイトと鍵の流れを実物で</small></h1>
+        <p class="lead"><code>curl -v https://example.com/</code> を打ってから最初の <code>GET /</code> が暗号化されて出ていくまでに、回線上では平文の ClientHello / ServerHello と、暗号化されたハンドシェイクメッセージが流れます。このページでは <code>openssl s_client -trace</code> と <code>curl -v</code> の<strong>実測出力</strong>をもとに、どのバイトが平文で見え、どこで鍵が決まり、クライアントが何をどの順に検証しているのかをステップ再生で追います。</p>
+        <div class="facts">
+          <div class="fact"><span>暗号化の境界</span><b>ServerHello の直後から。以降のレコードは外側 content type <code>23</code></b></div>
+          <div class="fact"><span>鍵を決めるもの</span><b><code>key_share</code>（X25519 / X25519MLKEM768）の ECDHE ＋ HKDF 鍵スケジュール</b></div>
+          <div class="fact"><span>サーバー認証</span><b><code>CertificateVerify</code>＝サーバー秘密鍵でトランスクリプトハッシュに署名</b></div>
+          <div class="fact"><span>仕様</span><b>RFC 8446 (TLS 1.3) / 6066 (SNI) / 7301 (ALPN) / 5869 (HKDF)</b></div>
+        </div>
+      </section>
+
+      <!-- 1. 全体像 -->
+      <section class="chapter" id="overview">
+        <h2>全体像：curl -v の 1 往復半</h2>
+        <p>HTTPS は「TCP の上に TLS を張り、その中で HTTP を話す」だけです。TLS 1.3 のフルハンドシェイクは <strong>1-RTT</strong>：クライアントが ClientHello を送り、サーバーが ServerHello〜Finished をまとめて返した時点で、クライアントは自分の Finished と一緒に最初の HTTP リクエストを送れます。下のシーンの端末出力は Ubuntu 24.04 の <code>curl 8.5.0 (OpenSSL 3.0.13)</code> で 2026-09 に実測したものです（IP アドレスだけ RFC 5737 の例示アドレスに置き換えています）。</p>
+        <p>図中の <code>{…}</code> は handshake traffic key で、<code>[…]</code> は application traffic key で暗号化されたメッセージを表します（RFC 8446 §2 の記法）。</p>
+
+        <div class="scene" id="sc-overview" data-title="curl -v https://example.com/ の 1 往復半">
+          <div class="stage" data-w="960" data-h="540">
+            <div class="node" data-el="cli" style="left:20px;top:16px;width:220px">
+              <div class="node-h"><i data-icon="terminal"></i><b class="node-t">curl 8.5.0</b></div>
+              <div class="node-s">OpenSSL 3.0.13<br>198.51.100.7</div>
+            </div>
+            <div class="node" data-el="srv" style="left:720px;top:16px;width:220px">
+              <div class="node-h"><i data-icon="server"></i><b class="node-t">example.com:443</b></div>
+              <div class="node-s">203.0.113.10<br>TLS 1.3 · HTTP/2</div>
+            </div>
+            <span class="chip c-green hide" data-el="hk1" style="left:252px;top:22px"><i data-icon="key"></i>handshake keys</span>
+            <span class="chip c-green hide" data-el="ak1" style="left:252px;top:54px"><i data-icon="key"></i>application keys</span>
+            <span class="chip c-green hide" data-el="hk2" style="left:566px;top:22px"><i data-icon="key"></i>handshake keys</span>
+            <span class="chip c-green hide" data-el="ak2" style="left:566px;top:54px"><i data-icon="key"></i>application keys</span>
+            <div class="ll" style="left:129px;top:104px;height:268px"></div>
+            <div class="ll" style="left:829px;top:104px;height:268px"></div>
+            <div class="zone c-green hide" data-el="bandA" data-label="handshake traffic keys で暗号化" style="left:150px;top:218px;width:660px;height:80px"></div>
+            <div class="zone c-green hide" data-el="bandB" data-label="application traffic keys で暗号化" style="left:150px;top:310px;width:660px;height:60px"></div>
+            <span class="chip c-amber hide" data-el="plain" style="left:20px;top:163px">平文で流れる</span>
+            <span class="chip c-green hide" data-el="enc1" style="left:20px;top:246px">暗号化 (23)</span>
+            <span class="chip c-green hide" data-el="enc2" style="left:20px;top:328px">暗号化 (23)</span>
+            <span class="chip hide" data-el="rtt1" style="left:846px;top:112px">TCP 1-RTT</span>
+            <span class="chip hide" data-el="rtt2" style="left:846px;top:206px">TLS 1-RTT</span>
+            <span class="chip hide" data-el="rtt3" style="left:846px;top:332px">HTTP/2</span>
+            <div class="term" data-el="t" style="left:20px;top:384px;width:920px;height:144px">
+              <div class="term-h">bash — curl -v https://example.com/</div>
+              <div class="term-b"></div>
+            </div>
+          </div>
+        </div>
+
+        <h3>curl -v の実測出力（全文・一部省略）</h3>
+        <pre data-lang="text" data-title="curl 8.5.0 / OpenSSL 3.0.13（Ubuntu 24.04, 2026-09 実測。IP のみ置換）">$ curl -v https://example.com/ -o /dev/null
+* Host example.com:443 was resolved.
+* IPv6: (none)
+* IPv4: 203.0.113.10
+*   Trying 203.0.113.10:443...
+* Connected to example.com (203.0.113.10) port 443
+* ALPN: curl offers h2,http/1.1
+* TLSv1.3 (OUT), TLS handshake, Client hello (1):
+*  CAfile: /etc/ssl/certs/ca-certificates.crt
+*  CApath: /etc/ssl/certs
+* TLSv1.3 (IN), TLS handshake, Server hello (2):
+* TLSv1.3 (IN), TLS handshake, Encrypted Extensions (8):
+* TLSv1.3 (IN), TLS handshake, Certificate (11):
+* TLSv1.3 (IN), TLS handshake, CERT verify (15):
+* TLSv1.3 (IN), TLS handshake, Finished (20):
+* TLSv1.3 (OUT), TLS change cipher, Change cipher spec (1):
+* TLSv1.3 (OUT), TLS handshake, Finished (20):
+* ⟪SSL connection using TLSv1.3 / TLS_AES_256_GCM_SHA384 / X25519 / id-ecPublicKey⟫
+* ⟪ALPN: server accepted h2⟫
+* Server certificate:
+*  subject: CN=example.com
+*  start date: Sep 26 22:49:11 2026 GMT
+*  expire date: Dec 25 22:56:35 2026 GMT
+*  subjectAltName: host "example.com" matched cert's "example.com"
+*  issuer: C=US; O=SSL Corporation; CN=Cloudflare TLS Issuing ECC CA 3
+*  SSL certificate verify ok.
+*   Certificate level 0: Public key type EC/prime256v1 (256/128 Bits/secBits), signed using ecdsa-with-SHA256
+*   Certificate level 1: Public key type EC/prime256v1 (256/128 Bits/secBits), signed using ecdsa-with-SHA384
+*   Certificate level 2: Public key type EC/secp384r1 (384/192 Bits/secBits), signed using ecdsa-with-SHA384
+*   Certificate level 3: Public key type EC/secp384r1 (384/192 Bits/secBits), signed using ecdsa-with-SHA384
+* using HTTP/2
+* [HTTP/2] [1] OPENED stream for https://example.com/
+> GET / HTTP/2
+> Host: example.com
+> User-Agent: curl/8.5.0
+> Accept: */*
+>
+* TLSv1.3 (IN), TLS handshake, Newsession Ticket (4):
+* TLSv1.3 (IN), TLS handshake, Newsession Ticket (4):
+< HTTP/2 200
+< content-type: text/html</pre>
+        <ul>
+          <li><code>SSL connection using</code> の 4 項目は「プロトコル / cipher suite / 鍵交換グループ / 署名鍵の種類」です（curl の <code>lib/vtls/openssl.c</code> が <code>SSL_get_version()</code> 等をそのまま出しています）。ECDSA 証明書なら <code>id-ecPublicKey</code>、RSA-PSS なら <code>RSASSA-PSS</code> と表示されます。</li>
+          <li>OpenSSL 3.5 以降と組み合わせた curl や最近のブラウザでは、鍵交換グループが <code>X25519MLKEM768</code>（耐量子ハイブリッド）になることがあります。同じサーバーに OpenSSL 3.5.7 の <code>s_client</code> で接続すると <code>Negotiated TLS1.3 group: X25519MLKEM768</code> と表示されました。</li>
+          <li>curl のバージョンで文言が変わります（ソースで確認）。7.81 は <code>ALPN, offering h2</code> / <code>ALPN, server accepted to use h2</code>、8.0 は <code>ALPN: offers h2,http/1.1</code>、8.4 以降は <code>ALPN: curl offers h2,http/1.1</code> / <code>ALPN: server accepted h2</code>。ホスト名不一致のエラーも 8.10 から <code>target host name</code> → <code>target hostname</code> に変わりました。curl 8.10 以降は <code>-vv</code> 〜 <code>-vvvv</code> で詳細度を上げられます。</li>
+        </ul>
+      </section>
+
+      <!-- 2. ClientHello -->
+      <section class="chapter" id="clienthello">
+        <h2>ClientHello の中身（平文）</h2>
+        <p>ClientHello はハンドシェイクの最初のメッセージで、<strong>完全に平文</strong>です。以下は OpenSSL 3.5.7 の <code>openssl s_client -connect example.com:443 -servername example.com -groups X25519:secp256r1 -alpn h2,http/1.1 -trace</code> で実測した 337 バイト（レコードヘッダ 5 + ハンドシェイク 332）を、拡張ごとに分解したものです。右下の 16 進ダンプは同じ値から組み立てた実バイト列で、オフセットはレコード先頭からの位置です。</p>
+
+        <div class="scene" id="sc-hello" data-title="ClientHello をバイト単位で読む">
+          <div class="stage" data-w="960" data-h="520">
+            <div class="label acc" style="left:20px;top:14px">ClientHello · 5 + 332 bytes</div>
+            <div class="fld" data-el="f-rec" style="left:20px;top:40px;width:340px"><b>record header</b><small>5 B</small></div>
+            <div class="fld" data-el="f-hs" style="left:20px;top:67px;width:340px"><b>handshake header</b><small>4 B</small></div>
+            <div class="fld" data-el="f-ver" style="left:20px;top:94px;width:340px"><b>legacy_version</b><small>2 B</small></div>
+            <div class="fld" data-el="f-rnd" style="left:20px;top:121px;width:340px"><b>random</b><small>32 B</small></div>
+            <div class="fld" data-el="f-sid" style="left:20px;top:148px;width:340px"><b>legacy_session_id</b><small>1+32 B</small></div>
+            <div class="fld" data-el="f-cs" style="left:20px;top:175px;width:340px"><b>cipher_suites</b><small>2+60 B</small></div>
+            <div class="fld" data-el="f-cm" style="left:20px;top:202px;width:340px"><b>legacy_compression_methods</b><small>1+1 B</small></div>
+            <div class="fld" data-el="f-ext" style="left:20px;top:229px;width:340px"><b>extensions（13 個）</b><small>2+195 B</small></div>
+            <div class="fld ext" data-el="e-sni" style="left:44px;top:256px;width:316px"><b>server_name (0)</b><small>4+16 B</small></div>
+            <div class="fld ext" data-el="e-grp" style="left:44px;top:283px;width:316px"><b>supported_groups (10)</b><small>4+6 B</small></div>
+            <div class="fld ext" data-el="e-alpn" style="left:44px;top:310px;width:316px"><b>ALPN (16)</b><small>4+14 B</small></div>
+            <div class="fld ext" data-el="e-sig" style="left:44px;top:337px;width:316px"><b>signature_algorithms (13)</b><small>4+54 B</small></div>
+            <div class="fld ext" data-el="e-ver" style="left:44px;top:364px;width:316px"><b>supported_versions (43)</b><small>4+5 B</small></div>
+            <div class="fld ext" data-el="e-psk" style="left:44px;top:391px;width:316px"><b>psk_key_exchange_modes (45)</b><small>4+2 B</small></div>
+            <div class="fld ext" data-el="e-ks" style="left:44px;top:418px;width:316px"><b>key_share (51)</b><small>4+38 B</small></div>
+            <div class="fld ext" data-el="e-oth" style="left:44px;top:445px;width:316px"><b>他 6 個 (65281,11,35,22,23,27)</b><small>32 B</small></div>
+            <div class="file hide" data-el="det" style="left:390px;top:14px;width:550px"></div>
+            <div class="bytes hexd hide" data-el="hex" style="left:390px;top:318px;width:550px"></div>
+            <span class="chip hide" data-el="obs" style="left:390px;top:462px"></span>
+          </div>
+        </div>
+
+        <h3>拡張の早見表（type 番号つき）</h3>
+        <div class="tbl">
+          <table class="ref">
+            <thead><tr><th>type</th><th>拡張名</th><th>中身（今回の実測値）</th><th>経路上から</th></tr></thead>
+            <tbody>
+              <tr><td><code>0</code></td><td><code>server_name</code>（SNI, RFC 6066）</td><td>host_name = <code>example.com</code>。サーバーは 1 つの IP で複数の証明書を出し分けるのに使う</td><td>見える</td></tr>
+              <tr><td><code>10</code></td><td><code>supported_groups</code></td><td><code>x25519</code>(0x001d), <code>secp256r1</code>(0x0017)。ブラウザや OpenSSL 3.5 既定では先頭が <code>X25519MLKEM768</code>(0x11ec)</td><td>見える</td></tr>
+              <tr><td><code>13</code></td><td><code>signature_algorithms</code></td><td>26 方式。<code>0x0403</code> ecdsa_secp256r1_sha256, <code>0x0804</code> rsa_pss_rsae_sha256, <code>0x0807</code> ed25519 など</td><td>見える</td></tr>
+              <tr><td><code>16</code></td><td><code>application_layer_protocol_negotiation</code>（RFC 7301）</td><td><code>h2</code>, <code>http/1.1</code>。サーバーの選択結果は EncryptedExtensions（暗号化）で返る</td><td>候補は見える</td></tr>
+              <tr><td><code>41</code></td><td><code>pre_shared_key</code></td><td>再開時のみ。identity（チケット）＋ binder。<strong>必ず最後の拡張</strong></td><td>見える</td></tr>
+              <tr><td><code>42</code></td><td><code>early_data</code></td><td>0-RTT データを送るときだけ付く（中身は空）</td><td>見える</td></tr>
+              <tr><td><code>43</code></td><td><code>supported_versions</code></td><td><code>0x0304</code>(TLS 1.3), <code>0x0303</code>(TLS 1.2)。<strong>本当のバージョン交渉はここ</strong></td><td>見える</td></tr>
+              <tr><td><code>45</code></td><td><code>psk_key_exchange_modes</code></td><td><code>psk_dhe_ke</code>(1)：再開時も ECDHE を併用する</td><td>見える</td></tr>
+              <tr><td><code>51</code></td><td><code>key_share</code></td><td>x25519 の公開鍵 32 バイト。X25519MLKEM768 なら 1216 バイト</td><td>見える（公開鍵なので問題ない）</td></tr>
+              <tr><td><code>0xfe0d</code></td><td><code>encrypted_client_hello</code>（ECH, RFC 9849）</td><td>内側の ClientHello（SNI・ALPN を含む）を HPKE で暗号化して格納</td><td>外側の ClientHello だけ見える</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>TLS 1.3 の cipher suite</h3>
+        <p>TLS 1.3 の cipher suite は「AEAD と HKDF のハッシュ」だけを決めます。鍵交換（<code>key_share</code>）と署名方式（<code>signature_algorithms</code>）は別々の拡張で交渉します。</p>
+        <div class="tbl">
+          <table class="ref">
+            <thead><tr><th>値</th><th>名前（IANA）</th><th>AEAD</th><th>ハッシュ</th><th>key / iv</th></tr></thead>
+            <tbody>
+              <tr><td><code>0x1301</code></td><td><code>TLS_AES_128_GCM_SHA256</code></td><td>AES-128-GCM</td><td>SHA-256</td><td>16 / 12 B</td></tr>
+              <tr><td><code>0x1302</code></td><td><code>TLS_AES_256_GCM_SHA384</code></td><td>AES-256-GCM</td><td>SHA-384</td><td>32 / 12 B</td></tr>
+              <tr><td><code>0x1303</code></td><td><code>TLS_CHACHA20_POLY1305_SHA256</code></td><td>ChaCha20-Poly1305</td><td>SHA-256</td><td>32 / 12 B</td></tr>
+              <tr><td><code>0x1304</code></td><td><code>TLS_AES_128_CCM_SHA256</code></td><td>AES-128-CCM</td><td>SHA-256</td><td>16 / 12 B</td></tr>
+              <tr><td><code>0x1305</code></td><td><code>TLS_AES_128_CCM_8_SHA256</code></td><td>AES-128-CCM (8 B tag)</td><td>SHA-256</td><td>16 / 12 B</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- 3. ServerHello 以降 -->
+      <section class="chapter" id="handshake">
+        <h2>ServerHello 以降：鍵スケジュールと暗号化の境界</h2>
+        <p>ServerHello が届いた瞬間、両者は相手の <code>key_share</code> と自分の秘密鍵から同じ ECDHE 共有秘密を計算できます。そこから HKDF（RFC 5869）で handshake traffic secret を導出し、<strong>次のメッセージからは暗号化</strong>されます。サーバーは EncryptedExtensions・Certificate・CertificateVerify・Finished を 1 回の送信にまとめて返します（実測では 3853 バイトの 1 レコード）。</p>
+
+        <div class="scene" id="sc-keys" data-title="ServerHello 以降：鍵スケジュールと暗号化の境界">
+          <div class="stage" data-w="960" data-h="520">
+            <div class="node sm hide" data-el="k1" style="left:20px;top:18px;width:190px">
+              <div class="node-h"><i data-icon="key"></i><b class="node-t">ECDHE 共有秘密</b></div>
+              <div class="node-s">X25519(priv, peer_pub)<br>両側で同じ 32 B<br><b data-el="k1v">--</b></div>
+            </div>
+            <div class="node sm hide" data-el="k2" style="left:250px;top:18px;width:200px">
+              <div class="node-h"><i data-icon="hash"></i><b class="node-t">Handshake Secret</b></div>
+              <div class="node-s">HKDF-Extract(<br>salt=derived,<br>IKM=ECDHE 共有秘密)</div>
+            </div>
+            <div class="node sm hide" data-el="k3" style="left:490px;top:18px;width:210px">
+              <div class="node-h"><i data-icon="key"></i><b class="node-t">hs traffic secret</b></div>
+              <div class="node-s">"c hs traffic"<br>"s hs traffic"<br>Hash(CH‥SH) · 48 B</div>
+            </div>
+            <div class="node sm hide" data-el="k4" style="left:740px;top:18px;width:200px">
+              <div class="node-h"><i data-icon="lock"></i><b class="node-t">handshake keys</b></div>
+              <div class="node-s">key "key" → 32 B<br>iv  "iv"  → 12 B<br>AES-256-GCM</div>
+            </div>
+            <div class="node sm hide" data-el="k5" style="left:250px;top:128px;width:200px">
+              <div class="node-h"><i data-icon="hash"></i><b class="node-t">Master Secret</b></div>
+              <div class="node-s">HKDF-Extract(<br>salt=derived,<br>IKM=0)</div>
+            </div>
+            <div class="node sm hide" data-el="k6" style="left:490px;top:128px;width:210px">
+              <div class="node-h"><i data-icon="key"></i><b class="node-t">ap traffic secret</b></div>
+              <div class="node-s">"c ap traffic"<br>"s ap traffic"<br>Hash(CH‥server Fin)</div>
+            </div>
+            <div class="node sm hide" data-el="k7" style="left:740px;top:128px;width:200px">
+              <div class="node-h"><i data-icon="key"></i><b class="node-t">exp / res master</b></div>
+              <div class="node-s">"exp master"<br>"res master"<br>→ 再開用 PSK へ</div>
+            </div>
+
+            <div class="node" data-el="cli" style="left:20px;top:236px;width:175px">
+              <div class="node-h"><i data-icon="terminal"></i><b class="node-t">client</b></div>
+              <div class="node-s">curl · 198.51.100.7</div>
+            </div>
+            <div class="node" data-el="srv" style="left:765px;top:236px;width:175px">
+              <div class="node-h"><i data-icon="server"></i><b class="node-t">server</b></div>
+              <div class="node-s">203.0.113.10:443</div>
+            </div>
+            <span class="chip c-green hide" data-el="hkc" style="left:20px;top:312px"><i data-icon="key"></i>handshake keys</span>
+            <span class="chip c-green hide" data-el="hks" style="left:805px;top:312px"><i data-icon="key"></i>handshake keys</span>
+            <span class="chip c-green hide" data-el="aks" style="left:792px;top:344px"><i data-icon="key"></i>application keys</span>
+            <span class="chip c-pink hide" data-el="pk" style="left:822px;top:376px"><i data-icon="key"></i>privkey.pem</span>
+            <div class="file hide" data-el="msg" style="left:215px;top:232px;width:530px"></div>
+
+            <div class="label" style="left:20px;top:438px">wire（TCP ペイロード）</div>
+            <div class="rec pl hide" data-el="r-sh" style="left:20px;top:462px"><b>16 03 03 00 7a</b>ServerHello</div>
+            <div class="rec cc hide" data-el="r-ccs" style="left:236px;top:462px"><b>14 03 03 00 01</b>CCS</div>
+            <div class="vline hide" data-el="bound" style="left:388px;top:434px;height:66px"></div>
+            <div class="label c-green hide" data-el="boundl" style="left:398px;top:438px;color:var(--green)">ここから暗号化</div>
+            <div class="rec en hide" data-el="r-enc" style="left:400px;top:462px"><b>17 03 03 0f 0d</b>{EE}{Certificate}{CertificateVerify}{Finished} 3853 B</div>
+          </div>
+        </div>
+
+        <h3>鍵スケジュール（RFC 8446 §7.1 の要約）</h3>
+        <pre data-lang="text" data-title="key schedule (PSK なしのフルハンドシェイク)">0 (PSK なし) ──HKDF-Extract(salt=0)──────────────▶ Early Secret
+                                                   │ Derive-Secret(., "derived", "")
+(EC)DHE 共有秘密 ──HKDF-Extract(salt=↑)──────────▶ ⟪Handshake Secret⟫
+                                                   ├─ Derive-Secret(., "c hs traffic", ClientHello…ServerHello)
+                                                   ├─ Derive-Secret(., "s hs traffic", ClientHello…ServerHello)
+                                                   │ Derive-Secret(., "derived", "")
+0 ──────────────── HKDF-Extract(salt=↑)──────────▶ ⟪Master Secret⟫
+                                                   ├─ "c ap traffic" / "s ap traffic"  (ClientHello…server Finished)
+                                                   ├─ "exp master"                      (ClientHello…server Finished)
+                                                   └─ "res master"                      (ClientHello…client Finished)
+
+HKDF-Expand-Label(Secret, Label, Context, Length)   … HkdfLabel の label は "tls13 " + Label
+Derive-Secret(Secret, Label, Messages) = HKDF-Expand-Label(Secret, Label, Transcript-Hash(Messages), Hash.length)
+[sender]_write_key = HKDF-Expand-Label(Secret, "key", "", key_length)
+[sender]_write_iv  = HKDF-Expand-Label(Secret, "iv",  "", iv_length)</pre>
+
+        <h3>ハンドシェイクメッセージと保護</h3>
+        <div class="tbl">
+          <table class="ref">
+            <thead><tr><th>HandshakeType</th><th>メッセージ</th><th>送信者</th><th>保護（どの鍵で暗号化されるか）</th></tr></thead>
+            <tbody>
+              <tr><td><code>1</code></td><td>ClientHello</td><td>C</td><td>平文</td></tr>
+              <tr><td><code>2</code></td><td>ServerHello（HelloRetryRequest も同じ型）</td><td>S</td><td>平文</td></tr>
+              <tr><td><code>8</code></td><td>EncryptedExtensions</td><td>S</td><td>server handshake traffic key</td></tr>
+              <tr><td><code>13</code></td><td>CertificateRequest（相互 TLS のときだけ）</td><td>S</td><td>server handshake traffic key</td></tr>
+              <tr><td><code>11</code></td><td>Certificate</td><td>S（mTLS なら C も）</td><td>handshake traffic key</td></tr>
+              <tr><td><code>15</code></td><td>CertificateVerify</td><td>S（mTLS なら C も）</td><td>handshake traffic key</td></tr>
+              <tr><td><code>20</code></td><td>Finished</td><td>S, C</td><td>handshake traffic key</td></tr>
+              <tr><td><code>4</code></td><td>NewSessionTicket</td><td>S</td><td>server application traffic key</td></tr>
+              <tr><td><code>5</code></td><td>EndOfEarlyData</td><td>C</td><td>client early traffic key（0-RTT 時）</td></tr>
+              <tr><td><code>24</code></td><td>KeyUpdate</td><td>S, C</td><td>application traffic key</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="note">途中で出てくる <code>ChangeCipherSpec</code>（content type <code>20</code>、中身 <code>0x01</code> の 1 バイト）は TLS 1.3 では意味を持たない<strong>ミドルボックス互換モード</strong>用のダミーです（RFC 8446 Appendix D.4）。ClientHello の <code>legacy_session_id</code> に 32 バイトの値を入れるのも同じ目的です。</div>
+      </section>
+
+      <!-- 4. クライアント側の検証 -->
+      <section class="chapter" id="verify">
+        <h2>クライアント側の検証：どこで何を確かめるか</h2>
+        <p>サーバーの暗号化フライトを受け取ったクライアント（ここでは curl が使う OpenSSL）は、次の順に検証します。1 つでも失敗すればその場で alert を送って切断し、HTTP リクエストは 1 バイトも出ていきません。</p>
+
+        <div class="scene" id="sc-verify" data-title="証明書チェーン → ホスト名 → CertificateVerify → Finished">
+          <div class="stage" data-w="960" data-h="500">
+            <div class="node sm hide" data-el="c0" style="left:20px;top:20px;width:310px">
+              <div class="node-h"><i data-icon="cert"></i><b class="node-t">[0] CN=example.com</b></div>
+              <div class="node-s" data-el="c0s">issuer: Cloudflare TLS Issuing ECC CA 3<br>EC P-256 · ecdsa-with-SHA256</div>
+            </div>
+            <div class="node sm hide" data-el="c1" style="left:20px;top:110px;width:310px">
+              <div class="node-h"><i data-icon="cert"></i><b class="node-t">[1] Cloudflare TLS Issuing ECC CA 3</b></div>
+              <div class="node-s">issuer: SSL.com TLS Transit ECC CA R2<br>EC P-256 · ecdsa-with-SHA384</div>
+            </div>
+            <div class="node sm hide" data-el="c2" style="left:20px;top:200px;width:310px">
+              <div class="node-h"><i data-icon="cert"></i><b class="node-t">[2] SSL.com TLS Transit ECC CA R2</b></div>
+              <div class="node-s">issuer: SSL.com TLS ECC Root CA 2022<br>EC P-384 · ecdsa-with-SHA384</div>
+            </div>
+            <div class="zone c-green hide" data-el="tsz" data-label="trust store" style="left:12px;top:292px;width:326px;height:90px"></div>
+            <div class="node sm hide" data-el="root" style="left:20px;top:304px;width:310px">
+              <div class="node-h"><i data-icon="shieldok"></i><b class="node-t">SSL.com TLS ECC Root CA 2022</b></div>
+              <div class="node-s">/etc/ssl/certs/865fbdf9.0<br>自己署名 · EC P-384</div>
+            </div>
+            <div class="node sm hide" data-el="c3" style="left:660px;top:20px;width:280px">
+              <div class="node-h"><i data-icon="cert"></i><b class="node-t">[3] SSL.com TLS ECC Root CA 2022</b></div>
+              <div class="node-s">issuer: AAA Certificate Services<br>クロス署名版（今回は使われない）</div>
+            </div>
+
+            <div class="node sm" data-el="q1" style="left:350px;top:20px;width:300px"><div class="node-h"><i data-icon="link"></i><b class="node-t">① チェーン構築 → trust store</b></div></div>
+            <div class="node sm" data-el="q2" style="left:350px;top:58px;width:300px"><div class="node-h"><i data-icon="sign"></i><b class="node-t">② 各証明書の署名を検証</b></div></div>
+            <div class="node sm" data-el="q3" style="left:350px;top:96px;width:300px"><div class="node-h"><i data-icon="clock"></i><b class="node-t">③ 有効期間</b></div></div>
+            <div class="node sm" data-el="q4" style="left:350px;top:134px;width:300px"><div class="node-h"><i data-icon="globe"></i><b class="node-t">④ ホスト名 ↔ subjectAltName</b></div></div>
+            <div class="node sm" data-el="q5" style="left:350px;top:172px;width:300px"><div class="node-h"><i data-icon="shieldok"></i><b class="node-t">⑤ CertificateVerify の署名</b></div></div>
+            <div class="node sm" data-el="q6" style="left:350px;top:210px;width:300px"><div class="node-h"><i data-icon="hash"></i><b class="node-t">⑥ server Finished の HMAC</b></div></div>
+
+            <div class="file" data-el="ts" style="left:660px;top:104px;width:280px">
+              <div class="file-h">/etc/ssl/certs/ca-certificates.crt</div>
+              <pre data-lang="pem">-----BEGIN CERTIFICATE-----
+MIIH0zCCBbugAwIBAgIIXsO3pkN/…
+-----END CERTIFICATE-----
+…（PEM 121 個を連結）</pre>
+            </div>
+
+            <div class="file hide" data-el="cvf" style="left:350px;top:262px;width:590px"></div>
+            <div class="seg hide" data-el="rseg" style="left:20px;top:430px;width:920px">
+              <span class="c-amber" style="flex:none;width:200px"><small>header = AAD (5 B)</small>17 03 03 LL LL</span>
+              <span class="c-green" style="flex:1"><small>AEAD(key, iv ⊕ seq, AAD, TLSInnerPlaintext)</small>HTTP/2 HEADERS [GET /] ‖ 0x17 ‖ padding</span>
+              <span class="c-violet" style="flex:none;width:170px"><small>tag</small>16 B</span>
+            </div>
+          </div>
+        </div>
+
+        <h3>どこで何を検証し、失敗するとどうなるか</h3>
+        <div class="tbl">
+          <table class="ref">
+            <thead><tr><th>検証</th><th>何と何を比べるか</th><th>失敗時（curl）</th><th>OpenSSL verify / TLS alert</th></tr></thead>
+            <tbody>
+              <tr><td>チェーン構築</td><td>issuer → subject をたどり、trust store（<code>/etc/ssl/certs/ca-certificates.crt</code> 等）の自己署名ルートに届くか</td><td><code>(60) SSL certificate problem: unable to get local issuer certificate</code></td><td><code>20</code> / <code>unknown_ca(48)</code></td></tr>
+              <tr><td>自己署名</td><td>leaf 自身が issuer で、trust store に無い</td><td><code>(60) SSL certificate problem: self-signed certificate</code></td><td><code>18</code> / <code>unknown_ca(48)</code></td></tr>
+              <tr><td>各署名</td><td>子の <code>signatureValue</code> を親の公開鍵で検証</td><td><code>(60) SSL certificate problem: certificate signature failure</code></td><td><code>7</code> / <code>decrypt_error(51)</code></td></tr>
+              <tr><td>有効期間</td><td><code>notBefore ≤ 現在時刻 ≤ notAfter</code>（ローカル時計）</td><td><code>(60) SSL certificate problem: certificate has expired</code></td><td><code>10</code> / <code>certificate_expired(45)</code></td></tr>
+              <tr><td>ホスト名</td><td>URL のホスト名 ↔ <code>subjectAltName</code> の <code>DNS:</code>（CN は見ない）</td><td><code>(60) SSL: no alternative certificate subject name matches target host name '…'</code></td><td><code>62</code>（<code>s_client -verify_hostname</code>）/ curl は handshake 後に判定し <code>close_notify</code></td></tr>
+              <tr><td>CertificateVerify</td><td>leaf の公開鍵で、トランスクリプトハッシュへの署名を検証</td><td>接続エラー（TLS 層）</td><td><code>decrypt_error(51)</code>（RFC 8446 §4.4.3）</td></tr>
+              <tr><td>Finished</td><td>自分で計算した HMAC と受信した <code>verify_data</code></td><td>接続エラー（TLS 層）</td><td><code>decrypt_error(51)</code>（RFC 8446 §4.4.4）</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>証明書の中身（<code>subjectAltName</code>・<code>keyUsage</code>・DER/PEM）は <a href="../x509/">X.509 証明書</a>、チェーンと CA 側の署名は <a href="../ca-pki/">CA と証明書チェーン</a> のページで詳しく扱います。</p>
+
+        <h3>レコード層：暗号化されたレコードの形</h3>
+        <pre data-lang="text" data-title="TLSCiphertext（RFC 8446 §5.2）">opaque_type            = 23 (application_data)   ← 中身が handshake でも alert でも外側は常に 23
+legacy_record_version  = 0x0303
+length                 = len(encrypted_record)    ← 2 バイト
+encrypted_record       = AEAD-Encrypt(write_key, nonce, additional_data, TLSInnerPlaintext)
+
+TLSInnerPlaintext      = content ‖ ContentType(1 B: 22 handshake / 23 application_data / 21 alert) ‖ 00 00 …(padding)
+additional_data        = opaque_type ‖ legacy_record_version ‖ length   ← 5 バイトのレコードヘッダそのもの
+nonce                  = write_iv XOR (64 bit sequence number を左ゼロ詰めで 12 B に)
+
+例: client Finished = 17 03 03 00 45 … (69 B = Finished 52 B + type 1 B + tag 16 B)</pre>
+      </section>
+
+      <!-- 5. セッション再開 -->
+      <section class="chapter" id="resume">
+        <h2>セッション再開（PSK）と 0-RTT</h2>
+        <p>ハンドシェイク完了後、サーバーは <code>NewSessionTicket</code> を（application key で暗号化して）送ります。次回の接続でクライアントがそのチケットを <code>pre_shared_key</code> 拡張に入れると、サーバーは Certificate と CertificateVerify を省略できます。さらにチケットが <code>early_data</code> を許可していれば、ClientHello と同時にリクエストを送る <strong>0-RTT</strong> も可能ですが、リプレイに弱いという代償があります。</p>
+
+        <div class="scene" id="sc-resume" data-title="NewSessionTicket → PSK 再開 → 0-RTT とリプレイ">
+          <div class="stage" data-w="960" data-h="500">
+            <div class="node" data-el="cli" style="left:20px;top:16px;width:200px">
+              <div class="node-h"><i data-icon="terminal"></i><b class="node-t">client</b></div>
+              <div class="node-s">openssl s_client</div>
+            </div>
+            <div class="node" data-el="srv" style="left:740px;top:16px;width:200px">
+              <div class="node-h"><i data-icon="server"></i><b class="node-t">example.com:443</b></div>
+              <div class="node-s">203.0.113.10</div>
+            </div>
+            <div class="ll" style="left:119px;top:84px;height:392px"></div>
+            <div class="ll" style="left:839px;top:84px;height:392px"></div>
+            <div class="label" style="left:140px;top:96px">接続 #1（フルハンドシェイクの後）</div>
+            <div class="file hide" data-el="tk" style="left:170px;top:146px;width:620px"></div>
+            <span class="chip c-green hide" data-el="pskc" style="left:12px;top:208px"><i data-icon="key"></i>PSK 保存</span>
+            <div class="label" style="left:140px;top:266px">接続 #2（再開）</div>
+            <div class="node sm c-red hide" data-el="atk" style="left:380px;top:420px;width:200px">
+              <div class="node-h"><i data-icon="attacker"></i><b class="node-t">attacker</b></div>
+              <div class="node-s">録画した 0-RTT を再送</div>
+            </div>
+            <span class="chip c-red hide" data-el="tooearly" style="left:846px;top:440px">425 Too Early</span>
+          </div>
+        </div>
+
+        <div class="note warn"><b>0-RTT はリプレイされうる：</b>early data は前回の PSK だけで暗号化され、サーバーのその回の乱数に依存しません。経路上の攻撃者が ClientHello＋early data を録画して再送すると、サーバーは同じリクエストをもう一度処理しかねません（RFC 8446 §8）。<code>POST</code> など冪等でない操作には使わず、nginx なら <code>ssl_early_data on;</code> と <code>proxy_set_header Early-Data $ssl_early_data;</code> を組み合わせ、アプリ側で <code>425 Too Early</code>（RFC 8470）を返せるようにします。</div>
+      </section>
+
+      <!-- 6. 失敗・攻撃 -->
+      <section class="chapter" id="attack">
+        <h2>失敗・攻撃ケース：MITM はどこで止まるか</h2>
+        <p>公衆 Wi-Fi の偽アクセスポイントなど、攻撃者が経路の途中にいる場合を考えます。攻撃者は TCP を横取りでき、ECDHE も自分と成立させられます（<strong>鍵交換だけでは相手が誰かは分からない</strong>）。それでも接続が止まるのは、証明書チェーン・ホスト名・CertificateVerify の 3 つの検証があるからです。端末出力は curl 8.5.0 / OpenSSL 3.0.13 の実測です。自己署名（A）は手元の <code>openssl s_server -tls1_3</code> でそのまま再現、ホスト名不一致（C）と <code>-k</code> は badssl.com（TLS 1.2 で応答する）で再現したため、ホスト名とプロトコル表記だけ置き換えています。B（秘密鍵なしの CertificateVerify）は手元で再現できないため、RFC 8446 が定める動作を示します。</p>
+
+        <div class="scene" id="sc-mitm" data-title="中間者（MITM）はどこで止まるか">
+          <div class="stage" data-w="960" data-h="470">
+            <div class="node" data-el="cli" style="left:20px;top:24px;width:200px">
+              <div class="node-h"><i data-icon="laptop"></i><b class="node-t">curl</b></div>
+              <div class="node-s">192.0.2.23 · 公衆 Wi-Fi</div>
+            </div>
+            <div class="node c-red hide" data-el="atk" style="left:380px;top:24px;width:200px">
+              <div class="node-h"><i data-icon="attacker"></i><b class="node-t">attacker</b></div>
+              <div class="node-s">192.0.2.66 · 偽 gateway</div>
+            </div>
+            <div class="node" data-el="srv" style="left:740px;top:24px;width:200px">
+              <div class="node-h"><i data-icon="server"></i><b class="node-t">example.com</b></div>
+              <div class="node-s">203.0.113.10:443</div>
+            </div>
+
+            <div class="node sm" data-el="q1" style="left:20px;top:116px;width:290px"><div class="node-h"><i data-icon="link"></i><b class="node-t">チェーン → trust store</b></div></div>
+            <div class="node sm" data-el="q2" style="left:20px;top:154px;width:290px"><div class="node-h"><i data-icon="globe"></i><b class="node-t">ホスト名 ↔ SAN</b></div></div>
+            <div class="node sm" data-el="q3" style="left:20px;top:192px;width:290px"><div class="node-h"><i data-icon="shieldok"></i><b class="node-t">CertificateVerify の署名</b></div></div>
+
+            <div class="node sm c-red hide" data-el="mA" style="left:330px;top:116px;width:300px">
+              <div class="node-h"><i data-icon="cert"></i><b class="node-t">A：自己署名の偽証明書</b></div>
+              <div class="node-s">subject: CN=example.com<br>issuer : CN=example.com（自分）</div>
+            </div>
+            <div class="node sm c-amber hide" data-el="mB" style="left:330px;top:116px;width:300px">
+              <div class="node-h"><i data-icon="cert"></i><b class="node-t">B：本物のチェーンを複製</b></div>
+              <div class="node-s">CN=example.com ← Cloudflare …<br>privkey.pem は持っていない</div>
+            </div>
+            <div class="node sm c-amber hide" data-el="mC" style="left:330px;top:116px;width:300px">
+              <div class="node-h"><i data-icon="cert"></i><b class="node-t">C：攻撃者ドメインの正規証明書</b></div>
+              <div class="node-s">SAN: DNS:attacker.example.net<br>issuer: 公開 CA（正規に発行）</div>
+            </div>
+            <span class="chip c-amber hide" data-el="ecdh" style="left:330px;top:206px"><i data-icon="key"></i>ECDHE は attacker と成立</span>
+            <span class="chip c-amber hide" data-el="sni" style="left:650px;top:116px"><i data-icon="eye"></i>SNI = example.com を平文で読める</span>
+            <div class="file c-red hide" data-el="leak" style="left:650px;top:150px;width:290px">
+              <div class="file-h">attacker が復号した平文</div>
+              <pre data-lang="http">GET /account HTTP/2
+authorization: Bearer eyJhbGciOi…
+cookie: sid=9f2c…</pre>
+            </div>
+            <div class="term" data-el="t" style="left:20px;top:256px;width:920px;height:196px">
+              <div class="term-h">bash — curl -v</div>
+              <div class="term-b"></div>
+            </div>
+          </div>
+        </div>
+
+        <h3>エラーメッセージ早見表</h3>
+        <div class="tbl">
+          <table class="ref">
+            <thead><tr><th>状況</th><th>curl（OpenSSL バックエンド）</th><th>openssl s_client</th><th>送られる alert</th></tr></thead>
+            <tbody>
+              <tr><td>自己署名（MITM A）</td><td><code>curl: (60) SSL certificate problem: self-signed certificate</code></td><td><code>verify error:num=18:self-signed certificate</code></td><td><code>unknown_ca(48)</code>（curl 表示 <code>unknown CA (560)</code>）</td></tr>
+              <tr><td>自前ルート配下（社内 CA 等）</td><td><code>…: self-signed certificate in certificate chain</code></td><td><code>num=19</code></td><td><code>unknown_ca(48)</code></td></tr>
+              <tr><td>中間証明書が送られてこない</td><td><code>…: unable to get local issuer certificate</code></td><td><code>num=20</code> → <code>Verify return code: 21 (unable to verify the first certificate)</code></td><td><code>unknown_ca(48)</code></td></tr>
+              <tr><td>期限切れ</td><td><code>…: certificate has expired</code></td><td><code>num=10:certificate has expired</code></td><td><code>certificate_expired(45)</code>（curl 表示 <code>(557)</code>）</td></tr>
+              <tr><td>ホスト名不一致（MITM C）</td><td><code>curl: (60) SSL: no alternative certificate subject name matches target host name 'example.com'</code>（8.10 以降は <code>target hostname</code>）</td><td><code>-verify_hostname</code> 指定時 <code>num=62:hostname mismatch</code></td><td>curl: <code>close_notify</code>（handshake 完了後に判定）/ s_client: <code>bad_certificate(42)</code></td></tr>
+              <tr><td>秘密鍵を持たない（MITM B）</td><td colspan="2">CertificateVerify の署名検証に失敗し TLS 層のエラーで終了</td><td><code>decrypt_error(51)</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>curl が表示する alert 番号（<code>560</code> など）は「level × 256 + description」です。<code>560 = 2(fatal) × 256 + 48(unknown_ca)</code>、<code>557 = 2 × 256 + 45</code>、<code>256 = 1(warning) × 256 + 0(close_notify)</code>。</p>
+        <div class="note bad"><b><code>-k</code> / <code>--insecure</code> は「暗号化はするが、相手が誰かは確かめない」モードです。</b>証明書チェーン・期限・ホスト名の検証をすべてスキップするので、上の MITM A〜C はすべて素通りします（curl 8.5.0 の実測では <code>SSL certificate verify result: self-signed certificate (18), continuing anyway.</code> と 1 行出るだけ）。その結果、<code>Authorization</code> ヘッダや Cookie は攻撃者に復号されます。検証用の自己署名証明書を使うときは <code>-k</code> ではなく <code>--cacert mitm.crt</code> のように<strong>その証明書だけを信頼</strong>してください。</div>
+      </section>
+
+      <!-- 7. サーバー設定 -->
+      <section class="chapter" id="server">
+        <h2>サーバー側の実物設定（nginx）とよくある設定ミス</h2>
+        <p>サーバー側で TLS に関わる実物は、証明書チェーンのファイル（<code>fullchain.pem</code>）と秘密鍵（<code>privkey.pem</code>）、そして nginx の数行の設定です。Let's Encrypt（certbot）で取得した場合は <code>/etc/letsencrypt/live/&lt;ドメイン&gt;/</code> にシンボリックリンクが置かれます。</p>
+
+        <div class="scene" id="sc-server" data-title="nginx の設定と、よくある 3 つの設定ミス">
+          <div class="stage" data-w="960" data-h="520">
+            <div class="file hide" data-el="conf" style="left:20px;top:16px;width:590px"></div>
+            <div class="file hide" data-el="tree" style="left:630px;top:16px;width:310px">
+              <div class="file-h">/etc/letsencrypt/live/example.com/</div>
+              <pre data-lang="text">cert.pem       leaf のみ
+chain.pem      中間 CA のみ
+fullchain.pem  leaf + 中間
+privkey.pem    秘密鍵 (0600)</pre>
+            </div>
+            <div class="node sm hide" data-el="chainv" style="left:630px;top:140px;width:310px">
+              <div class="node-h"><i data-icon="cert"></i><b class="node-t" data-el="chaint">fullchain.pem → Certificate</b></div>
+              <div class="node-s" data-el="chains">leaf + 中間 CA をこの順で送る<br>ルート CA は送らなくてよい</div>
+            </div>
+            <div class="node sm hide" data-el="keyv" style="left:630px;top:226px;width:310px">
+              <div class="node-h"><i data-icon="key"></i><b class="node-t">privkey.pem → 署名専用</b></div>
+              <div class="node-s">CertificateVerify の署名に使う<br>ネットワークには一切出ない</div>
+            </div>
+            <div class="term" data-el="t" style="left:20px;top:334px;width:920px;height:172px">
+              <div class="term-h">bash — server (root)</div>
+              <div class="term-b"></div>
+            </div>
+          </div>
+        </div>
+
+        <h3>設定例（全文）</h3>
+        <pre data-lang="text" data-title="/etc/nginx/conf.d/example.com.conf">server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    http2 on;                                  # nginx 1.25.1 以降の書き方
+    server_name example.com;
+
+    ssl_certificate     /etc/letsencrypt/live/example.com/fullchain.pem;   # leaf → 中間の順
+    ssl_certificate_key /etc/letsencrypt/live/example.com/privkey.pem;
+
+    ssl_protocols TLSv1.2 TLSv1.3;             # nginx 1.23.4 以降はこれが既定値
+    ssl_ecdh_curve X25519:prime256v1:secp384r1;
+    # TLS 1.3 の cipher suite は ssl_ciphers では変わらない（OpenSSL の仕様）
+    ssl_conf_command Ciphersuites TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:TLS_AES_128_GCM_SHA256;
+
+    ssl_session_cache   shared:SSL:10m;
+    ssl_session_timeout 1d;
+    ssl_early_data      off;                   # 0-RTT。on にするなら Early-Data ヘッダで後段に伝える
+
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_set_header Early-Data $ssl_early_data;
+    }
+}</pre>
+        <ul>
+          <li><code>ssl_certificate</code> には<strong>サーバー証明書 → 中間証明書</strong>の順に連結したファイルを指定します（nginx 公式ドキュメント）。<code>cert.pem</code> を指定すると中間が欠け、curl や Java など AIA で補完しないクライアントだけが失敗します。</li>
+          <li><code>ssl_conf_command</code> は nginx 1.19.4 以降。<code>ssl_ciphers</code> は TLS 1.2 以下の cipher にだけ効きます（OpenSSL の <code>SSL_CTX_set_cipher_list()</code> は TLS 1.3 に影響しない）。</li>
+          <li>変数 <code>$ssl_protocol</code>・<code>$ssl_cipher</code>・<code>$ssl_curve</code>（1.21.5+）・<code>$ssl_early_data</code> をアクセスログに入れると、実際に何が交渉されたかを記録できます。</li>
+        </ul>
+      </section>
+
+      <!-- 8. SSLKEYLOGFILE -->
+      <section class="chapter" id="keylog">
+        <h2>SSLKEYLOGFILE で Wireshark 復号</h2>
+        <p>TLS 1.3 では ServerHello 以降がすべて暗号化されるため、パケットキャプチャだけでは証明書すら見えません。デバッグ時は、クライアントに<strong>トラフィックシークレットをファイルへ書き出させ</strong>、Wireshark に読ませて復号します。書式は RFC 9850（The SSLKEYLOGFILE Format for TLS）で標準化されています。</p>
+
+        <div class="scene" id="sc-keylog" data-title="鍵ログを書き出して Wireshark で復号する">
+          <div class="stage" data-w="960" data-h="480">
+            <div class="node" data-el="cli" style="left:20px;top:20px;width:220px">
+              <div class="node-h"><i data-icon="terminal"></i><b class="node-t">curl 8.5.0</b></div>
+              <div class="node-s">SSLKEYLOGFILE=~/tls-keys.log</div>
+            </div>
+            <div class="node" data-el="srv" style="left:720px;top:20px;width:220px">
+              <div class="node-h"><i data-icon="server"></i><b class="node-t">example.com:443</b></div>
+              <div class="node-s">203.0.113.10</div>
+            </div>
+            <div class="node sm hide" data-el="cap" style="left:370px;top:92px;width:220px">
+              <div class="node-h"><i data-icon="eye"></i><b class="node-t">tcpdump</b></div>
+              <div class="node-s">-w tls.pcapng · <b data-el="npk">0</b> pkts</div>
+            </div>
+            <div class="file hide" data-el="kl" style="left:20px;top:160px;width:600px">
+              <div class="file-h">~/tls-keys.log（1 接続ぶん 5 行）</div>
+              <pre data-lang="text" data-el="klp">SERVER_HANDSHAKE_TRAFFIC_SECRET 520ea890a1f66028… e79365cc879d2320…
+EXPORTER_SECRET 520ea890a1f66028… 124dcef5bb41a733…
+SERVER_TRAFFIC_SECRET_0 520ea890a1f66028… c3aa8448a31b3d93…
+CLIENT_HANDSHAKE_TRAFFIC_SECRET 520ea890a1f66028… eb81953403e2607a…
+CLIENT_TRAFFIC_SECRET_0 520ea890a1f66028… 35d962a656e7bdc2…</pre>
+            </div>
+            <dl class="kv hide" data-el="cols" style="left:640px;top:170px;width:300px">
+              <dt>1 列目</dt><dd>ラベル（どの secret か）</dd>
+              <dt>2 列目</dt><dd class="acc">ClientHello.random 32 B = 64 hex</dd>
+              <dt>3 列目</dt><dd>secret（SHA-384 → 48 B = 96 hex）</dd>
+            </dl>
+            <div class="node sm c-red hide" data-el="danger" style="left:640px;top:228px;width:300px">
+              <div class="node-h"><i data-icon="warn"></i><b class="node-t">このファイル = 全通信の鍵</b></div>
+              <div class="node-s">本番・共有端末で設定しない<br>使い終わったら削除</div>
+            </div>
+            <div class="file hide" data-el="ws" style="left:20px;top:314px;width:920px"></div>
+          </div>
+        </div>
+
+        <h3>鍵ログのラベル</h3>
+        <div class="tbl">
+          <table class="ref">
+            <thead><tr><th>ラベル</th><th>RFC 8446 の名前</th><th>復号できるもの</th></tr></thead>
+            <tbody>
+              <tr><td><code>CLIENT_HANDSHAKE_TRAFFIC_SECRET</code></td><td>client_handshake_traffic_secret</td><td>client の {Certificate}{CertificateVerify}{Finished}</td></tr>
+              <tr><td><code>SERVER_HANDSHAKE_TRAFFIC_SECRET</code></td><td>server_handshake_traffic_secret</td><td>server の {EncryptedExtensions}〜{Finished}</td></tr>
+              <tr><td><code>CLIENT_TRAFFIC_SECRET_0</code></td><td>client_application_traffic_secret_0</td><td>client → server の HTTP</td></tr>
+              <tr><td><code>SERVER_TRAFFIC_SECRET_0</code></td><td>server_application_traffic_secret_0</td><td>server → client の HTTP、NewSessionTicket</td></tr>
+              <tr><td><code>EXPORTER_SECRET</code></td><td>exporter_master_secret</td><td>（復号には使わない。鍵エクスポート用）</td></tr>
+              <tr><td><code>CLIENT_EARLY_TRAFFIC_SECRET</code></td><td>client_early_traffic_secret</td><td>0-RTT の early data</td></tr>
+              <tr><td><code>CLIENT_RANDOM</code></td><td>（TLS 1.2 の master_secret）</td><td>TLS 1.2 の通信全体</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- 9. TLS 1.2 との違い -->
+      <section class="chapter" id="vs12">
+        <h2>TLS 1.2 との違い</h2>
+        <div class="tbl">
+          <table class="ref">
+            <thead><tr><th>項目</th><th>TLS 1.2（RFC 5246）</th><th>TLS 1.3（RFC 8446）</th></tr></thead>
+            <tbody>
+              <tr><td>フルハンドシェイク</td><td>2-RTT</td><td>1-RTT（再開時は 0-RTT も可）</td></tr>
+              <tr><td>鍵交換</td><td>RSA 鍵輸送 または (EC)DHE（ServerKeyExchange）</td><td>(EC)DHE / PSK のみ。RSA 鍵輸送は廃止 → 常に前方秘匿性</td></tr>
+              <tr><td>暗号化の開始</td><td>ChangeCipherSpec の後。<strong>証明書は平文</strong></td><td>ServerHello の直後。<strong>証明書も暗号化</strong></td></tr>
+              <tr><td>cipher suite</td><td>鍵交換＋認証＋暗号＋MAC を 1 つで指定（例 <code>0xc02f</code> TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256）</td><td>AEAD＋ハッシュのみ（<code>0x1301</code>〜<code>0x1305</code>）</td></tr>
+              <tr><td>暗号方式</td><td>CBC＋HMAC、AEAD など</td><td>AEAD のみ（GCM / ChaCha20-Poly1305 / CCM）</td></tr>
+              <tr><td>サーバー認証の署名対象</td><td>ServerKeyExchange（DH パラメータ＋両 random）</td><td>ハンドシェイク全体のトランスクリプトハッシュ（CertificateVerify）</td></tr>
+              <tr><td>バージョン交渉</td><td><code>ClientHello.client_version</code></td><td><code>supported_versions</code> 拡張。<code>legacy_version</code> は常に <code>0x0303</code></td></tr>
+              <tr><td>ダウングレード検出</td><td>—</td><td>1.3 対応サーバーが 1.2 で応答するとき ServerHello.random の末尾 8 バイトを <code>44 4F 57 4E 47 52 44 01</code>（"DOWNGRD\x01"）にする</td></tr>
+              <tr><td>鍵導出</td><td>PRF（P_SHA256 など）</td><td>HKDF（RFC 5869）＋ <code>"tls13 "</code> ラベル</td></tr>
+              <tr><td>再ネゴシエーション</td><td>あり</td><td>廃止（KeyUpdate と post-handshake 認証で代替）</td></tr>
+              <tr><td>SSLKEYLOGFILE</td><td><code>CLIENT_RANDOM &lt;random&gt; &lt;master_secret&gt;</code> の 1 行</td><td>上表の 5 種類のラベル</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- 10. 早見表 -->
+      <section class="chapter" id="reference">
+        <h2>コマンド早見表</h2>
+        <h3>openssl s_client</h3>
+        <div class="tbl">
+          <table class="ref">
+            <thead><tr><th>フラグ</th><th>何が起きるか</th></tr></thead>
+            <tbody>
+              <tr><td><code>-connect host:port</code></td><td>TCP 接続先。OpenSSL 1.1.1 以降はホスト名が DNS 名なら SNI にも使われる</td></tr>
+              <tr><td><code>-servername name</code></td><td>SNI を明示。IP で <code>-connect</code> するときや別名の証明書を確認するときに必須。<code>-noservername</code> で送らない</td></tr>
+              <tr><td><code>-showcerts</code></td><td>サーバーが送ってきたチェーン全部を PEM で表示（既定は leaf のみ）</td></tr>
+              <tr><td><code>-tls1_3</code> / <code>-tls1_2</code></td><td>そのバージョンだけで接続</td></tr>
+              <tr><td><code>-alpn h2,http/1.1</code></td><td>ALPN を送る。結果は <code>ALPN protocol: h2</code></td></tr>
+              <tr><td><code>-brief</code></td><td>プロトコル・suite・署名方式・検証結果・鍵交換グループだけを表示</td></tr>
+              <tr><td><code>-msg</code></td><td>ハンドシェイクメッセージの種類と長さ（と 16 進）を表示</td></tr>
+              <tr><td><code>-trace</code></td><td>各フィールドをデコードして表示（<code>enable-ssl-trace</code> 付きビルドのみ）</td></tr>
+              <tr><td><code>-status</code></td><td>OCSP stapling を要求し、応答を表示</td></tr>
+              <tr><td><code>-verify_return_error</code></td><td>検証失敗で接続を中止（<strong>既定の s_client は検証失敗でも続行する</strong>）</td></tr>
+              <tr><td><code>-verify_hostname name</code></td><td>ホスト名検証も行う（既定では行わない）</td></tr>
+              <tr><td><code>-CAfile file</code></td><td>信頼するルートを指定</td></tr>
+              <tr><td><code>-groups X25519:secp256r1</code></td><td><code>supported_groups</code> / <code>key_share</code> を指定</td></tr>
+              <tr><td><code>-ciphersuites …</code> / <code>-cipher …</code></td><td>TLS 1.3 の suite / TLS 1.2 以下の cipher を指定</td></tr>
+              <tr><td><code>-keylogfile file</code></td><td>SSLKEYLOGFILE 形式で鍵を書き出す</td></tr>
+              <tr><td><code>-sess_out f</code> / <code>-sess_in f</code></td><td>セッション（チケット）を保存 / 再利用して再開を試す</td></tr>
+              <tr><td><code>-early_data file</code></td><td>ファイルの中身を 0-RTT で送る</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <h3>curl</h3>
+        <div class="tbl">
+          <table class="ref">
+            <thead><tr><th>フラグ</th><th>何が起きるか</th></tr></thead>
+            <tbody>
+              <tr><td><code>-v</code></td><td>接続・TLS・HTTP の経過を <code>*</code> <code>&gt;</code> <code>&lt;</code> 付きで表示（8.10 以降 <code>-vv</code>〜<code>-vvvv</code> で追加トレース）</td></tr>
+              <tr><td><code>--tlsv1.3</code> / <code>--tls-max 1.2</code></td><td>最低バージョン / 最高バージョンを指定</td></tr>
+              <tr><td><code>--cacert file</code> / <code>--capath dir</code></td><td>信頼するルート（または自己署名証明書）を指定</td></tr>
+              <tr><td><code>-k</code> / <code>--insecure</code></td><td>証明書検証を<strong>すべて</strong>スキップ（MITM を検出できない）</td></tr>
+              <tr><td><code>--resolve example.com:443:203.0.113.10</code></td><td>DNS を使わずこの IP に接続。SNI とホスト名検証は <code>example.com</code> のまま</td></tr>
+              <tr><td><code>--cert-status</code></td><td>OCSP stapling を要求し、無い・失効なら失敗</td></tr>
+              <tr><td><code>--curves X25519</code> / <code>--tls13-ciphers …</code></td><td>鍵交換グループ / TLS 1.3 suite を指定</td></tr>
+              <tr><td><code>--ech true</code></td><td>ECH を使う（8.8.0 以降、対応ビルドのみ）</td></tr>
+              <tr><td><code>-w '%{ssl_verify_result}'</code></td><td>検証結果コード（0 = OK）を出力</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <h3>Wireshark 表示フィルタ</h3>
+        <div class="tbl">
+          <table class="ref">
+            <thead><tr><th>フィルタ</th><th>意味</th></tr></thead>
+            <tbody>
+              <tr><td><code>tls.handshake.type == 1</code></td><td>ClientHello（2 = ServerHello, 11 = Certificate, 4 = NewSessionTicket）</td></tr>
+              <tr><td><code>tls.handshake.extensions_server_name == "example.com"</code></td><td>SNI で絞り込み（平文なので鍵なしで使える）</td></tr>
+              <tr><td><code>tls.handshake.extension.type == 51</code></td><td>key_share 拡張を含むもの</td></tr>
+              <tr><td><code>tls.handshake.extensions_key_share_group == 0x11ec</code></td><td>X25519MLKEM768 を使ったハンドシェイク</td></tr>
+              <tr><td><code>tls.handshake.ciphersuite == 0x1302</code></td><td>TLS_AES_256_GCM_SHA384</td></tr>
+              <tr><td><code>tls.handshake.extensions_alpn_str == "h2"</code></td><td>ALPN に h2 を含む</td></tr>
+              <tr><td><code>tls.record.opaque_type == 23</code></td><td>TLS 1.3 の暗号化レコード（外側 type）</td></tr>
+              <tr><td><code>tls.alert_message.desc == 48</code></td><td>unknown_ca alert（復号できる場合）</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- 11. 手元で試す -->
+      <section class="chapter" id="tryit">
+        <h2>手元で試す</h2>
+        <p>Linux / macOS / WSL で動きます。Windows 標準の <code>C:\Windows\System32\curl.exe</code> は Schannel バックエンドのため <code>-v</code> の出力が異なり、<code>SSLKEYLOGFILE</code> も書き出しません（実測）。</p>
+        <pre data-lang="bash" data-title="1) ハンドシェイクを観察する">$ openssl s_client -connect example.com:443 -servername example.com -brief &lt;/dev/null
+$ openssl s_client -connect example.com:443 -servername example.com -showcerts &lt;/dev/null
+# フィールド単位（-trace が無いビルドでは -msg）
+$ openssl s_client -connect example.com:443 -servername example.com \
+    -tls1_3 -groups X25519:secp256r1 -alpn h2,http/1.1 -trace &lt;/dev/null
+$ curl -v https://example.com/ -o /dev/null</pre>
+        <pre data-lang="bash" data-title="2) 失敗ケース（badssl.com のテスト用ホスト）">$ curl https://expired.badssl.com/            # certificate has expired
+$ curl https://wrong.host.badssl.com/         # no alternative certificate subject name matches …
+$ curl https://self-signed.badssl.com/        # self-signed certificate
+$ curl https://untrusted-root.badssl.com/     # self-signed certificate in certificate chain
+$ curl https://incomplete-chain.badssl.com/   # unable to get local issuer certificate</pre>
+        <pre data-lang="bash" data-title="3) ローカルで MITM（自己署名 + TLS 1.3）を再現する">$ openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
+    -keyout mitm.key -out mitm.crt -days 30 \
+    -subj "/CN=example.com" -addext "subjectAltName=DNS:example.com"
+$ openssl s_server -accept 8443 -cert mitm.crt -key mitm.key -tls1_3 -www &amp;
+$ curl -v --resolve example.com:8443:127.0.0.1 https://example.com:8443/
+# → Certificate (11) の直後に「TLS alert, unknown CA (560)」で停止
+$ curl -sS -o /dev/null -w '%{http_code} %{ssl_verify_result}\n' \
+    --cacert mitm.crt --resolve example.com:8443:127.0.0.1 https://example.com:8443/
+200 0
+# → 同じ証明書でも「信頼する」と明示すれば通る = 信頼の根拠は trust store</pre>
+        <pre data-lang="bash" data-title="4) SSLKEYLOGFILE で復号する">$ sudo tcpdump -i any -w tls.pcapng 'host example.com and tcp port 443' &amp;
+$ SSLKEYLOGFILE=$HOME/tls-keys.log curl -s -o /dev/null https://example.com/
+$ cut -d' ' -f1 ~/tls-keys.log
+SERVER_HANDSHAKE_TRAFFIC_SECRET
+EXPORTER_SECRET
+SERVER_TRAFFIC_SECRET_0
+CLIENT_HANDSHAKE_TRAFFIC_SECRET
+CLIENT_TRAFFIC_SECRET_0
+$ tshark -r tls.pcapng -o tls.keylog_file:$HOME/tls-keys.log -Y http2
+$ shred -u ~/tls-keys.log     # 使い終わったら消す</pre>
+        <pre data-lang="bash" data-title="5) セッション再開を確かめる">$ openssl s_client -connect example.com:443 -servername example.com -sess_out sess.pem -ign_eof \
+    &lt;&lt;&lt; $'HEAD / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n' &gt;/dev/null
+$ openssl s_client -connect example.com:443 -servername example.com -sess_in sess.pem &lt;/dev/null | grep -E '^(New|Reused)'
+Reused, TLSv1.3, Cipher is TLS_AES_256_GCM_SHA384</pre>
+      </section>
+
+      <!-- 12. ハマりどころ -->
+      <section class="chapter" id="pitfalls">
+        <h2>ハマりどころ</h2>
+        <div class="note warn"><b>ブラウザでは開けるのに curl だけ失敗する</b><ul>
+          <li>ほぼ確実に<strong>中間証明書の送り忘れ</strong>です（<code>ssl_certificate</code> に <code>cert.pem</code> を指定）。ブラウザは AIA による取得やキャッシュで中間を補えることがあるため気付きにくく、<code>openssl s_client -showcerts</code> で送られている枚数を確認します。</li>
+        </ul></div>
+        <div class="note warn"><b><code>openssl s_client</code> は検証に失敗しても接続を続ける</b><ul>
+          <li><code>Verify return code: 20 (…)</code> と出ても、そのまま HTTP を打ててしまいます。スクリプトでは <code>-verify_return_error</code> を付け、ホスト名も確かめるなら <code>-verify_hostname example.com</code> も付けます。</li>
+        </ul></div>
+        <div class="note warn"><b>IP アドレスで接続すると別の証明書が返る</b><ul>
+          <li><code>openssl s_client -connect 203.0.113.10:443</code> は SNI を送らないため、nginx は <code>default_server</code> の証明書を返します。<code>-servername example.com</code> を付けるか、curl なら <code>--resolve</code> を使います。</li>
+        </ul></div>
+        <div class="note warn"><b><code>ssl_ciphers</code> を絞っても TLS 1.3 の suite は変わらない</b><ul>
+          <li>OpenSSL では TLS 1.3 の suite は別 API です。nginx は <code>ssl_conf_command Ciphersuites …</code>、curl は <code>--tls13-ciphers</code>、s_client は <code>-ciphersuites</code> を使います。</li>
+        </ul></div>
+        <div class="note warn"><b>SNI は平文、ALPN の候補も平文</b><ul>
+          <li>通信内容は暗号化されても、<strong>どのホスト名に接続したか</strong>は ClientHello の <code>server_name</code> で経路上から見えます。隠すには ECH（RFC 9849）が必要で、サーバー側が DNS の HTTPS レコードで ECH 設定を公開している必要があります。</li>
+        </ul></div>
+        <div class="note warn"><b>時計のずれで「期限切れ」「まだ有効でない」</b><ul>
+          <li>有効期間の判定はクライアントのローカル時計です。起動直後の組み込み機器や VM で NTP が合っていないと、正しい証明書でも <code>certificate has expired</code> / <code>certificate is not yet valid</code> になります。</li>
+        </ul></div>
+        <div class="note warn"><b>証明書を更新したのに古い証明書が返る</b><ul>
+          <li>nginx はファイルを起動時・reload 時にしか読みません。certbot の webroot / standalone 方式では <code>--deploy-hook "systemctl reload nginx"</code> を設定します。</li>
+        </ul></div>
+        <div class="note warn"><b>Wireshark で復号できない</b><ul>
+          <li>鍵ログはクライアント側のファイルです。キャプチャの ClientHello と同じ <code>client_random</code> の行が無ければ復号されません（別の curl、Schannel 版 curl、ブラウザの別プロセスなど）。また TCP の途中から録ったキャプチャではハンドシェイクが無く復号できません。</li>
+        </ul></div>
+      </section>
+
+      <!-- 13. 仕様 -->
+      <section class="chapter" id="spec">
+        <h2>仕様・参考</h2>
+        <ul>
+          <li><a href="https://www.rfc-editor.org/rfc/rfc8446" target="_blank" rel="noopener">RFC 8446 — The Transport Layer Security (TLS) Protocol Version 1.3</a>（§2 概要, §4.1.2 ClientHello, §4.2 拡張, §4.4.3 CertificateVerify, §4.4.4 Finished, §5 レコード層, §7.1 鍵スケジュール, §8 0-RTT とリプレイ, Appendix D.4 ミドルボックス互換）</li>
+          <li><a href="https://www.rfc-editor.org/rfc/rfc6066" target="_blank" rel="noopener">RFC 6066 — TLS Extensions（§3 Server Name Indication）</a></li>
+          <li><a href="https://www.rfc-editor.org/rfc/rfc7301" target="_blank" rel="noopener">RFC 7301 — TLS Application-Layer Protocol Negotiation Extension</a></li>
+          <li><a href="https://www.rfc-editor.org/rfc/rfc5869" target="_blank" rel="noopener">RFC 5869 — HMAC-based Extract-and-Expand Key Derivation Function (HKDF)</a></li>
+          <li><a href="https://www.rfc-editor.org/rfc/rfc8470" target="_blank" rel="noopener">RFC 8470 — Using Early Data in HTTP（<code>Early-Data</code> ヘッダ, 425 Too Early）</a></li>
+          <li><a href="https://www.rfc-editor.org/rfc/rfc9849" target="_blank" rel="noopener">RFC 9849 — TLS Encrypted Client Hello</a></li>
+          <li><a href="https://www.rfc-editor.org/rfc/rfc9850" target="_blank" rel="noopener">RFC 9850 — The SSLKEYLOGFILE Format for TLS</a></li>
+          <li><a href="https://www.rfc-editor.org/rfc/rfc9001" target="_blank" rel="noopener">RFC 9001 — Using TLS to Secure QUIC</a>（HTTP/3 では TLS 1.3 のハンドシェイクを QUIC の CRYPTO フレームで運ぶ。参考）</li>
+          <li><a href="https://www.iana.org/assignments/tls-parameters/tls-parameters.xhtml" target="_blank" rel="noopener">IANA — TLS Parameters</a>（ExtensionType, Supported Groups, SignatureScheme, Cipher Suites, Alert の番号）</li>
+          <li><a href="https://nginx.org/en/docs/http/ngx_http_ssl_module.html" target="_blank" rel="noopener">nginx — ngx_http_ssl_module</a></li>
+          <li><a href="https://docs.openssl.org/3.5/man1/openssl-s_client/" target="_blank" rel="noopener">OpenSSL — openssl-s_client(1)</a></li>
+          <li><a href="https://curl.se/docs/manpage.html" target="_blank" rel="noopener">curl — man page</a> / <a href="https://curl.se/docs/sslcerts.html" target="_blank" rel="noopener">SSL Certificate Verification</a></li>
+          <li><a href="https://www.wireshark.org/docs/dfref/t/tls.html" target="_blank" rel="noopener">Wireshark — Display Filter Reference: TLS</a></li>
+          <li><a href="https://badssl.com/" target="_blank" rel="noopener">badssl.com</a>（失敗ケースのテスト用ホスト）</li>
+          <li>関連ページ：<a href="../x509/">X.509 証明書</a> / <a href="../ca-pki/">CA と証明書チェーン</a></li>
+        </ul>
+      </section>
+
+    </main>
+  </div>
+
+  <footer class="site-f"></footer>
+  <script src="../../assets/js/topics.js"></script>
+  <script src="../../assets/js/tim.js"></script>
+  <script src="scenes.js"></script>
+</body>
+</html>
