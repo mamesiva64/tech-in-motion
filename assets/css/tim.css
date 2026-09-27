@@ -34,6 +34,9 @@
 }
 
 *, *::before, *::after { box-sizing: border-box; }
+/* 実物の出力を正確に見せるため、等幅フォントの合字（-> が → になる等）を無効化。
+   font ショートハンドは font-feature-settings をリセットしないので全要素に効く */
+* { font-feature-settings: "liga" 0, "calt" 0; }
 html { scroll-behavior: smooth; scroll-padding-top: calc(var(--hdr) + 16px); -webkit-text-size-adjust: 100%; }
 body {
   margin: 0;

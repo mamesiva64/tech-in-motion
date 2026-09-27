@@ -85,8 +85,8 @@
       ['op', /^[ \t]*- /],
     ],
     dockerfile: [
-      ['com', /^\s*#[^\n]*/],
-      ['kw', /^\s*(?:FROM|RUN|CMD|LABEL|EXPOSE|ENV|ADD|COPY|ENTRYPOINT|VOLUME|USER|WORKDIR|ARG|ONBUILD|STOPSIGNAL|HEALTHCHECK|SHELL|MAINTAINER)\b/],
+      ['com', /^[ \t]*#[^\n]*/],
+      ['kw', /^[ \t]*(?:FROM|RUN|CMD|LABEL|EXPOSE|ENV|ADD|COPY|ENTRYPOINT|VOLUME|USER|WORKDIR|ARG|ONBUILD|STOPSIGNAL|HEALTHCHECK|SHELL|MAINTAINER)\b/],
       ['kw2', /\bAS\b/],
       ['flag', /--[\w-]+(?:=[^\s]+)?/],
       ['str', STR],
@@ -100,9 +100,9 @@
       ['num', /\b\d+\b/],
     ],
     ini: [
-      ['kw', /^\s*\[[^\]\n]+\]/],
-      ['com', /^\s*[#;][^\n]*/],
-      ['key', /^\s*[\w.-]+(?=\s*=)/],
+      ['kw', /^[ \t]*\[[^\]\n]+\]/],
+      ['com', /^[ \t]*[#;][^\n]*/],
+      ['key', /^[ \t]*[\w.-]+(?=\s*=)/],
       ['str', STR],
       ['num', NUM],
     ],
@@ -113,7 +113,7 @@
     cert: [
       ['kw', /-----(?:BEGIN|END) [A-Z0-9 ]+-----/],
       ['num', /(?:[0-9a-fA-F]{2}:){3,}[0-9a-fA-F]{0,2}/],
-      ['key', /^\s*[A-Za-z][\w .\/()-]*:(?=\s|$)/],
+      ['key', /^[ \t]*[A-Za-z][\w .\/()-]*:(?=\s|$)/],
       ['kw2', /\bcritical\b/],
       ['attr', /\b(?:C|ST|L|O|OU|CN|DC|emailAddress)(?= ?=)/],
       ['str', STR],
@@ -122,7 +122,7 @@
       ['key', /^[A-Za-z][\w-]*(?=:)/],
       ['attr', /(?<=^|[;\s])[a-z]{1,6}(?==)/],
       ['str', STR],
-      ['com', /^\s*;[^\n]*/],
+      ['com', /^[ \t]*;[^\n]*/],
     ],
     js: [
       ['com', /\/\/[^\n]*/],
@@ -438,7 +438,8 @@
           const p = Math.min(1, (performance.now() - t0) / T);
           fn(p);
           if (p >= 1) return res();
-          requestAnimationFrame(tick);
+          // rAF is paused in background tabs; fall back to timers so audits/automation don't stall
+          if (d.hidden) setTimeout(tick, 16); else requestAnimationFrame(tick);
         };
         tick();
       });
@@ -479,7 +480,7 @@
       if (!t) return;
       const b = t.querySelector('.term-b') || t;
       if (o.clear) b.innerHTML = '';
-      const lines = dedent(text).split('\n');
+      const lines = (o.raw ? String(text) : dedent(text)).split('\n');
       for (const line of lines) {
         if (!this.alive) return;
         const row = h('div', 'tl');
@@ -494,7 +495,7 @@
           row.innerHTML = highlight(line, 'bash');
           await this.wait(o.pause != null ? o.pause : 260);
         } else {
-          row.className = 'tl out';
+          row.className = 'tl out' + (o.cls ? ' ' + o.cls : '');
           row.innerHTML = highlight(line, o.lang || 'text') || '&nbsp;';
           this._a(row, [{ opacity: 0 }, { opacity: 1 }], { dur: 160 });
           await this.wait(o.lineDelay != null ? o.lineDelay : 45);
@@ -646,6 +647,10 @@
         e.appendChild(st);
         return this._a(st, [{ opacity: 0, scale: '2.4', rotate: '-20deg' }, { opacity: 1, scale: '1', rotate: '0deg' }], { dur: 440, delay: o.delay || 0, ease: EASE.back });
       }));
+    }
+    unstamp(sel) {
+      this.$(sel).forEach((e) => e.querySelectorAll(':scope > .stamp').forEach((st) => st.remove()));
+      return Promise.resolve();
     }
     caption(html, o = {}) {
       if (!this.alive) return Promise.resolve();
@@ -1130,6 +1135,18 @@
           if (e.closest('.hide') || e.closest('.term')) return;
           if (e.scrollWidth > e.clientWidth + 2 || e.scrollHeight > e.clientHeight + 2) out.push('scene ' + sc.no + ' step ' + (k + 1) + ': [' + name(e) + '] content overflows (' + e.scrollWidth + 'x' + e.scrollHeight + ' > ' + e.clientWidth + 'x' + e.clientHeight + ')');
         });
+        // overlap between visible top-level parts (zones are containers by design) and wire labels
+        const items = [];
+        sc.world.querySelectorAll(':scope > :not(.hide):not(svg):not(.fx):not(.zone):not([data-overlap-ok])').forEach((e) => items.push([e, box(e)]));
+        sc.fx.querySelectorAll('.wlabel:not(.hide):not([data-overlap-ok])').forEach((e) => items.push([e, { x: e.offsetLeft - e.offsetWidth / 2, y: e.offsetTop - e.offsetHeight / 2, w: e.offsetWidth, h: e.offsetHeight }]));
+        for (let a = 0; a < items.length; a++) {
+          for (let b = a + 1; b < items.length; b++) {
+            const A = items[a][1], B = items[b][1];
+            const ix = Math.min(A.x + A.w, B.x + B.w) - Math.max(A.x, B.x);
+            const iy = Math.min(A.y + A.h, B.y + B.h) - Math.max(A.y, B.y);
+            if (ix > 4 && iy > 4) out.push('scene ' + sc.no + ' step ' + (k + 1) + ': overlap [' + name(items[a][0]) + '] x [' + name(items[b][0]) + '] (' + Math.round(ix) + 'x' + Math.round(iy) + 'px)');
+          }
+        }
       }
       await sc.go(0, { instant: true });
       sc.pause();

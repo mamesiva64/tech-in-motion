@@ -263,7 +263,7 @@
           $ printf '%s' '${J(HS_H)}' | base64 | tr '+/' '-_' | tr -d '=\\n'
           ⟪${D.hsH}⟫` },
         run: async (s) => {
-          s.line('hj:r', 'hb:l', { cls: 'acc c-pink', label: 'base64url' });
+          s.line('hj:r', 'hb:l', { cls: 'acc c-pink' });
           await s.show('hb', { fx: 'left' });
           s.text('hbn', String(D.hsH.length), { flash: false });
           await s.scramble('hbv', D.hsH, { chars: B64CH, dur: 1000 });
@@ -282,7 +282,7 @@
           $ printf '%s' '${hsPc}' | base64 | tr '+/' '-_' | tr -d '=\\n'
           ⟪${D.hsP}⟫` },
         run: async (s) => {
-          s.line('pj:r', 'pb:l', { cls: 'acc c-violet', label: 'base64url' });
+          s.line('pj:r', 'pb:l', { cls: 'acc c-violet' });
           await s.show('pb', { fx: 'left' });
           s.text('pbn', String(D.hsP.length), { flash: false });
           await s.scramble('pbv', D.hsP, { chars: B64CH, dur: 1300 });
@@ -383,7 +383,7 @@
         code: { title: 'jwks.json（このページの鍵）', lang: 'json', src: jwksJson(80) },
         run: async (s) => {
           await s.set('jwksb', TIM.codeLines('{ "keys": [ {\n    "kty": "RSA", "use": "sig",\n    "kid": "2026-09", "alg": "RS256",\n    "e": "' + D.jwk.e + '",\n    "n": "' + cut(D.jwk.n, 34) + '"\n} ] }', 'json'), { flash: false });
-          s.line('pubf:r', 'jwksf:l', { cls: 'acc c-green', label: 'JWK (n, e) で公開', curve: -30 });
+          s.line('pubf:r', 'jwksf:l', { cls: 'acc c-green', label: 'JWK' });
           await s.show('jwksf', { fx: 'left' });
         },
       },
@@ -401,7 +401,7 @@
         ],
         run: async (s) => {
           await s.show('signer', { fx: 'up' });
-          s.line('privf:b', 'signer:t', { cls: 'acc c-pink', label: 'private key' });
+          s.line('privf:b', 'signer:t', { cls: 'acc c-pink' });
           s.pulse('privf');
           await s.scramble('shav', cut(D.rsSha, 34), { dur: 900 });
           await s.scramble('sigv', cut(D.rsSig, 34), { chars: B64CH, dur: 1100 });

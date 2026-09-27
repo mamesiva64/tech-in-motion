@@ -32,7 +32,7 @@ window.TIM_TOPICS = [
     sub: 'compose.yaml が作るネットワーク・ボリューム・コンテナと、サービス名 DNS',
     cmds: ['docker compose up -d', 'docker compose ps', 'docker compose logs -f api'],
     tags: ['compose.yaml', 'depends_on', 'healthcheck', '127.0.0.11', 'volumes'],
-    related: ['docker', 'dns', 'webapi'], status: 'soon',
+    related: ['docker', 'dns', 'webapi'], status: 'ready',
   },
   {
     id: 'http', cat: 'web', title: 'HTTP',

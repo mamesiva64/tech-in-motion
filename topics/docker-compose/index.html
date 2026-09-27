@@ -1,0 +1,826 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Docker Compose — Tech in Motion</title>
+  <meta name="description" content="docker compose up -d が実際に作るネットワーク・ボリューム・コンテナとラベル、127.0.0.11 によるサービス名 DNS、depends_on と healthcheck による起動順序、.env / env_file / override の解決を、実際の出力付きでステップ再生します。">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Space+Grotesk:wght@500;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="../../assets/css/tim.css">
+  <link rel="stylesheet" href="page.css">
+</head>
+<body data-root="../../" data-topic="docker-compose">
+  <header class="site-h"></header>
+
+  <div class="page">
+    <aside class="toc"></aside>
+    <main class="doc">
+
+      <!-- 0. HERO -->
+      <section class="hero">
+        <p class="kicker">Container · Compose</p>
+        <h1>Docker Compose<small>compose.yaml 1 枚から、何が・どんな名前で・どの順に作られるか</small></h1>
+        <p class="lead"><code>docker compose up -d</code> は、YAML を読んで <b>ネットワーク <code>myapp_default</code></b>・<b>ボリューム <code>myapp_dbdata</code></b>・<b>コンテナ <code>myapp-db-1</code></b> を Docker Engine に作らせ、すべてに <code>com.docker.compose.*</code> ラベルを貼るだけのツールです。このページでは web（nginx）＋ api（Node.js）＋ db（PostgreSQL）の 3 サービス構成を題材に、コンテナ内の <code>/etc/resolv.conf</code>、<code>docker inspect</code> の JSON、<code>docker compose config</code> の最終形まで実物で追います。</p>
+        <div class="facts">
+          <div class="fact"><span>作られるもの</span><b><code>&lt;project&gt;_default</code> / <code>&lt;project&gt;_dbdata</code> / <code>&lt;project&gt;-db-1</code></b></div>
+          <div class="fact"><span>サービス名 DNS</span><b>各コンテナの <code>nameserver 127.0.0.11</code>（dockerd 内蔵 DNS）</b></div>
+          <div class="fact"><span>起動順序</span><b><code>depends_on</code> + <code>condition: service_healthy</code> + <code>healthcheck</code></b></div>
+          <div class="fact"><span>仕様 / CLI</span><b>Compose Specification ／ <code>docker compose</code>（v2 以降。現行は v5 系）</b></div>
+        </div>
+      </section>
+
+      <!-- 1. 全体像 -->
+      <section class="chapter" id="overview">
+        <h2>docker compose up -d で作られるもの</h2>
+        <p>Compose は「コンテナを起動する魔法」ではなく、<b>Docker Engine API のクライアント</b>です。<code>compose.yaml</code> を読み、変数を展開し、プロジェクト名を決め、その名前を接頭辞にしてネットワーク → ボリューム → コンテナの順に作成 API を呼びます。作ったものには必ずラベルを貼り、次回以降は <b>状態ファイルではなくラベルで</b>自分のリソースを探します。</p>
+
+        <div class="scene" id="sc-up" data-title="docker compose up -d で作られるもの">
+          <div class="stage" data-w="960" data-h="472">
+            <div class="term" data-el="t" style="left:20px;top:20px;width:460px;height:236px">
+              <div class="term-h">alice@host:~/myapp</div>
+              <div class="term-b" data-el="tb"></div>
+            </div>
+            <div class="file" data-el="tree" style="left:20px;top:272px;width:214px">
+              <div class="file-h">~/myapp/</div>
+              <pre data-lang="tree">myapp/
+├── compose.yaml
+├── compose.override.yaml
+├── .env
+├── api/
+│   └── Dockerfile
+└── web/
+    └── nginx.conf</pre>
+            </div>
+            <div class="node" data-el="pname" style="left:250px;top:272px;width:230px">
+              <div class="node-h"><i data-icon="search"></i><b class="node-t">project name</b></div>
+              <dl class="kv">
+                <dt data-el="k1">-p</dt><dd data-el="v1">（なし）</dd>
+                <dt data-el="k2">COMPOSE_PROJECT_NAME</dt><dd data-el="v2">（なし）</dd>
+                <dt data-el="k3">name:</dt><dd data-el="v3">myapp</dd>
+                <dt data-el="k4">dir</dt><dd data-el="v4">myapp</dd>
+              </dl>
+            </div>
+            <div class="chip solid hide" data-el="pres" style="left:250px;top:414px">project = myapp</div>
+            <div class="file hide" data-el="lbl" style="left:20px;top:272px;width:470px">
+              <div class="file-h">docker inspect myapp-db-1 → .Config.Labels</div>
+              <pre data-lang="json">"com.docker.compose.project": "myapp",
+"com.docker.compose.service": "db",
+"com.docker.compose.container-number": "1",
+"com.docker.compose.oneoff": "False",
+"com.docker.compose.depends_on": "",
+"com.docker.compose.project.working_dir": "/home/alice/myapp",
+"com.docker.compose.config-hash": "8d0c5e2f…"</pre>
+            </div>
+
+            <div class="zone" data-el="engine" data-label="Docker Engine (dockerd)" style="left:500px;top:16px;width:440px;height:440px"></div>
+            <div class="zone hide" data-el="net" data-label="network myapp_default · bridge" style="left:516px;top:44px;width:408px;height:250px"></div>
+            <div class="node hide" data-el="cweb" style="left:532px;top:66px;width:376px">
+              <div class="node-h"><i data-icon="globe"></i><b class="node-t">myapp-web-1</b></div>
+              <div class="node-s">nginx:1.27-alpine · 172.18.0.4 · 0.0.0.0:8080→80</div>
+            </div>
+            <div class="node hide" data-el="capi" style="left:532px;top:138px;width:376px">
+              <div class="node-h"><i data-icon="server"></i><b class="node-t">myapp-api-1</b></div>
+              <div class="node-s">myapp-api (build ./api) · 172.18.0.3</div>
+            </div>
+            <div class="node hide" data-el="cdb" style="left:532px;top:210px;width:376px">
+              <div class="node-h"><i data-icon="db"></i><b class="node-t">myapp-db-1</b></div>
+              <div class="node-s">postgres:16-alpine · 172.18.0.2</div>
+            </div>
+            <div class="node hide" data-el="vol" style="left:516px;top:330px;width:196px">
+              <div class="node-h"><i data-icon="folder"></i><b class="node-t">myapp_dbdata</b></div>
+              <div class="node-s">volume · driver: local</div>
+            </div>
+            <div class="label hide" data-el="imgl" style="left:736px;top:312px">images</div>
+            <div class="chip hide" data-el="i1" style="left:736px;top:336px">nginx:1.27-alpine</div>
+            <div class="chip hide" data-el="i2" style="left:736px;top:370px">postgres:16-alpine</div>
+            <div class="chip hide" data-el="i3" style="left:736px;top:404px">myapp-api ← build ./api</div>
+          </div>
+        </div>
+
+        <div class="tbl">
+          <table class="ref">
+            <thead><tr><th>作られるもの</th><th>名前の規則（例）</th><th>付くラベル</th><th>確認コマンド</th></tr></thead>
+            <tbody>
+              <tr><td>ネットワーク</td><td><code>&lt;project&gt;_default</code>（<code>myapp_default</code>）。<code>networks:</code> で定義したものは <code>&lt;project&gt;_&lt;name&gt;</code></td><td><code>com.docker.compose.network=default</code>, <code>com.docker.compose.project=myapp</code></td><td><code>docker network inspect myapp_default</code></td></tr>
+              <tr><td>ボリューム</td><td><code>&lt;project&gt;_&lt;volume&gt;</code>（<code>myapp_dbdata</code>）</td><td><code>com.docker.compose.volume=dbdata</code>, <code>com.docker.compose.project=myapp</code></td><td><code>docker volume inspect myapp_dbdata</code></td></tr>
+              <tr><td>コンテナ</td><td><code>&lt;project&gt;-&lt;service&gt;-&lt;n&gt;</code>（<code>myapp-db-1</code>）。v1 はアンダースコア（<code>myapp_db_1</code>）</td><td><code>com.docker.compose.service=db</code>, <code>com.docker.compose.container-number=1</code>, <code>com.docker.compose.oneoff=False</code> ほか</td><td><code>docker compose ps</code> / <code>docker inspect myapp-db-1</code></td></tr>
+              <tr><td>ビルドしたイメージ</td><td><code>image:</code> 未指定なら <code>&lt;project&gt;-&lt;service&gt;</code>（<code>myapp-api</code>）</td><td>—</td><td><code>docker compose images</code> / <code>docker compose config --images</code></td></tr>
+              <tr><td>one-off コンテナ</td><td><code>docker compose run</code> で作られる <code>&lt;project&gt;-&lt;service&gt;-run-&lt;id&gt;</code></td><td><code>com.docker.compose.oneoff=True</code></td><td><code>docker compose ps -a</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="note">プロジェクト名は <b><code>-p</code> ＞ <code>COMPOSE_PROJECT_NAME</code> ＞ トップレベル <code>name:</code> ＞ compose.yaml のあるディレクトリ名</b> の順で決まります。使える文字は英小文字・数字・<code>-</code>・<code>_</code> で、先頭は英小文字か数字です。プロジェクト名が変わると、ネットワークもボリュームも<b>別物</b>として新しく作られます。</div>
+      </section>
+
+      <!-- 2. 実物 -->
+      <section class="chapter" id="files">
+        <h2>compose.yaml と周辺ファイルの実物</h2>
+        <p>題材は次の構成です。ブラウザ → <b>web</b>（nginx、ホストの 8080 番を公開）→ <b>api</b>（Node.js、3000 番。ホストには公開しない）→ <b>db</b>（PostgreSQL 16、5432 番。ホストには公開しない）。</p>
+        <pre data-lang="tree" data-title="ファイル構成">myapp/                       # ← ディレクトリ名。name: が無ければこれがプロジェクト名
+├── compose.yaml             # 本体（Compose Specification 形式。version: は書かない）
+├── compose.override.yaml    # 開発用の上書き。-f を付けなければ自動でマージされる
+├── .env                     # ${...} の展開用。コンテナには渡らない（git 管理外に）
+├── api/
+│   ├── Dockerfile
+│   ├── api.env              # env_file: コンテナの環境変数になる
+│   └── src/
+│       └── server.js
+└── web/
+    ├── nginx.conf           # バインドマウントで /etc/nginx/conf.d/default.conf へ
+    └── public/
+        └── index.html</pre>
+
+        <pre data-lang="yaml" data-title="compose.yaml（全文）">name: myapp                      # プロジェクト名（-p / COMPOSE_PROJECT_NAME が優先）
+
+services:
+  web:
+    image: nginx:1.27-alpine
+    ports:
+      - "${APP_PORT:-8080}:80"     # ホスト:コンテナ。ホストの 0.0.0.0:8080 で公開
+    volumes:
+      - ./web/nginx.conf:/etc/nginx/conf.d/default.conf:ro   # バインドマウント
+      - ./web/public:/usr/share/nginx/html:ro
+    depends_on:
+      - api                         # 短縮形 = condition: service_started
+    restart: unless-stopped
+
+  api:
+    build: ./api                    # イメージ名は myapp-api になる
+    env_file:
+      - ./api/api.env               # コンテナの環境変数（展開には使われない）
+    environment:
+      DATABASE_URL: postgres://app:${POSTGRES_PASSWORD}@db:5432/app   # ホスト名はサービス名 db
+      NODE_ENV: production
+    expose:
+      - "3000"                      # ドキュメント的な宣言。ホストには公開しない
+    depends_on:
+      db:
+        condition: service_healthy  # db の healthcheck が healthy になるまで起動しない
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_DB: app
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    volumes:
+      - dbdata:/var/lib/postgresql/data    # 名前付きボリューム（PostgreSQL 17 以下のパス）
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+volumes:
+  dbdata:                           # 実体は myapp_dbdata</pre>
+
+        <div class="cols">
+          <div>
+            <pre data-lang="ini" data-title=".env">POSTGRES_PASSWORD=devpass
+APP_PORT=8080</pre>
+            <pre data-lang="ini" data-title="api/api.env（env_file）">LOG_LEVEL=info
+PORT=3000</pre>
+            <pre data-lang="dockerfile" data-title="api/Dockerfile">FROM node:22-slim
+WORKDIR /app
+COPY src ./src
+EXPOSE 3000
+CMD ["node", "src/server.js"]</pre>
+          </div>
+          <div>
+            <pre data-lang="yaml" data-title="compose.override.yaml">services:
+  api:
+    environment:
+      NODE_ENV: development         # キー単位で上書き
+    command: ["node", "--watch", "src/server.js"]   # 置き換え
+    volumes:
+      - ./api/src:/app/src          # 追加（コンテナ側パスで統合）
+  db:
+    ports:
+      - "127.0.0.1:5432:5432"       # 追加（開発時だけ localhost に公開）</pre>
+            <pre data-lang="text" data-title="web/nginx.conf">server {
+    listen 80;
+    server_tokens off;
+
+    location /api/ {
+        proxy_pass http://api:3000/;   # サービス名 api を 127.0.0.11 で解決
+    }
+
+    location / {
+        root  /usr/share/nginx/html;
+        index index.html;
+    }
+}</pre>
+          </div>
+        </div>
+
+        <pre data-lang="js" data-title="api/src/server.js（依存ライブラリなしの最小サンプル）">const http = require('node:http');
+const net = require('node:net');
+
+const { hostname, port } = new URL(process.env.DATABASE_URL);
+const dbPort = Number(port) || 5432;
+
+// DB に TCP 接続できるかだけを確かめる（デモ用。実アプリでは pg などのドライバを使う）
+function checkDb() {
+  return new Promise((resolve, reject) => {
+    const sock = net.connect({ host: hostname, port: dbPort }, () => { sock.end(); resolve(); });
+    sock.setTimeout(2000, () => sock.destroy(Object.assign(new Error('timeout'), { code: 'ETIMEDOUT' })));
+    sock.on('error', reject);
+  });
+}
+
+process.on('SIGTERM', () => process.exit(0));   // PID 1 は SIGTERM を自分で処理する必要がある
+
+checkDb()
+  .then(() => {
+    console.log(`db reachable at ${hostname}:${dbPort}`);
+    const listenPort = Number(process.env.PORT) || 3000;
+    http.createServer(async (req, res) => {
+      res.setHeader('Content-Type', 'application/json');
+      try {
+        await checkDb();
+        res.end(JSON.stringify({ status: 'ok', db: 'up', env: process.env.NODE_ENV }));
+      } catch (e) {
+        res.statusCode = 503;
+        res.end(JSON.stringify({ status: 'error', db: e.code }));
+      }
+    }).listen(listenPort, () => console.log(`api listening on :${listenPort}`));
+  })
+  .catch((e) => {
+    console.error(`db connect failed (${e.code}) ${hostname}:${dbPort}`);
+    process.exit(1);
+  });</pre>
+
+        <h3>compose.yaml の主要キー</h3>
+        <div class="tbl">
+          <table class="ref">
+            <thead><tr><th>キー</th><th>書き方の例</th><th>実際に起きること</th></tr></thead>
+            <tbody>
+              <tr><td><code>services</code></td><td><code>services: { web: …, api: …, db: … }</code></td><td>サービスごとにコンテナ <code>&lt;project&gt;-&lt;service&gt;-1</code> を作る。サービス名はそのままネットワーク上の DNS 名になる</td></tr>
+              <tr><td><code>image</code></td><td><code>image: postgres:16-alpine</code></td><td>ローカルに無ければ pull。<code>build</code> と併用するとビルド結果にこの名前が付く</td></tr>
+              <tr><td><code>build</code></td><td><code>build: ./api</code> / <code>build: { context: ./api, target: dev }</code></td><td>コンテキストをビルドし、<code>image</code> 未指定なら <code>myapp-api</code> と命名。<code>up --build</code> で毎回再ビルド</td></tr>
+              <tr><td><code>ports</code></td><td><code>"8080:80"</code>, <code>"127.0.0.1:5432:5432"</code></td><td>ホスト側のポートを公開（DNAT）。ホスト IP を省略すると <code>0.0.0.0</code>（と <code>[::]</code>）。サービス間通信には不要</td></tr>
+              <tr><td><code>expose</code></td><td><code>- "3000"</code></td><td>ホストには公開しない。同じネットワークのコンテナからは <code>expose</code> が無くても届く（宣言的な意味合い）</td></tr>
+              <tr><td><code>environment</code></td><td><code>NODE_ENV: production</code></td><td>コンテナの環境変数。値の中の <code>${VAR}</code> は Compose が先に展開する</td></tr>
+              <tr><td><code>env_file</code></td><td><code>- ./api/api.env</code></td><td>ファイルの <code>KEY=VALUE</code> をコンテナの環境変数にする。<code>environment</code> の方が優先。<b>compose.yaml の展開には使われない</b></td></tr>
+              <tr><td><code>volumes</code>（サービス内）</td><td><code>dbdata:/var/lib/postgresql/data</code>, <code>./web/nginx.conf:/etc/…:ro</code></td><td>左辺が名前なら名前付きボリューム、<code>./</code> や <code>/</code> で始まればバインドマウント。<code>:ro</code> で読み取り専用</td></tr>
+              <tr><td><code>volumes</code>（トップレベル）</td><td><code>volumes: { dbdata: {} }</code></td><td><code>myapp_dbdata</code> を作成。<code>external: true</code> なら作らず既存を使う（<code>down -v</code> でも消えない）</td></tr>
+              <tr><td><code>networks</code></td><td><code>networks: [backend]</code></td><td>省略時は全サービスが <code>myapp_default</code> に参加。分けると別ネットワークのサービスは名前解決も通信もできない</td></tr>
+              <tr><td><code>depends_on</code></td><td><code>db: { condition: service_healthy }</code></td><td>起動（と停止）の順序。<code>service_started</code> / <code>service_healthy</code> / <code>service_completed_successfully</code>。短縮形は <code>service_started</code></td></tr>
+              <tr><td><code>healthcheck</code></td><td><code>test: ["CMD-SHELL", "pg_isready …"]</code></td><td>Engine がコンテナ内で定期実行し、終了コード 0 なら <code>healthy</code>。<code>interval</code> / <code>timeout</code> / <code>retries</code> / <code>start_period</code></td></tr>
+              <tr><td><code>restart</code></td><td><code>no</code> / <code>always</code> / <code>on-failure[:N]</code> / <code>unless-stopped</code></td><td>Engine の再起動ポリシー。落ちたコンテナを dockerd が再起動する（Compose は常駐しない）</td></tr>
+              <tr><td><code>profiles</code></td><td><code>profiles: [debug]</code></td><td>そのプロファイルが有効（<code>--profile debug</code> / <code>COMPOSE_PROFILES</code>）なときだけ起動するサービスにする</td></tr>
+              <tr><td><code>deploy.resources</code></td><td><code>limits: { memory: 256M, cpus: "0.5" }</code></td><td>cgroup の上限としてコンテナに設定される（<code>docker inspect</code> の <code>HostConfig.Memory</code> など）</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- 3. DNS -->
+      <section class="chapter" id="dns">
+        <h2>サービス名で名前解決する仕組み（127.0.0.11）</h2>
+        <p>Compose が作る <code>myapp_default</code> は<b>ユーザー定義 bridge ネットワーク</b>です。ここに参加したコンテナの <code>/etc/resolv.conf</code> は <code>nameserver 127.0.0.11</code> に書き換えられ、名前解決は dockerd の<b>組み込み DNS</b> が受け持ちます。組み込み DNS は同じネットワーク上のサービス名・コンテナ名を知っていて、知らない名前（外部ドメイン）はホストの DNS サーバーへ転送します。</p>
+
+        <div class="scene" id="sc-dns" data-title="サービス名 db が 172.18.0.2 になるまで">
+          <div class="stage" data-w="960" data-h="520">
+            <div class="node" data-el="browser" style="left:20px;top:30px;width:190px">
+              <div class="node-h"><i data-icon="browser"></i><b class="node-t">Browser</b></div>
+              <div class="node-s">http://localhost:8080/</div>
+            </div>
+            <div class="node" data-el="hostport" style="left:20px;top:128px;width:190px">
+              <div class="node-h"><i data-icon="router"></i><b class="node-t">host :8080</b></div>
+              <div class="node-s">0.0.0.0:8080<br>→ 172.18.0.4:80 (DNAT)</div>
+            </div>
+            <div class="node hide" data-el="names" style="left:20px;top:236px;width:190px">
+              <div class="node-h"><i data-icon="db"></i><b class="node-t">db の DNS 名</b></div>
+              <dl class="kv">
+                <dt>service</dt><dd class="acc">db</dd>
+                <dt>container</dt><dd>myapp-db-1</dd>
+                <dt>id</dt><dd>3f2a9c1b7d4e</dd>
+              </dl>
+            </div>
+
+            <div class="zone" data-el="net" data-label="myapp_default · 172.18.0.0/16" style="left:232px;top:24px;width:472px;height:300px"></div>
+            <div class="node" data-el="web" style="left:250px;top:52px;width:180px">
+              <div class="node-h"><i data-icon="globe"></i><b class="node-t">web</b></div>
+              <div class="node-s">myapp-web-1<br>172.18.0.4 · :80</div>
+            </div>
+            <div class="node" data-el="dns" style="left:506px;top:52px;width:180px">
+              <div class="node-h"><i data-icon="search"></i><b class="node-t">127.0.0.11:53</b></div>
+              <div class="node-s">dockerd 内蔵 DNS<br>（各コンテナ内の lo）</div>
+            </div>
+            <div class="node" data-el="api" style="left:250px;top:216px;width:180px">
+              <div class="node-h"><i data-icon="server"></i><b class="node-t">api</b></div>
+              <div class="node-s">myapp-api-1<br>172.18.0.3 · :3000</div>
+            </div>
+            <div class="node" data-el="db" style="left:506px;top:216px;width:180px">
+              <div class="node-h"><i data-icon="db"></i><b class="node-t">db</b></div>
+              <div class="node-s">myapp-db-1<br>172.18.0.2 · :5432</div>
+            </div>
+
+            <div class="file hide" data-el="resolv" style="left:724px;top:24px;width:216px">
+              <div class="file-h">api: /etc/resolv.conf</div>
+              <pre data-lang="text">nameserver 127.0.0.11
+options ndots:0</pre>
+            </div>
+            <div class="node hide" data-el="ans" style="left:724px;top:116px;width:216px">
+              <div class="node-h"><i data-icon="check"></i><b class="node-t">DNS 応答</b></div>
+              <dl class="kv">
+                <dt>QNAME</dt><dd data-el="qn">db</dd>
+                <dt>TYPE</dt><dd>A</dd>
+                <dt>ANSWER</dt><dd class="acc" data-el="qa">172.18.0.2</dd>
+              </dl>
+            </div>
+            <div class="node hide" data-el="hostdns" style="left:724px;top:236px;width:216px">
+              <div class="node-h"><i data-icon="globe"></i><b class="node-t">host の DNS</b></div>
+              <div class="node-s">192.168.1.1<br>(resolv.conf の ExtServers)</div>
+            </div>
+
+            <div class="term" data-el="t" style="left:20px;top:348px;width:920px;height:156px">
+              <div class="term-h">alice@host:~/myapp</div>
+              <div class="term-b"></div>
+            </div>
+          </div>
+        </div>
+
+        <pre data-lang="bash" data-title="コンテナの中から見る">$ docker compose exec api cat /etc/resolv.conf
+# Generated by Docker Engine.
+# This file can be edited; Docker Engine will not make further changes once it
+# has been modified.
+
+nameserver 127.0.0.11
+options ndots:0
+
+# Based on host file: '/etc/resolv.conf' (internal resolver)
+# ExtServers: [192.168.1.1]
+# Overrides: []
+# Option ndots from: internal
+
+$ docker compose exec api getent hosts db
+172.18.0.2      db
+
+$ docker network inspect myapp_default \
+    --format '{{range .Containers}}{{.Name}} {{.IPv4Address}}{{"\n"}}{{end}}'
+myapp-db-1 172.18.0.2/16
+myapp-api-1 172.18.0.3/16
+myapp-web-1 172.18.0.4/16</pre>
+        <p>コメント行の書式は Docker Engine のバージョンで異なります（上は Engine 27 系以降の例。古い版は <code>nameserver 127.0.0.11</code> と <code>options ndots:0</code> だけ）。IP アドレスはコンテナを作り直すたびに変わり得るので、<b>アプリの設定には必ずサービス名を書きます</b>。<code>docker network inspect</code> の出力順は保証されません。</p>
+
+        <div class="tbl">
+          <table class="ref">
+            <thead><tr><th>書き方</th><th>ホスト（ブラウザ・psql）から</th><th>同じネットワークの別コンテナから</th></tr></thead>
+            <tbody>
+              <tr><td><code>ports: ["8080:80"]</code></td><td><code>localhost:8080</code> で届く（<code>0.0.0.0</code> で待ち受けるので LAN からも届く）</td><td><code>web:80</code>（コンテナ側ポート）で届く。<code>web:8080</code> ではない</td></tr>
+              <tr><td><code>ports: ["127.0.0.1:5432:5432"]</code></td><td>ホスト自身の <code>127.0.0.1:5432</code> からだけ届く</td><td><code>db:5432</code></td></tr>
+              <tr><td><code>expose: ["3000"]</code></td><td>届かない</td><td><code>api:3000</code></td></tr>
+              <tr><td>何も書かない</td><td>届かない</td><td>待ち受けていれば <code>api:3000</code> で届く（<code>expose</code> は必須ではない）</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- 4. 起動順序 -->
+      <section class="chapter" id="order">
+        <h2>起動順序：depends_on と healthcheck</h2>
+        <p><code>depends_on</code> の短縮形（<code>- db</code>）は「db コンテナが <b>running</b> になったら次へ」という意味で、PostgreSQL が接続を受け付けられる状態かどうかは見ていません。<code>condition: service_healthy</code> を付けると、Compose は依存先コンテナの <code>State.Health.Status</code> を 500 ms 間隔で確認し、<code>healthy</code> になってから依存元を起動します。</p>
+
+        <div class="scene" id="sc-order" data-title="service_healthy で db の準備完了を待つ">
+          <div class="stage" data-w="960" data-h="500">
+            <div class="node" data-el="db" style="left:20px;top:24px;width:250px">
+              <div class="node-h"><i data-icon="db"></i><b class="node-t">db</b></div>
+              <div class="node-s">myapp-db-1 · postgres:16-alpine</div>
+            </div>
+            <div class="node" data-el="api" style="left:20px;top:150px;width:250px">
+              <div class="node-h"><i data-icon="server"></i><b class="node-t">api</b></div>
+              <div class="node-s">myapp-api-1 · myapp-api</div>
+            </div>
+            <div class="node" data-el="web" style="left:20px;top:276px;width:250px">
+              <div class="node-h"><i data-icon="globe"></i><b class="node-t">web</b></div>
+              <div class="node-s">myapp-web-1 · nginx:1.27-alpine</div>
+            </div>
+            <div class="chip hide" data-el="sdb" style="left:290px;top:44px">—</div>
+            <div class="chip hide" data-el="sapi" style="left:290px;top:170px">—</div>
+            <div class="chip hide" data-el="sweb" style="left:290px;top:296px">—</div>
+
+            <div class="file hide" data-el="health" style="left:520px;top:24px;width:420px">
+              <div class="file-h">docker inspect myapp-db-1 → .State.Health</div>
+              <pre data-lang="json">{
+  "Status": "starting",
+  "FailingStreak": 0,
+  "Log": []
+}</pre>
+            </div>
+            <div class="term" data-el="dblog" style="left:520px;top:236px;width:420px;height:250px">
+              <div class="term-h">docker compose logs -f --no-log-prefix db</div>
+              <div class="term-b"></div>
+            </div>
+            <div class="term" data-el="ps" style="left:20px;top:350px;width:480px;height:136px">
+              <div class="term-h">alice@host:~/myapp</div>
+              <div class="term-b"></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="tbl">
+          <table class="ref">
+            <thead><tr><th>condition</th><th>依存元を起動するタイミング</th><th>向いている依存先</th></tr></thead>
+            <tbody>
+              <tr><td><code>service_started</code></td><td>依存先コンテナが running になった時点（短縮形 <code>- db</code> と同じ）</td><td>起動直後から使える／自前でリトライするもの</td></tr>
+              <tr><td><code>service_healthy</code></td><td>依存先の healthcheck が <code>healthy</code> になった時点。<code>unhealthy</code> や終了なら <code>up</code> 自体がエラー</td><td>DB・メッセージブローカーなど初期化に時間がかかるもの</td></tr>
+              <tr><td><code>service_completed_successfully</code></td><td>依存先が<b>終了コード 0 で終わった</b>時点</td><td>マイグレーション・初期データ投入などの一回きりのジョブ</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="tbl">
+          <table class="ref">
+            <thead><tr><th>healthcheck のキー</th><th>意味</th><th>この例の値</th></tr></thead>
+            <tbody>
+              <tr><td><code>test</code></td><td>コンテナ内で実行するコマンド。<code>CMD</code> は exec 形式、<code>CMD-SHELL</code> は <code>/bin/sh -c</code> 経由。終了コード 0 = 成功、それ以外 = 失敗（<code>pg_isready</code> の「応答なし」は 2）</td><td><code>pg_isready -h 127.0.0.1 …</code></td></tr>
+              <tr><td><code>interval</code></td><td>チェックの間隔</td><td><code>5s</code></td></tr>
+              <tr><td><code>timeout</code></td><td>1 回のチェックの制限時間。超えたら失敗扱い</td><td><code>3s</code></td></tr>
+              <tr><td><code>retries</code></td><td>連続でこの回数失敗したら <code>unhealthy</code></td><td><code>5</code></td></tr>
+              <tr><td><code>start_period</code></td><td>起動直後の猶予。この間の失敗は <code>retries</code> に数えない（成功すれば即 <code>healthy</code>）</td><td><code>10s</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="note tip"><b>なぜ <code>-h 127.0.0.1</code> を付けるのか：</b>公式 postgres イメージは初回起動時、<code>initdb</code> の後に<b>Unix ソケットだけで待ち受ける一時サーバー</b>を立ててユーザーや DB を作り、いったん停止してから本番のサーバーを起動します。<code>pg_isready</code> を <code>-h</code> なし（Unix ソケット）で実行すると、この一時サーバーに対して <code>accepting connections</code> を返してしまうことがあります。TCP で確認すれば、他のコンテナから実際に接続できる状態になってから <code>healthy</code> になります。なお <code>pg_isready</code> は認証を行わないので、ユーザー名が違っても「受け付け中」かどうかは判定できます。</div>
+      </section>
+
+      <!-- 5. 設定の解決 -->
+      <section class="chapter" id="config">
+        <h2>設定の解決：.env・env_file・override・config</h2>
+        <p>Compose は YAML をそのまま Engine に渡すのではなく、<b>読み込み → 変数展開（interpolate）→ 複数ファイルのマージ → 正規化</b>を経た「最終形」を作ってから API を呼びます。<code>docker compose config</code> はその最終形を表示するコマンドで、「思った値になっていない」ときに最初に見るべきものです。</p>
+
+        <div class="scene" id="sc-config" data-title=".env・override・env_file が最終形になるまで">
+          <div class="stage" data-w="960" data-h="540">
+            <div class="file" data-el="env" style="left:20px;top:20px;width:220px">
+              <div class="file-h">.env（展開用）</div>
+              <pre data-lang="ini">POSTGRES_PASSWORD=devpass
+APP_PORT=8080</pre>
+            </div>
+            <div class="file" data-el="apienv" style="left:256px;top:20px;width:254px">
+              <div class="file-h">api/api.env（env_file）</div>
+              <pre data-lang="ini">LOG_LEVEL=info
+PORT=3000</pre>
+            </div>
+            <div class="file" data-el="base" style="left:20px;top:112px;width:490px">
+              <div class="file-h">compose.yaml（抜粋）</div>
+              <pre data-lang="yaml">services:
+  web:
+    ports: ["${APP_PORT:-8080}:80"]
+  api:
+    env_file: [./api/api.env]
+    environment:
+      DATABASE_URL: postgres://app:${POSTGRES_PASSWORD}@db:5432/app
+      NODE_ENV: production</pre>
+            </div>
+            <div class="file" data-el="ovr" style="left:20px;top:312px;width:490px">
+              <div class="file-h">compose.override.yaml</div>
+              <pre data-lang="yaml">services:
+  api:
+    environment:
+      NODE_ENV: development
+    command: ["node", "--watch", "src/server.js"]
+    volumes: ["./api/src:/app/src"]
+  db:
+    ports: ["127.0.0.1:5432:5432"]</pre>
+            </div>
+
+            <div class="node" data-el="proc" style="left:530px;top:20px;width:410px">
+              <div class="node-h"><i data-icon="gear"></i><b class="node-t">docker compose（compose-go）</b></div>
+              <div class="node-s">load → <span data-el="p1">interpolate</span> → <span data-el="p2">merge</span> → <span data-el="p3">normalize</span></div>
+            </div>
+            <div class="file hide" data-el="out" style="left:530px;top:94px;width:410px">
+              <div class="file-h">docker compose config（抜粋）</div>
+              <pre data-lang="yaml">name: myapp
+services:
+  api:
+    …</pre>
+            </div>
+            <div class="term" data-el="t" style="left:530px;top:410px;width:410px;height:120px">
+              <div class="term-h">alice@host:~/myapp</div>
+              <div class="term-b" data-el="ctb"></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="tbl">
+          <table class="ref">
+            <thead><tr><th>ファイル / 指定</th><th>誰が読むか</th><th>何に効くか</th></tr></thead>
+            <tbody>
+              <tr><td><code>.env</code></td><td>Compose（プロジェクトディレクトリのもの）</td><td>compose.yaml 内の <code>${VAR}</code> の展開。<b>コンテナには渡らない</b></td></tr>
+              <tr><td><code>--env-file ./prod.env</code></td><td>Compose</td><td>展開に使う変数ファイルを指定（シェルの環境変数 ＞ <code>--env-file</code> ＞ <code>.env</code>）</td></tr>
+              <tr><td><code>env_file:</code></td><td>Compose → コンテナ</td><td>コンテナの環境変数。compose.yaml の展開には使われない</td></tr>
+              <tr><td><code>environment:</code></td><td>Compose → コンテナ</td><td>コンテナの環境変数。<code>env_file</code> と同じキーならこちらが優先</td></tr>
+              <tr><td>シェルの環境変数</td><td>Compose</td><td>展開で最優先（<code>POSTGRES_PASSWORD=x docker compose up</code>）</td></tr>
+              <tr><td>イメージの <code>ENV</code></td><td>Engine</td><td>上のどれにも無いときの既定値</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="tbl">
+          <table class="ref">
+            <thead><tr><th>展開の書式</th><th>意味</th><th>例</th></tr></thead>
+            <tbody>
+              <tr><td><code>${VAR}</code> / <code>$VAR</code></td><td>値に置き換え。未定義なら空文字＋警告 <code>WARN[0000] The "VAR" variable is not set. Defaulting to a blank string.</code></td><td><code>${POSTGRES_PASSWORD}</code></td></tr>
+              <tr><td><code>${VAR:-default}</code></td><td>未定義または空なら <code>default</code>（<code>${VAR-default}</code> は未定義のときだけ）</td><td><code>${APP_PORT:-8080}</code></td></tr>
+              <tr><td><code>${VAR:?message}</code></td><td>未定義または空ならエラーで停止（<code>${VAR?message}</code> は未定義のときだけ）</td><td><code>${POSTGRES_PASSWORD:?set …}</code></td></tr>
+              <tr><td><code>${VAR:+replacement}</code></td><td>定義されていて空でなければ <code>replacement</code></td><td><code>${DEBUG:+--inspect}</code></td></tr>
+              <tr><td><code>$$</code></td><td>リテラルの <code>$</code>。展開をコンテナ側のシェルに任せたいときに使う</td><td><code>pg_isready -U $${POSTGRES_USER}</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="tbl">
+          <table class="ref">
+            <thead><tr><th>マージ規則（compose.yaml ← compose.override.yaml）</th><th>対象キー</th><th>この例での結果</th></tr></thead>
+            <tbody>
+              <tr><td>置き換え</td><td><code>image</code>, <code>command</code>, <code>mem_limit</code> など単一値</td><td><code>command</code> が <code>node --watch src/server.js</code> に</td></tr>
+              <tr><td>連結（両方残る）</td><td><code>ports</code>, <code>expose</code>, <code>external_links</code>, <code>dns</code>, <code>dns_search</code>, <code>tmpfs</code></td><td>db に <code>127.0.0.1:5432:5432</code> が追加</td></tr>
+              <tr><td>キーで統合（後勝ち）</td><td><code>environment</code>, <code>labels</code>（変数名）/ <code>volumes</code>, <code>devices</code>（コンテナ側パス）</td><td><code>NODE_ENV</code> だけ <code>development</code> に。<code>DATABASE_URL</code> は残る</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- 6. ボリューム -->
+      <section class="chapter" id="volumes">
+        <h2>ボリューム：名前付きボリュームとバインドマウント</h2>
+        <p><code>volumes:</code> の左辺が<b>名前</b>（<code>dbdata</code>）なら Docker が管理する名前付きボリューム、<b>パス</b>（<code>./web/nginx.conf</code>）ならホストのファイルをそのまま見せるバインドマウントです。名前付きボリュームの実体は Linux ホストでは <code>/var/lib/docker/volumes/&lt;project&gt;_&lt;name&gt;/_data</code> にあり、<code>docker compose down</code> では消えず、<code>down -v</code> で消えます。</p>
+
+        <div class="scene" id="sc-vol" data-title="データはどこにあり、いつ消えるか">
+          <div class="stage" data-w="960" data-h="540">
+            <div class="zone" data-el="hostz" data-label="host (Linux)" style="left:20px;top:24px;width:430px;height:340px"></div>
+            <div class="node" data-el="volnode" style="left:36px;top:48px;width:398px">
+              <div class="node-h"><i data-icon="folder"></i><b class="node-t">volume myapp_dbdata</b></div>
+              <div class="node-s">/var/lib/docker/volumes/myapp_dbdata/_data</div>
+            </div>
+            <div class="file" data-el="vtree" style="left:36px;top:124px;width:398px">
+              <div class="file-h">sudo ls /var/lib/docker/volumes/myapp_dbdata/_data</div>
+              <pre data-lang="tree">_data/
+├── PG_VERSION        # 16
+├── base/             # データベース本体
+├── global/
+├── pg_wal/           # WAL（先行書き込みログ）
+└── postgresql.conf</pre>
+            </div>
+            <div class="node" data-el="bindsrc" style="left:36px;top:286px;width:398px">
+              <div class="node-h"><i data-icon="file"></i><b class="node-t">./web/nginx.conf</b></div>
+              <div class="node-s">/home/alice/myapp/web/nginx.conf</div>
+            </div>
+
+            <div class="zone" data-el="ctrz" data-label="containers" style="left:510px;top:24px;width:430px;height:340px"></div>
+            <div class="node" data-el="cdb" style="left:526px;top:48px;width:398px">
+              <div class="node-h"><i data-icon="db"></i><b class="node-t">myapp-db-1</b></div>
+              <div class="node-s">/var/lib/postgresql/data ← volume</div>
+            </div>
+            <div class="chip hide" data-el="rows" style="left:526px;top:130px">orders: 3 rows</div>
+            <div class="chip hide" data-el="staging" style="left:526px;top:172px">staging-db-1 → staging_dbdata（別物）</div>
+            <div class="node" data-el="cweb" style="left:526px;top:286px;width:398px">
+              <div class="node-h"><i data-icon="globe"></i><b class="node-t">myapp-web-1</b></div>
+              <div class="node-s">/etc/nginx/conf.d/default.conf ← bind (ro)</div>
+            </div>
+
+            <div class="term" data-el="t" style="left:20px;top:380px;width:920px;height:148px">
+              <div class="term-h">alice@host:~/myapp</div>
+              <div class="term-b" data-el="vtb"></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="tbl">
+          <table class="ref">
+            <thead><tr><th></th><th>名前付きボリューム</th><th>バインドマウント</th></tr></thead>
+            <tbody>
+              <tr><td>書き方</td><td><code>dbdata:/var/lib/postgresql/data</code> ＋ トップレベル <code>volumes: { dbdata: }</code></td><td><code>./web/nginx.conf:/etc/nginx/conf.d/default.conf:ro</code></td></tr>
+              <tr><td>実体</td><td><code>/var/lib/docker/volumes/myapp_dbdata/_data</code>（Docker Desktop では VM の中）</td><td>ホストの <code>/home/alice/myapp/web/nginx.conf</code> そのもの</td></tr>
+              <tr><td><code>docker inspect</code> の <code>Mounts[].Type</code></td><td><code>"volume"</code></td><td><code>"bind"</code></td></tr>
+              <tr><td>初回マウント時</td><td>空のボリュームならイメージ内の同じパスの中身がコピーされる</td><td>ホスト側の内容でコンテナ内のパスが<b>覆い隠される</b></td></tr>
+              <tr><td>向いている用途</td><td>DB データなど、コンテナより長生きさせたいデータ</td><td>設定ファイル、開発中のソースコード</td></tr>
+              <tr><td><code>docker compose down</code></td><td>残る</td><td>残る（ホストのファイル）</td></tr>
+              <tr><td><code>docker compose down -v</code></td><td><b>削除される</b>（<code>external: true</code> は除く）</td><td>残る</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- 7. 失敗ケース -->
+      <section class="chapter" id="failures">
+        <h2>失敗ケース：localhost の罠と起動競合</h2>
+        <p>Compose でいちばん多い事故は「ホストでは <code>localhost:5432</code> で繋がったのに、api コンテナからは繋がらない」です。各コンテナは<b>別々の network namespace</b> を持ち、<code>lo</code>（127.0.0.1）もコンテナごとに別物です。api コンテナの <code>localhost</code> は api コンテナ自身を指し、そこでは誰も 5432 番を待ち受けていません。</p>
+
+        <div class="scene" id="sc-fail" data-title="localhost は自分自身、depends_on は起動しか待たない">
+          <div class="stage" data-w="960" data-h="520">
+            <div class="zone" data-el="nsapi" data-label="api の network namespace" style="left:20px;top:24px;width:440px;height:206px"></div>
+            <div class="node" data-el="papi" style="left:36px;top:48px;width:408px">
+              <div class="node-h"><i data-icon="server"></i><b class="node-t">node src/server.js</b></div>
+              <div class="node-s" data-el="papis">DATABASE_URL=postgres://app:…@localhost:5432/app</div>
+            </div>
+            <div class="chip" data-el="loapi" style="left:36px;top:134px">lo 127.0.0.1</div>
+            <div class="chip" data-el="ethapi" style="left:323px;top:134px">eth0 172.18.0.3</div>
+            <div class="chip c-gray" data-el="lsapi" style="left:36px;top:178px">listen :3000</div>
+
+            <div class="zone" data-el="nsdb" data-label="db の network namespace" style="left:500px;top:24px;width:440px;height:206px"></div>
+            <div class="node" data-el="pdb" style="left:516px;top:48px;width:408px">
+              <div class="node-h"><i data-icon="db"></i><b class="node-t">postgres</b></div>
+              <div class="node-s" data-el="pdbs">listen_addresses='*' · port 5432</div>
+            </div>
+            <div class="chip" data-el="lodb" style="left:820px;top:134px">lo 127.0.0.1</div>
+            <div class="chip" data-el="ethdb" style="left:516px;top:134px">eth0 172.18.0.2</div>
+            <div class="chip c-gray" data-el="lsdb" style="left:516px;top:178px">listen 0.0.0.0:5432</div>
+
+            <div class="term" data-el="t" style="left:20px;top:248px;width:530px;height:256px">
+              <div class="term-h">docker compose logs -f</div>
+              <div class="term-b" data-el="ftb"></div>
+            </div>
+            <div class="file" data-el="fix" style="left:564px;top:248px;width:376px">
+              <div class="file-h">compose.yaml（api）</div>
+              <pre data-lang="yaml">environment:
+  DATABASE_URL: postgres://app:…@⟪localhost⟫:5432/app</pre>
+            </div>
+          </div>
+        </div>
+
+        <div class="tbl">
+          <table class="ref">
+            <thead><tr><th>メッセージ</th><th>どこで出るか</th><th>原因</th><th>対処</th></tr></thead>
+            <tbody>
+              <tr><td><code>db connect failed (ECONNREFUSED) localhost:5432</code>（Node.js の <code>ECONNREFUSED</code>、libpq 系なら <code>Connection refused</code>）</td><td>api のログ</td><td>コンテナ内の <code>localhost</code> は自分自身</td><td>ホスト名をサービス名 <code>db</code> にする</td></tr>
+              <tr><td><code>db connect failed (ECONNREFUSED) db:5432</code> → <code>api-1 exited with code 1</code></td><td>api のログ（初回起動時）</td><td>短縮形 <code>depends_on</code> のため、db の初期化中（一時サーバーは Unix ソケットのみ）に接続した</td><td><code>condition: service_healthy</code> ＋ <code>healthcheck</code>。アプリ側にもリトライを</td></tr>
+              <tr><td><code>dependency failed to start: container myapp-db-1 is unhealthy</code></td><td><code>docker compose up</code></td><td>healthcheck が <code>retries</code> 回連続で失敗（コマンドの誤り、<code>start_period</code> 不足など）</td><td><code>docker inspect --format '{{json .State.Health}}' myapp-db-1</code> で <code>Output</code> を読む</td></tr>
+              <tr><td><code>container myapp-db-1 has no healthcheck configured</code></td><td><code>docker compose up</code></td><td><code>service_healthy</code> を指定したのに依存先に healthcheck が無い</td><td>依存先に <code>healthcheck</code> を書く（イメージの <code>HEALTHCHECK</code> でも可）</td></tr>
+              <tr><td><code>dependency failed to start: container myapp-db-1 exited (1)</code></td><td><code>docker compose up</code></td><td>依存先が起動直後に終了した</td><td><code>docker compose logs db</code></td></tr>
+              <tr><td><code>required variable POSTGRES_PASSWORD is missing a value: …</code></td><td><code>docker compose up</code> / <code>config</code></td><td><code>${VAR:?…}</code> の変数が未定義</td><td><code>.env</code> かシェルの環境変数で与える</td></tr>
+              <tr><td><code>Bind for 0.0.0.0:8080 failed: port is already allocated</code></td><td><code>docker compose up</code></td><td>ホストの 8080 番を別プロセス／別プロジェクトが使用中</td><td><code>APP_PORT=8081 docker compose up -d</code> など</td></tr>
+              <tr><td><code>host not found in upstream "api:3000"</code></td><td>nginx（web）のログ</td><td>nginx の起動時に <code>api</code> が名前解決できない（別ネットワーク、サービス名の誤りなど）</td><td>同じネットワークに置く／<code>depends_on: [api]</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- 8. CLI -->
+      <section class="chapter" id="cli">
+        <h2>CLI 早見表</h2>
+        <div class="tbl">
+          <table class="ref">
+            <thead><tr><th>コマンド</th><th>主なフラグ</th><th>何が起きるか</th></tr></thead>
+            <tbody>
+              <tr><td><code>docker compose up</code></td><td><code>-d</code> バックグラウンド, <code>--build</code> 先にビルド, <code>--wait</code> running/healthy まで待つ（<code>-d</code> を含む）, <code>--force-recreate</code>, <code>--remove-orphans</code>, <code>--scale api=2</code></td><td>ネットワーク・ボリューム・コンテナを作成して起動。設定やイメージが変わったサービスだけ作り直す（ボリュームは引き継ぐ）</td></tr>
+              <tr><td><code>docker compose down</code></td><td><code>-v</code> 名前付き/匿名ボリュームも削除, <code>--rmi local|all</code>, <code>--remove-orphans</code>, <code>-t 30</code></td><td>コンテナと <code>default</code> などのネットワークを削除。ボリュームは <code>-v</code> なしでは残る</td></tr>
+              <tr><td><code>docker compose ps</code></td><td><code>-a</code> 停止中も, <code>--format json</code>, <code>--format 'table {{.Name}}\t{{.Status}}'</code></td><td>このプロジェクトのコンテナ一覧（ラベルで検索）。STATUS に <code>(healthy)</code> などが出る</td></tr>
+              <tr><td><code>docker compose logs</code></td><td><code>-f</code> 追従, <code>--tail 100</code>, <code>-t</code> 時刻, サービス名で絞り込み</td><td><code>api-1  | …</code> のようにサービス名付きで各コンテナの stdout/stderr を表示</td></tr>
+              <tr><td><code>docker compose exec</code></td><td><code>-T</code> TTY なし, <code>-u</code> ユーザー, <code>-e</code> 環境変数</td><td>起動中のコンテナで追加のプロセスを実行（<code>exec api sh</code>）</td></tr>
+              <tr><td><code>docker compose run --rm</code></td><td><code>--rm</code> 終了後に削除, <code>--no-deps</code>, <code>-e</code>, <code>--service-ports</code></td><td>サービス定義から one-off コンテナを新規作成して実行（<code>run --rm api node -v</code>）。<code>ports</code> は既定で公開しない</td></tr>
+              <tr><td><code>docker compose build</code></td><td><code>--no-cache</code>, <code>--pull</code>, サービス名</td><td><code>build:</code> のあるサービスのイメージをビルド</td></tr>
+              <tr><td><code>docker compose pull</code></td><td><code>--ignore-buildable</code>, <code>-q</code></td><td><code>image:</code> のイメージを取得</td></tr>
+              <tr><td><code>docker compose config</code></td><td><code>--services</code>, <code>--images</code>, <code>--volumes</code>, <code>--format json</code>, <code>-q</code> 検証のみ, <code>--no-interpolate</code></td><td>展開・マージ・正規化後の最終形を表示</td></tr>
+              <tr><td><code>docker compose restart</code> / <code>stop</code> / <code>start</code></td><td><code>-t</code> 停止待ち秒数</td><td>既存コンテナの再起動・停止・起動。<b>設定変更は反映されない</b>（反映は <code>up</code>）</td></tr>
+              <tr><td><code>-f FILE</code></td><td>複数指定可（左から順にマージ）／ <code>COMPOSE_FILE</code></td><td>使うファイルを明示。指定すると <code>compose.override.yaml</code> は自動では読まれない</td></tr>
+              <tr><td><code>-p NAME</code></td><td><code>--project-name</code> ／ <code>COMPOSE_PROJECT_NAME</code></td><td>プロジェクト名を上書き。リソース名の接頭辞が変わる</td></tr>
+              <tr><td><code>--profile NAME</code></td><td>複数指定可 ／ <code>COMPOSE_PROFILES</code></td><td><code>profiles:</code> 付きのサービスを有効にする</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- 9. v1/v2 -->
+      <section class="chapter" id="versions">
+        <h2>Compose v1 と v2（以降）の違い、version: キー</h2>
+        <div class="tbl">
+          <table class="ref">
+            <thead><tr><th></th><th>Compose v1（非推奨・更新終了）</th><th>Compose v2 以降（現行）</th></tr></thead>
+            <tbody>
+              <tr><td>コマンド</td><td><code>docker-compose</code>（独立したバイナリ）</td><td><code>docker compose</code>（Docker CLI プラグイン）</td></tr>
+              <tr><td>実装</td><td>Python</td><td>Go（<code>compose-go</code> で Compose Specification を解釈）</td></tr>
+              <tr><td>コンテナ名</td><td><code>myapp_db_1</code>（アンダースコア）</td><td><code>myapp-db-1</code>（ハイフン。DNS ホスト名として有効）。<code>--compatibility</code> で v1 形式</td></tr>
+              <tr><td>既定のファイル名</td><td><code>docker-compose.yml</code></td><td><code>compose.yaml</code> を優先（<code>docker-compose.yml</code> も読める）</td></tr>
+              <tr><td>保守状況</td><td>2023 年 7 月に更新終了、Docker Desktop からも除外</td><td>v2.x の次は <b>v5.0.0</b>（2025 年 12 月）。旧ファイル形式の番号 2.x / 3.x と紛らわしいため 3・4 を欠番にした</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>ファイル先頭の <code>version: "3.8"</code> のような行は、旧ファイル形式の名残です。現在の Compose Specification では情報的な意味しかなく、書くと次の警告が出るだけなので<b>削除します</b>。</p>
+        <pre data-lang="bash" data-title="version: を書いたときの警告">$ docker compose up -d
+WARN[0000] /home/alice/myapp/compose.yaml: the attribute `version` is obsolete, it will be ignored, please remove it to avoid potential confusion</pre>
+        <p>進捗表示の書式もバージョンで変わります。v2.2x 系は見出しが <code>[+] Running 5/5</code>、ボリューム行が <code>Volume "myapp_dbdata"</code>（引用符付き）でした。v5 系は <code>[+] up 5/5</code>、<code>Volume myapp_dbdata</code> です。このページの出力例は v5 系の書式に合わせています。</p>
+      </section>
+
+      <!-- 10. 手元で試す -->
+      <section class="chapter" id="try">
+        <h2>手元で試す</h2>
+        <p>Docker Engine と Compose プラグインが入った Linux（または Docker Desktop）で、空のディレクトリにコピペすれば再現できます。<code>/var/lib/docker</code> を直接見る手順は Linux ホスト専用です。</p>
+        <pre data-lang="bash" data-title="1. ファイルを作る">mkdir -p myapp/api/src myapp/web/public &amp;&amp; cd myapp
+
+cat &gt; .env &lt;&lt;'EOF'
+POSTGRES_PASSWORD=devpass
+APP_PORT=8080
+EOF
+
+printf 'LOG_LEVEL=info\nPORT=3000\n' &gt; api/api.env
+printf '&lt;h1&gt;myapp&lt;/h1&gt;\n' &gt; web/public/index.html
+
+cat &gt; api/Dockerfile &lt;&lt;'EOF'
+FROM node:22-slim
+WORKDIR /app
+COPY src ./src
+EXPOSE 3000
+CMD ["node", "src/server.js"]
+EOF
+
+cat &gt; web/nginx.conf &lt;&lt;'EOF'
+server {
+    listen 80;
+    server_tokens off;
+    location /api/ { proxy_pass http://api:3000/; }
+    location / { root /usr/share/nginx/html; index index.html; }
+}
+EOF
+
+# compose.yaml / compose.override.yaml / api/src/server.js は
+# 上の「compose.yaml と周辺ファイルの実物」の内容をそのまま保存する</pre>
+        <pre data-lang="bash" data-title="2. 起動して中身を見る">docker compose config                     # 最終形（.env と override が反映済み）
+docker compose up -d --wait               # db が healthy、他が running になるまで待つ
+docker compose ps
+curl -s http://localhost:8080/api/health  # {"status":"ok","db":"up","env":"development"}
+
+docker network ls --filter label=com.docker.compose.project=myapp
+docker volume inspect myapp_dbdata --format '{{ .Mountpoint }}'
+docker inspect myapp-db-1 --format '{{json .Config.Labels}}'
+docker inspect myapp-db-1 --format '{{json .State.Health}}'
+
+docker compose exec api cat /etc/resolv.conf   # nameserver 127.0.0.11
+docker compose exec api getent hosts db        # 172.18.0.x      db</pre>
+        <pre data-lang="bash" data-title="3. 失敗させてみる">docker compose exec db pg_isready -h localhost     # localhost:5432 - accepting connections（db の中では OK）
+
+# api の接続先を localhost にしてみる
+sed -i 's/@db:5432/@localhost:5432/' compose.yaml
+docker compose up -d api
+docker compose logs api                            # db connect failed (ECONNREFUSED) localhost:5432
+sed -i 's/@localhost:5432/@db:5432/' compose.yaml &amp;&amp; docker compose up -d api   # 元に戻す
+
+# データの寿命
+docker compose exec db psql -U app -c "CREATE TABLE orders(id int); INSERT INTO orders VALUES (1),(2),(3);"
+docker compose down &amp;&amp; docker compose up -d --wait
+docker compose exec db psql -U app -tAc "SELECT count(*) FROM orders"   # 3（残っている）
+docker compose down -v &amp;&amp; docker compose up -d --wait
+docker compose exec db psql -U app -tAc "SELECT count(*) FROM orders"   # ERROR:  relation "orders" does not exist</pre>
+      </section>
+
+      <!-- 11. ハマりどころ -->
+      <section class="chapter" id="pitfalls">
+        <h2>ハマりどころ</h2>
+        <div class="note warn">
+          <ul>
+            <li><b>コンテナ内の <code>localhost</code> はそのコンテナ自身。</b>他サービスへは <code>db:5432</code> のようにサービス名＋<b>コンテナ側</b>ポートで接続します（<code>ports</code> の左側の番号ではありません）。</li>
+            <li><b><code>depends_on: [db]</code> は「起動した」しか待ちません。</b>DB の準備完了を待つには <code>condition: service_healthy</code> と <code>healthcheck</code>。それでもアプリ側の再接続処理はあった方が安全です（DB の再起動時などに備えて）。</li>
+            <li><b><code>.env</code> はコンテナに渡りません。</b>compose.yaml の <code>${...}</code> 展開用です。渡したい値は <code>environment</code> で参照するか <code>env_file</code> を使います。また <code>.env</code> はプロジェクトディレクトリ（通常 compose.yaml の場所）から読まれます。</li>
+            <li><b><code>$</code> は Compose が先に展開します。</b>コンテナ内のシェルに展開させたい <code>$VAR</code> は <code>$$VAR</code> と書きます（healthcheck の <code>$${POSTGRES_USER}</code> がその例）。パスワードに <code>$</code> を含む場合も同様です。</li>
+            <li><b><code>down -v</code> は DB のデータを消します。</b>また <code>-p</code> やディレクトリ名が変わるとボリューム名も変わり（<code>staging_dbdata</code> など）、「データが消えた」ように見えます。守りたいボリュームは <code>external: true</code> にする手もあります。</li>
+            <li><b><code>ports: "5432:5432"</code> はホストの全インターフェースで公開されます。</b>開発用 DB は <code>"127.0.0.1:5432:5432"</code> に。Docker が追加する iptables ルールは ufw などホスト側のファイアウォール設定より先に評価されることがあります。</li>
+            <li><b>ポート指定は引用符で文字列に。</b>YAML 1.1 のパーサでは <code>xx:yy</code> 形式の数値が 60 進数として解釈されることがあるためです（<code>"8080:80"</code>）。</li>
+            <li><b>nginx は起動時に <code>proxy_pass</code> のホスト名を解決して保持します。</b>api を作り直して IP が変わると 502 になることがあります。<code>resolver 127.0.0.11 valid=10s;</code> と変数を使った <code>proxy_pass</code> で都度解決させるか、web を再起動します。</li>
+            <li><b><code>docker compose down</code> が 10 秒かかるのは、PID 1 のプロセスが SIGTERM を処理していないから</b>です。アプリで SIGTERM を処理するか、サービスに <code>init: true</code> を付けます。</li>
+            <li><b><code>-f</code> を付けると <code>compose.override.yaml</code> は自動で読まれません。</b>本番用に <code>-f compose.yaml -f compose.prod.yaml</code> とするのはこの性質を利用したものです。</li>
+            <li><b><code>restart</code> / <code>stop</code> / <code>start</code> は設定変更を反映しません。</b>compose.yaml や <code>.env</code> を変えたら <code>docker compose up -d</code>（変わったサービスだけ作り直されます）。</li>
+            <li><b>PostgreSQL 18 以降の公式イメージはデータの置き場所が変わりました。</b><code>PGDATA</code> が <code>/var/lib/postgresql/18/docker</code> になり、ボリュームは <code>/var/lib/postgresql</code> にマウントする前提です。このページの例（16）のパスをそのまま 18 に使わないでください。</li>
+            <li><b>Docker Desktop（macOS / Windows）では <code>/var/lib/docker/volumes</code> はホスト OS 上にありません。</b>Linux VM の中にあるため、<code>ls</code> で見るならコンテナ経由（<code>docker run --rm -v myapp_dbdata:/v alpine ls /v</code>）が確実です。</li>
+          </ul>
+        </div>
+      </section>
+
+      <!-- 12. 仕様・参考 -->
+      <section class="chapter" id="spec">
+        <h2>仕様・参考</h2>
+        <ul>
+          <li><a href="https://github.com/compose-spec/compose-spec/blob/main/spec.md" target="_blank" rel="noopener">Compose Specification（compose-spec/compose-spec）</a></li>
+          <li><a href="https://docs.docker.com/reference/compose-file/" target="_blank" rel="noopener">Docker Docs — Compose file reference</a>（<a href="https://docs.docker.com/reference/compose-file/services/" target="_blank" rel="noopener">services</a> / <a href="https://docs.docker.com/reference/compose-file/volumes/" target="_blank" rel="noopener">volumes</a> / <a href="https://docs.docker.com/reference/compose-file/interpolation/" target="_blank" rel="noopener">interpolation</a>）</li>
+          <li><a href="https://docs.docker.com/compose/how-tos/project-name/" target="_blank" rel="noopener">Docker Docs — Specify a project name</a>（優先順位と使える文字）</li>
+          <li><a href="https://docs.docker.com/compose/how-tos/networking/" target="_blank" rel="noopener">Docker Docs — Networking in Compose</a>（<code>&lt;project&gt;_default</code>、サービス名での到達）</li>
+          <li><a href="https://docs.docker.com/engine/network/#dns-services" target="_blank" rel="noopener">Docker Docs — Networking overview: DNS services</a>（組み込み DNS <code>127.0.0.11</code>）</li>
+          <li><a href="https://docs.docker.com/compose/how-tos/startup-order/" target="_blank" rel="noopener">Docker Docs — Control startup and shutdown order</a>（<code>depends_on</code> の condition）</li>
+          <li><a href="https://docs.docker.com/compose/how-tos/environment-variables/variable-interpolation/" target="_blank" rel="noopener">Docker Docs — Variable interpolation</a> / <a href="https://docs.docker.com/compose/how-tos/environment-variables/envvars-precedence/" target="_blank" rel="noopener">Environment variables precedence</a></li>
+          <li><a href="https://docs.docker.com/compose/how-tos/multiple-compose-files/merge/" target="_blank" rel="noopener">Docker Docs — Merge Compose files</a>（override のマージ規則）</li>
+          <li><a href="https://docs.docker.com/reference/cli/docker/compose/" target="_blank" rel="noopener">Docker Docs — docker compose CLI reference</a>（<a href="https://docs.docker.com/reference/cli/docker/compose/up/" target="_blank" rel="noopener">up</a> / <a href="https://docs.docker.com/reference/cli/docker/compose/down/" target="_blank" rel="noopener">down</a>）</li>
+          <li><a href="https://docs.docker.com/compose/releases/migrate/" target="_blank" rel="noopener">Docker Docs — Migrate to Compose v2</a>（v1 との違い）</li>
+          <li><a href="https://github.com/docker/compose/releases/tag/v5.0.0" target="_blank" rel="noopener">docker/compose v5.0.0 release notes</a>（v3・v4 を欠番にした理由）</li>
+          <li><a href="https://github.com/docker/compose/blob/main/pkg/api/labels.go" target="_blank" rel="noopener">docker/compose — pkg/api/labels.go</a>（<code>com.docker.compose.*</code> ラベルの定義）</li>
+          <li><a href="https://hub.docker.com/_/postgres" target="_blank" rel="noopener">Docker Hub — postgres 公式イメージ</a>（<code>POSTGRES_PASSWORD</code>、初期化スクリプト、<code>PGDATA</code>）</li>
+          <li><a href="https://www.postgresql.org/docs/current/app-pg-isready.html" target="_blank" rel="noopener">PostgreSQL Docs — pg_isready</a></li>
+        </ul>
+        <p>関連トピック：<a href="../docker/">Docker（イメージとコンテナの実体）</a> ／ <a href="../dns/">DNS 名前解決</a> ／ <a href="../webapi/">Web API (REST)</a></p>
+      </section>
+
+    </main>
+  </div>
+
+  <footer class="site-f"></footer>
+  <script src="../../assets/js/topics.js"></script>
+  <script src="../../assets/js/tim.js"></script>
+  <script src="scenes.js"></script>
+</body>
+</html>

@@ -547,7 +547,7 @@
             await s.show('chain', { fx: 'pop' });
             s.state('nginx', null);
             s.hide('tcp');
-            s.line('client:r', 'nginx:l', { cls: 'flow c-violet', label: '🔒 TLS 1.3', id: 'tls', arrow: false });
+            s.line('client:r', 'nginx:l', { cls: 'flow c-violet', label: '🔒', id: 'tls', arrow: false });
             await s.term('term', '* SSL connection using TLSv1.3 / TLS_AES_256_GCM_SHA384\n*  SSL certificate verify ok.');
           },
         },
@@ -582,7 +582,7 @@
             }` },
           run: async (s) => {
             s.state('nginx', null);
-            s.line('nginx:r', 'api:l', { cls: 'acc c-cyan', label: 'proxy_pass :8080' });
+            s.line('nginx:r', 'api:l', { cls: 'acc c-cyan', label: ':8080' });
             await s.fly('nginx:r', 'api:l', { label: 'GET /v1/users/42', cls: 'c-cyan' });
             s.state('api', 'active');
           },

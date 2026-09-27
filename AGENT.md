@@ -168,14 +168,14 @@ TIM.scene('#sc-flow', {
 | `s.type(sel, str, {cps, dur, append})` | タイプライター表示 |
 | `s.scramble(sel, final, {dur, chars})` | ランダム文字が確定値に収束（ハッシュ・署名・暗号文の演出） |
 | `s.count(sel, from, to, {dur, fmt})` | 数値カウント |
-| `s.term(sel, text, {clear})` | `.term` にターミナル出力。`$ ` で始まる行はタイプ入力、それ以外は出力行 |
+| `s.term(sel, text, {clear, raw, cls})` | `.term` にターミナル出力。`$ ` で始まる行はタイプ入力、それ以外は出力行。`raw` で dedent しない、`cls` で出力行にクラス（例 `c-red`） |
 | `s.fly(from, to, {label, cls, arc, dur, keep, id})` | パケット（ラベル付きチップ）を飛ばす。`keep:true` で到着後も残す |
 | `s.line(from, to, {cls, label, curve, elbow, arrow, both, id, dur})` | 接続線を描画（残る）。`cls`: `acc` `dash` `flow` `ok` `bad` `warn` |
 | `s.move(sel, {x, y, dx, dy, to})` | 要素を移動（`to` は目標要素の中心へ） |
 | `s.state(sel, st)` | `data-state` を設定：`ok` `bad` `warn` `active` `dim`（`null` で解除） |
 | `s.cls(sel, add, remove)` | クラス付け外し |
 | `s.pulse(sel)` / `s.shake(sel)` / `s.scan(sel)` | 注目リング／振動（エラー）／スキャン線（検証中） |
-| `s.stamp(sel, text, {cls})` | 判子（`st-ok` `st-bad` `st-warn` `st-acc`）。署名・検証結果の演出 |
+| `s.stamp(sel, text, {cls})` / `s.unstamp(sel)` | 判子（`st-ok` `st-bad` `st-warn` `st-acc`）。署名・検証結果の演出 / 判子を外す |
 | `s.caption(html, {cls, x, y})` | ステージ下部の字幕（強調メッセージ）。`''` で消す。`x`（中心）/`y`（上端）で位置指定可 |
 | `s.camera({scale, x, y, to, dur})` | カメラズーム／パン。引数なしで戻す |
 | `s.spawn(html, {x, y, into, fx})` | 要素を動的生成して返す（同期） |
@@ -220,7 +220,7 @@ TIM.scene('#sc-flow', {
 
 ## 10. 品質チェック（push 前に必ず）
 
-1. ブラウザでページを開き、**コンソールエラー 0**。さらにコンソールで `await TIM.audit()` を実行し、`OK` になること（全シーン全ステップを瞬時再生して、ステージ外へのはみ出し・要素内テキストのあふれ・ステップ例外を列挙する）。
+1. ブラウザでページを開き、**コンソールエラー 0**。さらにコンソールで `await TIM.audit()` を実行し、`OK` になること（全シーン全ステップを瞬時再生して、ステージ外へのはみ出し・要素内テキストのあふれ・要素同士や線ラベルとの重なり・ステップ例外を列挙する）。意図的に重ねる要素には `data-overlap-ok` を付ける。`zone` は入れ物なので重なり判定の対象外。
 2. すべてのシーンを最後のステップまで再生し、要素がはみ出したり重なったりしないこと。前へ／次へ／ドットジャンプでも崩れないこと。
 3. 幅 375px でもレイアウトが崩れないこと（ステージは縮小表示・全画面ボタンあり）。
 4. コマンド・フラグ・ヘッダ名・ファイルパスが実在すること（記憶に頼らず、不確かなら書かない）。

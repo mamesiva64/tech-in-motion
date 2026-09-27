@@ -1,0 +1,10 @@
+/* docker-compose page: small stage helpers */
+.stage .kv .on { color: var(--accent); font-weight: 700; }
+.stage .node-s span.on { color: var(--accent); font-weight: 700; }
+.stage .node-s span.done { color: var(--green); }
+.stage .term-b .tl.ok { color: var(--green); }
+.stage .term-b .tl.bad { color: var(--red); }
+.stage .term-b .tl.warn { color: var(--amber); }
+.stage .node-s span.bad { color: var(--red); font-weight: 700; text-decoration: line-through; }
+/* 実物の出力（-> など）を合字にしない */
+.doc code, .doc pre, .doc pre *, .stage, .stage * { font-variant-ligatures: none; font-feature-settings: "calt" 0, "liga" 0; }
