@@ -67,14 +67,14 @@ window.TIM_TOPICS = [
     sub: 'X.501 識別名(DN)・SAN・拡張・ASN.1/DER/PEM。証明書ファイルの中身を全部読む',
     cmds: ['openssl x509 -in server.crt -noout -text', 'openssl asn1parse -in server.crt', 'openssl x509 -in server.crt -noout -subject -issuer -dates'],
     tags: ['Subject DN', 'subjectAltName', 'keyUsage', 'DER', 'PEM'],
-    related: ['ca-pki', 'https-tls', 'ssh'], status: 'soon',
+    related: ['ca-pki', 'https-tls', 'ssh'], status: 'ready',
   },
   {
     id: 'ca-pki', cat: 'pki', title: 'CA と証明書チェーン',
     sub: 'CSR を誰が作り、CA がどこで署名し、ブラウザがどこで検証するか',
     cmds: ['openssl req -new -key server.key -out server.csr', 'openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key …', 'openssl verify -CAfile root.crt -untrusted inter.crt server.crt'],
     tags: ['CSR', 'Root CA', 'Intermediate', 'trust store', 'OCSP'],
-    related: ['x509', 'https-tls', 'dkim'], status: 'soon',
+    related: ['x509', 'https-tls', 'dkim'], status: 'ready',
   },
   {
     id: 'jwt', cat: 'auth', title: 'JWT',

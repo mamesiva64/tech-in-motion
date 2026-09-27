@@ -622,6 +622,8 @@ a.rel-a:hover { border-color: var(--accent); transform: translateY(-2px); box-sh
 .term-h::before { content: ""; width: 34px; height: 8px; flex: none; background: radial-gradient(circle at 4px 4px, #f87171 3px, transparent 3.5px), radial-gradient(circle at 17px 4px, #fbbf24 3px, transparent 3.5px), radial-gradient(circle at 30px 4px, #34d399 3px, transparent 3.5px); opacity: 0.75; }
 .term-b { flex: 1; min-height: 0; padding: 8px 12px; font: 11.5px/1.6 var(--mono); color: #c9d4ec; overflow: hidden; white-space: pre-wrap; word-break: break-all; border-radius: 0 0 9px 9px; }
 .file.tight pre { font-size: 10.5px; line-height: 1.45; }
+.term.tight .term-b { font-size: 10.5px; line-height: 1.5; }
+.label.raw { text-transform: none; letter-spacing: 0.04em; }
 .file.tight .file-h { font-size: 10px; padding: 4px 9px; }
 .tl.out { color: #97a5c4; }
 .typing::after { content: "▋"; color: var(--accent); animation: blink 0.9s steps(1) infinite; margin-left: 1px; }

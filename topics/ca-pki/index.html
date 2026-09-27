@@ -1,0 +1,664 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CA と証明書チェーン — Tech in Motion</title>
+  <meta name="description" content="秘密鍵と CSR はどこで作られ、CA はどこで何に署名し、クライアントはどの公開鍵で何を検証するのか。ACME・CT・チェーン検証・失効確認を openssl の実出力でたどります。">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Space+Grotesk:wght@500;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="../../assets/css/tim.css">
+  <link rel="stylesheet" href="page.css">
+</head>
+<body data-root="../../" data-topic="ca-pki">
+  <header class="site-h"></header>
+
+  <div class="page">
+    <aside class="toc"></aside>
+    <main class="doc">
+
+      <!-- 0. HERO -->
+      <section class="hero">
+        <p class="kicker">Crypto / PKI · Certificate Authority</p>
+        <h1>CA と証明書チェーン<small>どこで署名され、どこで検証されるか</small></h1>
+        <p class="lead">サーバーの秘密鍵はサーバーの中で生まれて一度も外に出ません。CA に渡るのは CSR だけで、CA は自分の HSM の中にある中間 CA の鍵で TBSCertificate に署名します。クライアントは受け取った「リーフ + 中間」を、手元のトラストストアにあるルートまでつないで、各段の署名を<b>発行者の公開鍵</b>で検証します。このページではその全行程を、実際に作ったミニ CA（OpenSSL 3.5）と ACME の実メッセージで追いかけます。</p>
+        <div class="facts">
+          <div class="fact"><span>秘密鍵のある場所</span><b>サーバー：<code>privkey.pem</code>／CA：HSM 内の中間 CA 鍵</b></div>
+          <div class="fact"><span>署名する場所</span><b>CA の HSM（中間 CA「E1」の鍵で TBS に署名）</b></div>
+          <div class="fact"><span>検証する場所</span><b>クライアント（<code>/etc/ssl/certs/ca-certificates.crt</code> 等のルートまで）</b></div>
+          <div class="fact"><span>仕様</span><b>RFC 5280 / 2986 / 8555 / 6960 / 6962、CA/B Forum BR</b></div>
+        </div>
+      </section>
+
+      <!-- 1. 全体像 -->
+      <section class="chapter" id="overview">
+        <h2>全体像：鍵・CSR・証明書はどこを流れるか</h2>
+        <p>4 つの場所（サーバー、CA、CT ログ、クライアント）を行き来するのは <b>公開情報だけ</b>です。秘密鍵は「サーバーの privkey.pem」と「CA の HSM」から動きません。</p>
+
+        <div class="scene" id="sc-overview" data-title="発行から検証まで：4 つの場所とデータの流れ">
+          <div class="stage" data-w="960" data-h="500">
+            <div class="zone" data-el="z-srv" data-label="www.example.com（サーバー運用者）" style="left:16px;top:24px;width:300px;height:252px"></div>
+            <div class="node" data-el="srv" style="left:30px;top:46px;width:272px">
+              <div class="node-h"><i data-icon="server"></i><b class="node-t">nginx + certbot</b></div>
+              <div class="node-s">203.0.113.10:443</div>
+            </div>
+            <div class="chip hide c-amber" data-el="k1" style="left:30px;top:130px"><i data-icon="key"></i>privkey.pem（秘密鍵）</div>
+            <div class="chip hide" data-el="k2" style="left:30px;top:166px"><i data-icon="file"></i>server.csr（CSR）</div>
+            <div class="chip hide c-green" data-el="k3" style="left:30px;top:202px"><i data-icon="cert"></i>fullchain.pem（leaf + E1）</div>
+
+            <div class="zone c-violet" data-el="z-ca" data-label="CA（Example Trust）" style="left:346px;top:24px;width:340px;height:252px"></div>
+            <div class="node" data-el="acme" style="left:362px;top:46px;width:308px">
+              <div class="node-h"><i data-icon="globe"></i><b class="node-t">ACME サーバー</b></div>
+              <div class="node-s">https://acme.ca.example.com/directory</div>
+            </div>
+            <div class="node sm" data-el="va" style="left:362px;top:128px;width:150px">
+              <div class="node-h"><i data-icon="search"></i><b class="node-t">検証（VA）</b></div>
+              <div class="node-s">HTTP-01 / DNS-01</div>
+            </div>
+            <div class="node sm c-amber" data-el="hsm" style="left:520px;top:128px;width:150px">
+              <div class="node-h"><i data-icon="lock"></i><b class="node-t">HSM</b></div>
+              <div class="node-s">E1 秘密鍵 P-384</div>
+            </div>
+            <div class="chip hide c-green" data-el="crt" style="left:362px;top:214px"><i data-icon="cert"></i>server.crt（E1 が署名）</div>
+
+            <div class="zone c-blue" data-el="z-ct" data-label="CT ログ（公開・追記のみ）" style="left:716px;top:24px;width:228px;height:252px"></div>
+            <div class="node sm" data-el="ct1" style="left:730px;top:46px;width:200px">
+              <div class="node-h"><i data-icon="layers"></i><b class="node-t">CT log A</b></div>
+              <div class="node-s">add-pre-chain → SCT</div>
+            </div>
+            <div class="node sm" data-el="ct2" style="left:730px;top:128px;width:200px">
+              <div class="node-h"><i data-icon="layers"></i><b class="node-t">CT log B</b></div>
+              <div class="node-s">add-pre-chain → SCT</div>
+            </div>
+            <div class="txt" data-el="ctx" style="left:730px;top:208px;width:200px">ログは公開されており、crt.sh などで誰でも発行履歴を検索できます。</div>
+
+            <div class="zone c-cyan" data-el="z-cl" data-label="クライアント（検証する側）" style="left:16px;top:300px;width:928px;height:180px"></div>
+            <div class="node" data-el="br" style="left:30px;top:324px;width:272px">
+              <div class="node-h"><i data-icon="browser"></i><b class="node-t">Browser / curl</b></div>
+              <div class="node-s">https://www.example.com/</div>
+            </div>
+            <div class="chip hide c-cyan" data-el="rcv" style="left:30px;top:420px">受信: [0] leaf, [1] E1</div>
+            <div class="file fs10 hide" data-el="ts" style="left:340px;top:318px;width:300px">
+              <div class="file-h">トラストストア</div>
+              <pre data-lang="tree">/etc/ssl/certs/ca-certificates.crt
+├ ISRG Root X1
+├ DigiCert Global Root G2
+├ …
+└ Example Root CA R1（デモ）</pre>
+            </div>
+            <div class="node hide" data-el="vf" style="left:670px;top:324px;width:260px">
+              <div class="node-h"><i data-icon="shieldok"></i><b class="node-t">検証</b></div>
+              <div class="node-s">パス構築 → 署名 → 期限 → SAN → 失効</div>
+            </div>
+          </div>
+        </div>
+
+        <h3>役割：鍵を持つ人・署名する場所・検証する場所</h3>
+        <div class="tbl">
+          <table class="ref">
+            <thead><tr><th>登場人物</th><th>持っている秘密鍵</th><th>やること</th><th>実物（ファイル・装置・URL）</th></tr></thead>
+            <tbody>
+              <tr><td>サーバー運用者</td><td><code>server.key</code>（EC P-256）</td><td>鍵生成、CSR 作成、証明書とチェーンの設置</td><td><code>/etc/letsencrypt/live/example.com/privkey.pem</code>、<code>fullchain.pem</code>、nginx の <code>ssl_certificate</code></td></tr>
+              <tr><td>ACME クライアント（certbot）</td><td>ACME アカウント鍵</td><td>注文、チャレンジ応答、CSR 提出（finalize）、証明書ダウンロード</td><td><code>/etc/letsencrypt/accounts/</code>、<code>/var/www/html/.well-known/acme-challenge/</code></td></tr>
+              <tr><td>発行 CA（中間 CA「E1」）</td><td>E1 の秘密鍵（HSM 内）</td><td>ドメイン検証、TBSCertificate の組み立てと署名、CT 提出、CRL / OCSP 応答の署名</td><td>HSM（BR §6.2.7：FIPS 140 Level 3 または CC EAL 4+）、<code>http://crl.ca.example.com/e1.crl</code></td></tr>
+              <tr><td>ルート CA「R1」</td><td>R1 の秘密鍵（通常はオフライン HSM）</td><td>中間 CA 証明書・CRL への署名だけ</td><td>自己署名の <code>root.crt</code> を OS・ブラウザのルートプログラムに収録</td></tr>
+              <tr><td>CT ログ</td><td>ログの署名鍵</td><td>プレ証明書を追記し、SCT（受領証）を返す</td><td><code>https://&lt;log&gt;/ct/v1/add-pre-chain</code></td></tr>
+              <tr><td>クライアント</td><td>なし（使うのは公開鍵だけ）</td><td>パス構築、署名検証、期限・制約・ホスト名・失効の確認</td><td><code>/etc/ssl/certs/ca-certificates.crt</code>、Windows 証明書ストア、Mozilla NSS、Chrome Root Store</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- 2. サーバー運用者側 -->
+      <section class="chapter" id="csr">
+        <h2>サーバー運用者側：秘密鍵と CSR</h2>
+        <p>CSR（Certificate Signing Request, PKCS #10 / RFC 2986）は「この公開鍵にこの名前で証明書をください」という申請書です。中身は <b>公開鍵 + subject + 要求する拡張</b>で、それを<b>申請者自身の秘密鍵で署名</b>してあります。この署名は「申請者がこの公開鍵に対応する秘密鍵を本当に持っている」ことの証明（proof of possession）で、CA は発行前に必ず検証します。</p>
+
+        <div class="scene" id="sc-csr" data-title="server.key と server.csr を作る（鍵はサーバーから出ない）">
+          <div class="stage" data-w="960" data-h="500">
+            <div class="term" data-el="tk" style="left:16px;top:16px;width:470px;height:250px">
+              <div class="term-h">bash — root@www:/etc/ssl/example</div>
+              <div class="term-b"></div>
+            </div>
+            <div class="file hide c-amber stampable" data-el="key" style="left:16px;top:282px;width:470px">
+              <div class="file-h">server.key（PKCS #8 · EC P-256 · 0600 · デモ用）</div>
+              <pre data-lang="pem">-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg…
+…（32 バイトの秘密スカラー d と公開鍵 Q）…
+caVfgIs4W4DjVTeCE4dJVQYGkSx6hqSCqLXT9sN+hxtjQSm137ChAH/x
+-----END PRIVATE KEY-----</pre>
+            </div>
+            <div class="chip hide" data-el="pub" style="left:16px;top:430px">公開鍵 Q = 04 14 03 e2 cb d2 14 8b … （65 バイト）</div>
+
+            <div class="zone hide" data-el="csr" data-label="server.csr — CertificationRequest（PKCS #10, DER 276 バイト）" style="left:510px;top:22px;width:434px;height:322px"></div>
+            <div class="zone hide c-amber" data-el="cri" data-label="certificationRequestInfo（署名対象）" style="left:522px;top:48px;width:410px;height:196px"></div>
+            <div class="asn hide" data-el="q-ver" style="left:534px;top:66px;width:386px"><b>version</b><span>INTEGER 0（v1）</span><code>02 01 00</code></div>
+            <div class="asn hide" data-el="q-sub" style="left:534px;top:106px;width:386px"><b>subject</b><span data-el="q-subv">CN=www.example.com</span><code>30 1a 31 18 …</code></div>
+            <div class="asn hide" data-el="q-spki" style="left:534px;top:146px;width:386px"><b>subjectPKInfo</b><span>EC P-256 公開鍵</span><code>30 59 30 13 …</code></div>
+            <div class="asn hide" data-el="q-attr" style="left:534px;top:186px;width:386px"><b>attributes [0]</b><span>extensionRequest</span><code>a0 3a 30 38 …</code></div>
+            <div class="asn hide" data-el="q-alg" style="left:522px;top:262px;width:410px"><b>signatureAlgorithm</b><span>ecdsa-with-SHA256</span><code>30 0a 06 08 …</code></div>
+            <div class="asn hide" data-el="q-sig" style="left:522px;top:302px;width:410px"><b>signature</b><span>server.key による署名</span><code>03 49 00 30 46 …</code></div>
+
+            <div class="node hide" data-el="ca" style="left:510px;top:372px;width:434px">
+              <div class="node-h"><i data-icon="shield"></i><b class="node-t">CA へ提出（ACME finalize）</b></div>
+              <div class="node-s">送るのは server.csr（公開鍵 + 名前 + 所持証明の署名）だけ</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="tbl">
+          <table class="ref">
+            <thead><tr><th>CSR のフィールド</th><th>ASN.1</th><th>server.csr の値</th><th>CA はどう扱うか</th></tr></thead>
+            <tbody>
+              <tr><td><code>version</code></td><td><code>INTEGER { v1(0) }</code></td><td>0</td><td>常に 0</td></tr>
+              <tr><td><code>subject</code></td><td><code>Name</code></td><td><code>CN=www.example.com</code></td><td>DV では参考程度。証明書の subject / SAN は CA が<b>検証済みの識別子</b>から決める</td></tr>
+              <tr><td><code>subjectPKInfo</code></td><td><code>SubjectPublicKeyInfo</code></td><td>id-ecPublicKey / P-256</td><td>そのまま証明書の SPKI にコピー（弱い鍵・既知の漏洩鍵は拒否）</td></tr>
+              <tr><td><code>attributes [0]</code></td><td><code>extensionRequest</code>（1.2.840.113549.1.9.14）</td><td><code>subjectAltName=DNS:www.example.com,DNS:example.com</code></td><td>要求にすぎない。公開 CA は自分のプロファイルで拡張を付け直す</td></tr>
+              <tr><td><code>signatureAlgorithm</code> / <code>signature</code></td><td><code>AlgorithmIdentifier</code> / <code>BIT STRING</code></td><td>ecdsa-with-SHA256（server.key で署名）</td><td>CSR 内の公開鍵で検証 → 鍵の所持証明（proof of possession）</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <pre data-lang="cert" data-title="$ openssl req -in server.csr -noout -text -verify">Certificate request self-signature verify OK
+Certificate Request:
+    Data:
+        Version: 1 (0x0)
+        Subject: CN=www.example.com
+        Subject Public Key Info:
+            Public Key Algorithm: id-ecPublicKey
+                Public-Key: (256 bit)
+                pub:
+                    04:14:03:e2:cb:d2:14:8b:fa:0b:bd:7f:f0:7f:e7:
+                    c8:76:2a:79:9f:60:1b:53:71:a5:5f:80:8b:38:5b:
+                    80:e3:55:37:82:13:87:49:55:06:06:91:2c:7a:86:
+                    a4:82:a8:b5:d3:f6:c3:7e:87:1b:63:41:29:b5:df:
+                    b0:a1:00:7f:f1
+                ASN1 OID: prime256v1
+                NIST CURVE: P-256
+        Attributes:
+            Requested Extensions:
+                X509v3 Subject Alternative Name:
+                    DNS:www.example.com, DNS:example.com
+    Signature Algorithm: ecdsa-with-SHA256
+    Signature Value:
+        30:46:02:21:00:d6:e7:6e:62:52:74:bd:f5:e7:ec:56:d2:cb:
+        5a:01:ef:16:1f:e3:b3:35:42:c6:2b:8c:6c:55:28:75:e9:94:
+        c7:02:21:00:98:05:83:c3:9b:8f:7c:b0:0c:8e:ab:19:4f:6d:
+        cd:53:f7:55:7b:d9:8b:c6:82:c5:bf:c5:d5:db:c5:49:98:b1</pre>
+      </section>
+
+      <!-- 3. CA 側 -->
+      <section class="chapter" id="ca">
+        <h2>CA 側：ドメイン検証 → 署名 → CT</h2>
+        <p>公開 CA（Let's Encrypt など）とのやり取りは ACME（RFC 8555）で自動化されています。certbot が注文を出し、CA が出したチャレンジ（トークン）を <b>そのドメインを支配していなければ置けない場所</b>に置き、CA が外から確認できたら CSR を受け付けて署名します。</p>
+
+        <div class="scene" id="sc-ca" data-title="ACME で注文・検証し、HSM で署名、CT に登録する">
+          <div class="stage" data-w="960" data-h="520">
+            <div class="zone" data-el="z1" data-label="www.example.com（certbot）" style="left:16px;top:24px;width:290px;height:480px"></div>
+            <div class="node" data-el="cb" style="left:30px;top:46px;width:262px">
+              <div class="node-h"><i data-icon="terminal"></i><b class="node-t">certbot</b></div>
+              <div class="node-s">ACME クライアント · アカウント鍵 ES256</div>
+            </div>
+            <div class="file hide" data-el="web" style="left:30px;top:126px;width:262px">
+              <div class="file-h">/var/www/html/.well-known/acme-challenge/</div>
+              <pre data-lang="text">ファイル名: IMBhFzCHz9_1…C-Lw
+中身: token + "." + thumbprint
+IMBhFzCHz9_1…C-Lw.w1Hm6Y…i23M</pre>
+            </div>
+            <div class="file hide c-blue" data-el="dns" style="left:30px;top:236px;width:262px">
+              <div class="file-h">DNS-01 の場合（権威 DNS に追加）</div>
+              <pre data-lang="dns">_acme-challenge.www.example.com.
+300 IN TXT "0OlgIpBSaBRlpSZ…vvYQ"</pre>
+            </div>
+            <div class="file hide c-green" data-el="live" style="left:30px;top:330px;width:262px">
+              <div class="file-h">/etc/letsencrypt/live/example.com/</div>
+              <pre data-lang="text">cert.pem      -> リーフ
+chain.pem     -> 中間 CA（E1）
+fullchain.pem -> cert + chain
+privkey.pem   -> 秘密鍵</pre>
+            </div>
+
+            <div class="zone c-violet" data-el="z2" data-label="CA（Example Trust）" style="left:330px;top:24px;width:380px;height:480px"></div>
+            <div class="node" data-el="acme" style="left:346px;top:46px;width:348px">
+              <div class="node-h"><i data-icon="globe"></i><b class="node-t">ACME サーバー</b></div>
+              <div class="node-s">https://acme.ca.example.com/directory</div>
+            </div>
+            <div class="node sm" data-el="va" style="left:346px;top:124px;width:348px">
+              <div class="node-h"><i data-icon="search"></i><b class="node-t">検証（Validation Authority）</b></div>
+              <div class="node-s">外部から HTTP-01 / DNS-01 を確認</div>
+            </div>
+            <div class="file hide stampable" data-el="tbs" style="left:346px;top:196px;width:348px">
+              <div class="file-h">TBSCertificate（CA が組み立てる）</div>
+              <div class="file-b">
+                <div class="orow" data-el="t-ser"><b>serial  </b> 0b:73:fb:81:…:10:f4:cf（20 B 乱数）</div>
+                <div class="orow" data-el="t-iss"><b>issuer  </b> C=JP, O=Example Trust, CN=…E1</div>
+                <div class="orow" data-el="t-val"><b>validity</b> 2026-09-27 → 2026-12-26（90 日）</div>
+                <div class="orow" data-el="t-sub"><b>subject </b> CN=www.example.com</div>
+                <div class="orow" data-el="t-spki"><b>SPKI    </b> CSR からコピー（EC P-256）</div>
+                <div class="orow" data-el="t-san"><b>SAN     </b> DNS:www.example.com, DNS:example.com</div>
+                <div class="orow" data-el="t-aki"><b>AKI     </b> 92:21:CB:1D:…（= E1 の SKI）</div>
+                <div class="orow" data-el="t-ct"><b>CT      </b> <span data-el="t-ctv">poison 拡張（プレ証明書）</span></div>
+              </div>
+            </div>
+            <div class="node c-amber" data-el="hsm" style="left:346px;top:400px;width:348px">
+              <div class="node-h"><i data-icon="lock"></i><b class="node-t">HSM（FIPS 140 Level 3 相当）</b></div>
+              <div class="node-s">中間 CA E1 の秘密鍵（P-384）· 鍵は装置の外に出ない</div>
+            </div>
+
+            <div class="zone c-blue" data-el="z3" data-label="CT ログ" style="left:734px;top:24px;width:210px;height:176px"></div>
+            <div class="node sm" data-el="ct1" style="left:748px;top:48px;width:182px">
+              <div class="node-h"><i data-icon="layers"></i><b class="node-t">CT log A</b></div>
+              <div class="node-s">add-pre-chain</div>
+            </div>
+            <div class="node sm" data-el="ct2" style="left:748px;top:118px;width:182px">
+              <div class="node-h"><i data-icon="layers"></i><b class="node-t">CT log B</b></div>
+              <div class="node-s">add-pre-chain</div>
+            </div>
+            <div class="file hide c-green stampable" data-el="out" style="left:734px;top:222px;width:210px">
+              <div class="file-h">server.crt（発行）</div>
+              <div class="file-b">
+                <div class="orow"><b>subject</b> CN=www.example.com</div>
+                <div class="orow"><b>issuer </b> …Issuing CA E1</div>
+                <div class="orow"><b>SCT    </b> ×2（埋め込み）</div>
+                <div class="orow"><b>sig    </b> ecdsa-with-SHA384</div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="tbl">
+          <table class="ref">
+            <thead><tr><th>チャレンジ</th><th>CA が確認するもの</th><th>置く場所 / 値</th><th>使いどころ</th></tr></thead>
+            <tbody>
+              <tr><td><code>http-01</code></td><td><code>http://&lt;ドメイン&gt;/.well-known/acme-challenge/&lt;token&gt;</code>（ポート 80）の応答本文</td><td>本文 = key authorization = <code>token + "." + base64url(JWK thumbprint)</code></td><td>Web サーバーが 80 番で公開されている場合。ワイルドカード不可</td></tr>
+              <tr><td><code>dns-01</code></td><td><code>_acme-challenge.&lt;ドメイン&gt;</code> の TXT レコード</td><td><code>base64url(SHA-256(key authorization))</code>（43 文字）</td><td>ワイルドカード（<code>*.example.com</code>）、80 番を開けられないホスト</td></tr>
+              <tr><td><code>tls-alpn-01</code>（RFC 8737）</td><td>443 番で ALPN <code>acme-tls/1</code> を使って提示される検証用証明書</td><td><code>id-pe-acmeIdentifier</code> 拡張に key authorization の SHA-256</td><td>443 番だけで完結させたい場合</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <pre data-lang="tree" data-title="certbot が作るファイル（/etc/letsencrypt）">/etc/letsencrypt/
+├── accounts/                     # ACME アカウント鍵
+├── archive/example.com/          # 実体（更新のたびに番号が増える）
+│   ├── cert1.pem
+│   ├── chain1.pem
+│   ├── fullchain1.pem
+│   └── privkey1.pem              # 0600
+├── live/example.com/             # 最新版へのシンボリックリンク
+│   ├── cert.pem -> ../../archive/example.com/cert1.pem
+│   ├── chain.pem -> ../../archive/example.com/chain1.pem
+│   ├── fullchain.pem -> ../../archive/example.com/fullchain1.pem
+│   ├── privkey.pem -> ../../archive/example.com/privkey1.pem
+│   └── README
+└── renewal/example.com.conf      # 更新設定（authenticator, webroot など）</pre>
+        <div class="note">Let's Encrypt は 2025 年に OCSP を終了し（2025-05-07 以降の証明書は OCSP URL なし、2025-08-06 にレスポンダ停止）、失効情報は CRL のみで提供しています。証明書に AIA の OCSP URL が無くても異常ではありません。</div>
+      </section>
+
+      <!-- 4. チェーン検証 -->
+      <section class="chapter" id="verify">
+        <h2>チェーンとクライアント側の検証</h2>
+        <p>サーバーは TLS の <code>Certificate</code> メッセージで <b>リーフ + 中間</b>を送ります（ルートは送らない、送っても信頼の根拠にはならない）。クライアントは issuer/subject と AKI/SKI で上へたどり、各証明書の署名を<b>1 つ上の証明書に入っている公開鍵</b>で検証し、最後に自分のトラストストアにあるルートに到達したら「信頼できる」と判断します（RFC 5280 §6）。</p>
+
+        <div class="scene" id="sc-verify" data-title="リーフ → 中間 → ルート：どの公開鍵で何を検証するか">
+          <div class="stage" data-w="960" data-h="520">
+            <div class="node" data-el="cl" style="left:16px;top:20px;width:250px">
+              <div class="node-h"><i data-icon="browser"></i><b class="node-t">クライアント</b></div>
+              <div class="node-s">curl · ブラウザ · openssl</div>
+            </div>
+            <div class="chip hide c-cyan" data-el="msg" style="left:16px;top:106px">Certificate: [0] leaf, [1] E1</div>
+            <div class="file fs10 hide c-green" data-el="ts" style="left:16px;top:370px;width:260px">
+              <div class="file-h">トラストストア（信頼の起点）</div>
+              <pre data-lang="tree">/etc/ssl/certs/ca-certificates.crt
+├ ISRG Root X1
+├ DigiCert Global Root G2
+├ …
+└ Example Root CA R1（デモ）</pre>
+            </div>
+
+            <div class="file hide stampable" data-el="cL" style="left:300px;top:20px;width:330px">
+              <div class="file-h">[0] server.crt（リーフ · 受信）</div>
+              <div class="file-b">
+                <div class="orow" data-el="L-sub"><b>subject</b> CN=www.example.com</div>
+                <div class="orow" data-el="L-iss"><b>issuer </b> …CN=Example Issuing CA E1</div>
+                <div class="orow" data-el="L-aki"><b>AKI    </b> 92:21:CB:1D:8F:9A:…</div>
+                <div class="orow" data-el="L-san"><b>SAN    </b> DNS:www.example.com, …</div>
+                <div class="orow" data-el="L-bc"><b>basic  </b> CA:FALSE · EKU serverAuth</div>
+                <div class="orow" data-el="L-sig"><b>sig    </b> ecdsa-with-SHA384（E1 が署名）</div>
+              </div>
+            </div>
+            <div class="file hide stampable" data-el="cI" style="left:300px;top:186px;width:330px">
+              <div class="file-h">[1] inter.crt（中間 CA · 受信）</div>
+              <div class="file-b">
+                <div class="orow" data-el="I-sub"><b>subject</b> …CN=Example Issuing CA E1</div>
+                <div class="orow" data-el="I-iss"><b>issuer </b> …CN=Example Root CA R1</div>
+                <div class="orow" data-el="I-ski"><b>SKI    </b> 92:21:CB:1D:8F:9A:…</div>
+                <div class="orow" data-el="I-aki"><b>AKI    </b> 11:67:A9:34:E1:FD:…</div>
+                <div class="orow" data-el="I-bc"><b>basic  </b> CA:TRUE, pathlen:0 · keyCertSign</div>
+                <div class="orow" data-el="I-pub"><b>pubkey </b> P-384（Q_E1）</div>
+                <div class="orow" data-el="I-sig"><b>sig    </b> ecdsa-with-SHA384（R1 が署名）</div>
+              </div>
+            </div>
+            <div class="file hide stampable c-green" data-el="cR" style="left:300px;top:370px;width:330px">
+              <div class="file-h">root.crt（ストア内 · 送られない）</div>
+              <div class="file-b">
+                <div class="orow" data-el="R-sub"><b>subject</b> …CN=Example Root CA R1</div>
+                <div class="orow" data-el="R-iss"><b>issuer </b> …CN=Example Root CA R1（自己署名）</div>
+                <div class="orow" data-el="R-ski"><b>SKI    </b> 11:67:A9:34:E1:FD:…</div>
+                <div class="orow" data-el="R-bc"><b>basic  </b> CA:TRUE · keyCertSign</div>
+                <div class="orow" data-el="R-pub"><b>pubkey </b> P-384（Q_R1）</div>
+              </div>
+            </div>
+
+            <div class="file" data-el="ck" style="left:656px;top:20px;width:288px">
+              <div class="file-h">検証の順序（RFC 5280 §6 ほか）</div>
+              <div class="file-b">
+                <div class="orow ck" data-el="ck1">1. パス構築 issuer/subject・AKI/SKI</div>
+                <div class="orow ck" data-el="ck2">2. 署名 leaf ← Q_E1</div>
+                <div class="orow ck" data-el="ck3">3. 署名 E1 ← Q_R1</div>
+                <div class="orow ck" data-el="ck4">4. トラストアンカー R1 ∈ ストア</div>
+                <div class="orow ck" data-el="ck5">5. 期間・basicConstraints・keyUsage</div>
+                <div class="orow ck" data-el="ck6">6. EKU serverAuth・SAN ホスト名</div>
+                <div class="orow ck" data-el="ck7">7. 失効 OCSP / CRL</div>
+              </div>
+            </div>
+            <div class="node hide" data-el="ocsp" style="left:656px;top:206px;width:288px">
+              <div class="node-h"><i data-icon="clock"></i><b class="node-t">OCSP レスポンダ</b></div>
+              <div class="node-s">http://ocsp.ca.example.com<br><span data-el="ocsp-r">Cert Status: good</span></div>
+            </div>
+            <div class="file fs10 hide c-green" data-el="res" style="left:656px;top:330px;width:288px">
+              <div class="file-h">openssl verify -show_chain（抜粋）</div>
+              <pre data-lang="text">server.crt: OK
+Chain:
+depth=0: CN=www.example.com (untrusted)
+depth=1: …Issuing CA E1 (untrusted)
+depth=2: …Example Root CA R1</pre>
+            </div>
+          </div>
+        </div>
+
+        <h3>検証で見るもの・落ちたときのエラー</h3>
+        <div class="tbl">
+          <table class="ref">
+            <thead><tr><th>確認項目</th><th>使うフィールド</th><th>失敗時（openssl verify 3.x）</th></tr></thead>
+            <tbody>
+              <tr><td>パス構築</td><td>issuer ↔ 上位の subject、AKI ↔ 上位の SKI</td><td><code>error 20 … unable to get local issuer certificate</code> / <code>error 2 … unable to get issuer certificate</code></td></tr>
+              <tr><td>署名</td><td>signatureValue と 1 つ上の証明書の SPKI</td><td><code>error 7 … certificate signature failure</code></td></tr>
+              <tr><td>トラストアンカー</td><td>トラストストア内のルート</td><td><code>error 19 … self-signed certificate in certificate chain</code> / <code>error 18 … self-signed certificate</code></td></tr>
+              <tr><td>有効期間</td><td>validity（全段）</td><td><code>error 10 … certificate has expired</code> / <code>error 9 … certificate is not yet valid</code></td></tr>
+              <tr><td>CA 制約</td><td>basicConstraints（cA, pathLenConstraint）</td><td><code>error 79 … invalid CA certificate</code> / <code>error 25 … path length constraint exceeded</code></td></tr>
+              <tr><td>鍵用途</td><td>keyUsage（keyCertSign）</td><td><code>error 32 … key usage does not include certificate signing</code></td></tr>
+              <tr><td>用途</td><td>extendedKeyUsage（serverAuth）</td><td><code>error 26 … unsuitable certificate purpose</code></td></tr>
+              <tr><td>ホスト名</td><td>subjectAltName</td><td><code>error 62 … hostname mismatch</code>（<code>-verify_hostname</code> 指定時）</td></tr>
+              <tr><td>失効</td><td>CRL / OCSP 応答</td><td><code>error 23 … certificate revoked</code> / <code>error 3 … unable to get certificate CRL</code>（<code>-crl_check</code> で CRL なし）</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>トラストストアはどこにあるか</h3>
+        <div class="tbl">
+          <table class="ref">
+            <thead><tr><th>環境</th><th>場所</th><th>社内ルートを追加する方法</th></tr></thead>
+            <tbody>
+              <tr><td>Debian / Ubuntu</td><td><code>/etc/ssl/certs/ca-certificates.crt</code></td><td><code>/usr/local/share/ca-certificates/&lt;名前&gt;.crt</code> に置いて <code>sudo update-ca-certificates</code></td></tr>
+              <tr><td>RHEL / Fedora</td><td><code>/etc/pki/tls/certs/ca-bundle.crt</code>（実体は <code>/etc/pki/ca-trust/extracted/</code>）</td><td><code>/etc/pki/ca-trust/source/anchors/</code> に置いて <code>sudo update-ca-trust</code></td></tr>
+              <tr><td>Windows</td><td>証明書ストア「信頼されたルート証明機関」（<code>certlm.msc</code>、PowerShell では <code>Cert:\LocalMachine\Root</code>）</td><td><code>certutil -addstore -f Root root.crt</code>（管理者）</td></tr>
+              <tr><td>macOS</td><td>キーチェーン（システムルート / システム）</td><td><code>sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain root.crt</code></td></tr>
+              <tr><td>Firefox</td><td>Mozilla NSS 内蔵ルート</td><td>設定の証明書マネージャで読み込む、または <code>security.enterprise_roots.enabled</code> で OS のストアを参照</td></tr>
+              <tr><td>Chrome</td><td>Chrome Root Store（+ OS に追加されたローカルのルート）</td><td>OS のストアに追加</td></tr>
+              <tr><td>Java</td><td><code>$JAVA_HOME/lib/security/cacerts</code></td><td><code>keytool -importcert -cacerts -alias example-root -file root.crt</code></td></tr>
+              <tr><td>Python requests / Node.js</td><td>certifi の <code>cacert.pem</code> / Node 同梱の Mozilla ルート</td><td><code>REQUESTS_CA_BUNDLE=/path/root.crt</code> / <code>NODE_EXTRA_CA_CERTS=/path/root.crt</code></td></tr>
+              <tr><td>OpenSSL / curl</td><td>ビルド時の既定（<code>openssl version -d</code> の OPENSSLDIR など）</td><td><code>-CAfile root.crt</code> / <code>curl --cacert root.crt</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- 5. 失敗ケース -->
+      <section class="chapter" id="failures">
+        <h2>失敗・改ざんケース</h2>
+        <p>現場で一番多いのは「中間証明書の送り忘れ」です。ブラウザでは表示できるのに、curl・Java・Python・一部のモバイルアプリだけ失敗する、という形で表面化します。</p>
+
+        <div class="scene" id="sc-fail" data-title="中間証明書の送り忘れ・未信頼ルート・改ざん・偽 CA・失効">
+          <div class="stage" data-w="960" data-h="500">
+            <div class="node" data-el="srv" style="left:16px;top:20px;width:470px">
+              <div class="node-h"><i data-icon="server"></i><b class="node-t">nginx（www.example.com:443）</b></div>
+              <div class="node-s">ssl_certificate に何を指定したかで、送られるチェーンが決まる</div>
+            </div>
+            <div class="file fs10" data-el="conf" style="left:16px;top:100px;width:470px">
+              <div class="file-h">/etc/nginx/conf.d/example.conf</div>
+              <div data-el="conf-b"><pre data-lang="text">server {
+    listen 443 ssl;
+    server_name www.example.com;
+    ssl_certificate     /etc/letsencrypt/live/example.com/⟪cert.pem⟫;
+    ssl_certificate_key /etc/letsencrypt/live/example.com/privkey.pem;
+}</pre></div>
+            </div>
+            <div class="node hide c-amber" data-el="cz" style="left:16px;top:256px;width:470px">
+              <div class="node-h"><i data-icon="warn"></i><b class="node-t" data-el="cz-t">原因</b></div>
+              <div class="txt" data-el="cz-b" style="margin-top:4px"></div>
+            </div>
+            <div class="file fs10 hide c-green" data-el="fx" style="left:16px;top:376px;width:470px">
+              <div class="file-h" data-el="fx-h">対処</div>
+              <div data-el="fx-b"></div>
+            </div>
+
+            <div class="node" data-el="cl" style="left:510px;top:20px;width:434px">
+              <div class="node-h"><i data-icon="terminal"></i><b class="node-t">クライアント</b></div>
+              <div class="node-s">openssl s_client -CAfile root.crt / openssl verify / curl</div>
+            </div>
+            <div class="chip hide c-cyan" data-el="msg" style="left:510px;top:104px">Certificate: [0] leaf のみ</div>
+            <div class="term tiny" data-el="t" style="left:510px;top:140px;width:434px;height:344px">
+              <div class="term-h">bash — client</div>
+              <div class="term-b"></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="tbl">
+          <table class="ref">
+            <thead><tr><th>症状</th><th>実際のエラー</th><th>原因</th><th>対処</th></tr></thead>
+            <tbody>
+              <tr><td>ブラウザは OK、curl / Java / Python が NG</td><td><code>curl: (60) SSL certificate problem: unable to get local issuer certificate</code><br><code>verify error:num=21:unable to verify the first certificate</code></td><td>サーバーがリーフだけを送っている（<code>cert.pem</code> を設定）</td><td><code>ssl_certificate</code> に <code>fullchain.pem</code> を指定</td></tr>
+              <tr><td>社内サイトだけ NG</td><td><code>error 19 … self-signed certificate in certificate chain</code></td><td>社内ルート CA がクライアントのトラストストアに無い</td><td>ルートをストアに追加（上の表）。<code>-k</code> / <code>verify=False</code> で無効化しない</td></tr>
+              <tr><td>自己署名 1 枚の証明書</td><td><code>error 18 … self-signed certificate</code></td><td>リーフ自体が自己署名</td><td>CA（社内 CA でも可）で発行し直す</td></tr>
+              <tr><td>証明書の書き換え</td><td><code>error 7 … certificate signature failure</code></td><td>TBS が改ざんされ、発行者の署名と一致しない</td><td>正規の証明書に戻す</td></tr>
+              <tr><td>リーフの鍵で子証明書を作った</td><td><code>error 79 … invalid CA certificate</code> など</td><td>署名者が <code>CA:FALSE</code> / keyCertSign なし</td><td>—（攻撃の検出例）</td></tr>
+              <tr><td>失効済み</td><td><code>server.crt: revoked</code>（OCSP）/ <code>error 23 … certificate revoked</code>（CRL）</td><td>CA が鍵漏洩などで失効させた</td><td>鍵を作り直して再発行</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- 6. コマンド早見表 -->
+      <section class="chapter" id="commands">
+        <h2>コマンド早見表</h2>
+        <div class="tbl">
+          <table class="ref">
+            <thead><tr><th>やりたいこと</th><th>コマンド（OpenSSL 3.x）</th><th>どこで実行するか</th></tr></thead>
+            <tbody>
+              <tr><td>秘密鍵を作る</td><td><code>openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out server.key</code>（RSA：<code>-algorithm RSA -pkeyopt rsa_keygen_bits:2048</code>）</td><td>サーバー</td></tr>
+              <tr><td>CSR を作る</td><td><code>openssl req -new -key server.key -subj "/CN=www.example.com" -addext "subjectAltName=DNS:www.example.com" -out server.csr</code></td><td>サーバー</td></tr>
+              <tr><td>CSR を確認・自己署名を検証</td><td><code>openssl req -in server.csr -noout -text -verify</code></td><td>サーバー / CA</td></tr>
+              <tr><td>CA として署名する</td><td><code>openssl x509 -req -in server.csr -CA inter.crt -CAkey inter.key -sha384 -days 90 -extfile pki.cnf -extensions v3_leaf -out server.crt</code></td><td>CA</td></tr>
+              <tr><td>自己署名ルートを作る</td><td><code>openssl req -x509 -new -key root.key -sha384 -days 3650 -subj "/CN=…" -config pki.cnf -extensions v3_root -out root.crt</code></td><td>ルート CA</td></tr>
+              <tr><td>チェーンを検証</td><td><code>openssl verify -show_chain -CAfile root.crt -untrusted inter.crt server.crt</code></td><td>どこでも</td></tr>
+              <tr><td>サーバーが送るチェーンを見る</td><td><code>openssl s_client -connect www.example.com:443 -servername www.example.com -showcerts &lt;/dev/null</code></td><td>クライアント</td></tr>
+              <tr><td>鍵と証明書の対応を確かめる</td><td><code>openssl x509 -in server.crt -noout -pubkey | openssl sha256</code> と <code>openssl pkey -in server.key -pubout | openssl sha256</code> を比較</td><td>サーバー</td></tr>
+              <tr><td>OCSP で失効確認</td><td><code>openssl ocsp -issuer inter.crt -cert server.crt -url http://ocsp.ca.example.com -CAfile ca-bundle.pem</code></td><td>クライアント / サーバー（stapling）</td></tr>
+              <tr><td>CRL を見る・CRL で検証</td><td><code>openssl crl -in e1.crl -inform der -noout -text</code> / <code>openssl verify -crl_check -CRLfile e1.crl …</code></td><td>クライアント</td></tr>
+              <tr><td>ACME で取得（webroot）</td><td><code>sudo certbot certonly --webroot -w /var/www/html -d example.com -d www.example.com</code></td><td>サーバー</td></tr>
+              <tr><td>ACME で取得（DNS-01・ワイルドカード）</td><td><code>sudo certbot certonly --manual --preferred-challenges dns -d "*.example.com"</code></td><td>サーバー</td></tr>
+              <tr><td>CT ログで発行履歴を確認</td><td><code>https://crt.sh/?q=example.com</code></td><td>ブラウザ</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="cols">
+          <pre data-lang="cert" data-title="OCSP 応答（ローカルの openssl ocsp レスポンダで取得）">$ openssl ocsp -issuer inter.crt -cert server.crt \
+    -url http://127.0.0.1:18890 -CAfile ca-bundle.pem -resp_text
+OCSP Response Data:
+    OCSP Response Status: successful (0x0)
+    Response Type: Basic OCSP Response
+    Version: 1 (0x0)
+    Responder Id: C = JP, O = Example Trust, CN = Example Issuing CA E1
+    Produced At: Sep 27 18:57:40 2026 GMT
+    Responses:
+    Certificate ID:
+      Hash Algorithm: sha1
+      Issuer Name Hash: E05DE3B1ED2A3718F476E0ECB0EF53E0FEDB974B
+      Issuer Key Hash: 9221CB1D8F9ABA15795F8AF13485D47FD23345F5
+      Serial Number: 0B73FB81F66C9CFEA3E6620091A896E08210F4CF
+    Cert Status: good
+    This Update: Sep 27 18:57:40 2026 GMT
+Response verify OK
+server.crt: good</pre>
+          <pre data-lang="cert" data-title="CRL（openssl ca -gencrl で作成）">$ openssl crl -in e1.crl -noout -text
+Certificate Revocation List (CRL):
+        Version 2 (0x1)
+        Signature Algorithm: ecdsa-with-SHA384
+        Issuer: C=JP, O=Example Trust, CN=Example Issuing CA E1
+        Last Update: Sep 27 19:02:11 2026 GMT
+        Next Update: Oct  4 19:02:11 2026 GMT
+        CRL extensions:
+            X509v3 Authority Key Identifier:
+                92:21:CB:1D:8F:9A:BA:15:79:5F:8A:F1:34:85:D4:7F:D2:33:45:F5
+            X509v3 CRL Number:
+                4096
+Revoked Certificates:
+    Serial Number: 0B73FB81F66C9CFEA3E6620091A896E08210F4CF
+        Revocation Date: Sep 27 19:00:00 2026 GMT
+        CRL entry extensions:
+            X509v3 CRL Reason Code:
+                Key Compromise</pre>
+        </div>
+        <p>OCSP の <code>Issuer Key Hash</code>（<code>9221CB1D…</code>）は中間 CA の公開鍵の SHA-1 で、ここでは中間 CA 証明書の SKI と同じ値です（SKI を RFC 5280 §4.2.1.2 の方法 (1)＝公開鍵の SHA-1 で作っているため。OpenSSL の <code>subjectKeyIdentifier = hash</code>）。CRL / OCSP 応答はどちらも中間 CA E1 の鍵で署名されており、クライアントは証明書と同じくその署名を検証します。</p>
+      </section>
+
+      <!-- 7. 手元で試す -->
+      <section class="chapter" id="try">
+        <h2>手元で試す：ルート → 中間 → リーフのミニ CA</h2>
+        <p>OpenSSL 3.x（本ページは 3.5.7 で確認）で、公開 CA と同じ 3 段構成を作り、署名・検証・失敗ケースまで再現します。鍵はすべてデモ用です。Windows の Git Bash では <code>-subj</code> のパス変換を避けるため先に <code>export MSYS_NO_PATHCONV=1</code> を実行してください。</p>
+        <pre data-lang="bash" data-title="1) 拡張の定義ファイル pki.cnf">mkdir -p ~/mini-ca &amp;&amp; cd ~/mini-ca
+cat > pki.cnf &lt;&lt;'EOF'
+[ req ]
+distinguished_name     = req_dn
+prompt                 = no
+[ req_dn ]
+CN                     = placeholder
+
+[ v3_root ]
+basicConstraints       = critical, CA:TRUE
+keyUsage               = critical, keyCertSign, cRLSign
+subjectKeyIdentifier   = hash
+
+[ v3_inter ]
+basicConstraints       = critical, CA:TRUE, pathlen:0
+keyUsage               = critical, digitalSignature, keyCertSign, cRLSign
+extendedKeyUsage       = serverAuth, clientAuth
+subjectKeyIdentifier   = hash
+authorityKeyIdentifier = keyid:always
+
+[ v3_leaf ]
+basicConstraints       = critical, CA:FALSE
+keyUsage               = critical, digitalSignature
+extendedKeyUsage       = serverAuth
+subjectKeyIdentifier   = hash
+authorityKeyIdentifier = keyid:always
+subjectAltName         = DNS:www.example.com, DNS:example.com
+EOF</pre>
+        <pre data-lang="bash" data-title="2) ルート CA・中間 CA・リーフを作る">#--- ルート CA（自己署名。本物ならオフラインの HSM で行う）
+openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-384 -out root.key
+openssl req -x509 -new -key root.key -sha384 -days 3650 \
+  -subj "/C=JP/O=Example Trust/CN=Example Root CA R1" \
+  -config pki.cnf -extensions v3_root -out root.crt
+
+#--- 中間 CA（ルートが署名）
+openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-384 -out inter.key
+openssl req -new -key inter.key -config pki.cnf \
+  -subj "/C=JP/O=Example Trust/CN=Example Issuing CA E1" -out inter.csr
+openssl x509 -req -in inter.csr -CA root.crt -CAkey root.key -sha384 -days 1825 \
+  -extfile pki.cnf -extensions v3_inter -out inter.crt
+
+#--- サーバー側：鍵と CSR（鍵はここから出さない）
+openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out server.key
+chmod 600 server.key
+openssl req -new -key server.key -subj "/CN=www.example.com" \
+  -addext "subjectAltName=DNS:www.example.com,DNS:example.com" -out server.csr
+openssl req -in server.csr -noout -verify      # Certificate request self-signature verify OK
+
+#--- CA 側：中間 CA の鍵でリーフに署名
+openssl x509 -req -in server.csr -CA inter.crt -CAkey inter.key -sha384 -days 90 \
+  -extfile pki.cnf -extensions v3_leaf -out server.crt
+cat server.crt inter.crt > fullchain.pem        # サーバーが送るのはこれ</pre>
+        <pre data-lang="bash" data-title="3) 検証する（成功と失敗）">openssl verify -show_chain -CAfile root.crt -untrusted inter.crt server.crt   # OK
+openssl verify -CAfile root.crt -untrusted inter.crt -verify_hostname www.example.com server.crt
+openssl verify -CAfile root.crt server.crt                  # error 20: 中間がない
+cat inter.crt root.crt > bundle.pem
+openssl verify -untrusted bundle.pem server.crt             # error 19: ルートを信頼していない
+openssl verify -CAfile inter.crt server.crt                 # error 2: 中間をアンカーにしても上が無い
+
+#--- TLS で試す（ターミナルを 2 つ使う）
+# (A) 中間を送らないサーバー
+openssl s_server -accept 8443 -cert server.crt -key server.key -www
+# (B) クライアント → verify error:num=20 / Verify return code: 21
+openssl s_client -connect 127.0.0.1:8443 -servername www.example.com \
+  -verify_hostname www.example.com -CAfile root.crt &lt;/dev/null 2&gt;&amp;1 | grep -E 'depth|verify|Verif'
+# (A') 中間も送るサーバー（nginx の fullchain.pem に相当）
+openssl s_server -accept 8443 -cert server.crt -cert_chain inter.crt -key server.key -www
+# (B) もう一度 → depth=2..0 verify return:1 / Verify return code: 0 (ok)</pre>
+        <pre data-lang="text" data-title="期待される出力（抜粋）">server.crt: OK
+Chain:
+depth=0: CN=www.example.com (untrusted)
+depth=1: C=JP, O=Example Trust, CN=Example Issuing CA E1 (untrusted)
+depth=2: C=JP, O=Example Trust, CN=Example Root CA R1
+server.crt: OK
+CN=www.example.com
+error 20 at 0 depth lookup: unable to get local issuer certificate
+error server.crt: verification failed
+C=JP, O=Example Trust, CN=Example Root CA R1
+error 19 at 2 depth lookup: self-signed certificate in certificate chain
+error server.crt: verification failed
+C=JP, O=Example Trust, CN=Example Issuing CA E1
+error 2 at 1 depth lookup: unable to get issuer certificate
+error server.crt: verification failed</pre>
+        <div class="note tip"><b>形式を変える：</b>Windows / IIS 向けの PKCS #12 は <code>openssl pkcs12 -export -inkey server.key -in server.crt -certfile inter.crt -out server.pfx</code>、証明書だけの束（.p7b）は <code>openssl crl2pkcs7 -nocrl -certfile fullchain.pem -out chain.p7b</code>。PEM / DER の違いは <a href="../x509/">X.509 証明書</a>のページを参照してください。</div>
+      </section>
+
+      <!-- 8. ハマりどころ -->
+      <section class="chapter" id="pitfalls">
+        <h2>ハマりどころ</h2>
+        <div class="note warn"><b>中間証明書の送り忘れ：</b><code>ssl_certificate</code> に <code>cert.pem</code> を指定するとリーフだけが送られます。ブラウザは AIA の CA Issuers URL から中間証明書を取りに行ったり、以前に見た・事前配布された中間証明書で補完したりして表示できてしまうことがあるため気付きにくく、curl・Java・Python などで <code>unable to get local issuer certificate</code> になります。確認は <code>openssl s_client -showcerts</code> で「何枚送られてくるか」を見ます。</div>
+        <div class="note warn"><b>チェーンの順序：</b>先頭は必ずリーフ、その後に中間を「下から上」の順に並べます（<code>cat server.crt inter.crt</code>）。TLS 1.2（RFC 5246）は厳密な順序を要求し、TLS 1.3（RFC 8446 §4.4.2）は先頭以外の順序を緩めましたが、nginx は <code>ssl_certificate</code> の<b>最初の 1 枚</b>をサーバー証明書として秘密鍵と突き合わせるので、順序を逆にすると起動時に <code>key values mismatch</code> で失敗します。</div>
+        <div class="note warn"><b>ルートは送らなくてよい：</b>信頼の根拠はクライアント側のストアにあるルートだけです。サーバーがルートを送っても信頼は増えず、バイト数が増えるだけです（送っても害はほぼありません）。</div>
+        <div class="note warn"><b><code>-CAfile</code> と <code>-untrusted</code> の違い：</b><code>-CAfile</code> に入れた証明書は「信頼の起点（トラストアンカー）」、<code>-untrusted</code> は「パス構築に使ってよいが信頼はしない中間」です。中間 CA を <code>-CAfile</code> に入れてもルートまで届かなければ <code>error 2</code>（<code>-partial_chain</code> を付けると中間をアンカーとして扱う）。</div>
+        <div class="note warn"><b>秘密鍵のパーミッション：</b><code>privkey.pem</code> は <code>0600</code>（certbot 0.29.0 以降の既定）で root 所有。nginx はマスタープロセス（root）が起動時に読み込むのでワーカーの権限は不要です。鍵をリポジトリやチケットに貼ったら、失効と鍵の作り直しが必要です。</div>
+        <div class="note warn"><b>ワイルドカードの範囲：</b><code>*.example.com</code> は <code>www.example.com</code> や <code>api.example.com</code> に一致しますが、<code>example.com</code> 自身や <code>a.b.example.com</code>（2 階層下）には一致しません。Let's Encrypt でワイルドカードを取るには DNS-01 が必要です。</div>
+        <div class="note warn"><b>時計のずれ：</b>クライアントの時刻が notBefore より前だと <code>error 9 … certificate is not yet valid</code>、notAfter より後だと <code>error 10 … certificate has expired</code>。発行直後の証明書が一部の端末だけで失敗する場合は端末の時刻を疑います。</div>
+        <div class="note warn"><b>有効期間の短縮：</b>公開 TLS 証明書の最大有効期間は 2026-03-15 から 200 日、2027-03-15 から 100 日、2029-03-15 から 47 日（CA/B Forum SC-081v3）。手動更新の運用は成り立たなくなるので ACME での自動更新（<code>certbot renew</code> の timer）を前提にします。</div>
+        <div class="note warn"><b>Git Bash の <code>-subj</code>：</b>Windows の Git Bash では <code>"/CN=www.example.com"</code> が Windows パスに変換されて <code>req</code> が失敗します。<code>MSYS_NO_PATHCONV=1</code> を付けるか、<code>"//CN=www.example.com"</code> と書きます。</div>
+      </section>
+
+      <!-- 9. 仕様 -->
+      <section class="chapter" id="spec">
+        <h2>仕様・参考</h2>
+        <ul>
+          <li><a href="https://www.rfc-editor.org/rfc/rfc5280" target="_blank" rel="noopener">RFC 5280 — X.509 PKI Certificate and CRL Profile</a>（§6 パス検証アルゴリズム、§5 CRL）</li>
+          <li><a href="https://www.rfc-editor.org/rfc/rfc2986" target="_blank" rel="noopener">RFC 2986 — PKCS #10: Certification Request Syntax</a></li>
+          <li><a href="https://www.rfc-editor.org/rfc/rfc8555" target="_blank" rel="noopener">RFC 8555 — ACME</a>（§7.4 注文、§8.1 key authorization、§8.3 HTTP-01、§8.4 DNS-01）/ <a href="https://www.rfc-editor.org/rfc/rfc8737" target="_blank" rel="noopener">RFC 8737 — TLS-ALPN-01</a></li>
+          <li><a href="https://www.rfc-editor.org/rfc/rfc6960" target="_blank" rel="noopener">RFC 6960 — OCSP</a> / <a href="https://www.rfc-editor.org/rfc/rfc6066" target="_blank" rel="noopener">RFC 6066 §8 — status_request（OCSP stapling）</a></li>
+          <li><a href="https://www.rfc-editor.org/rfc/rfc6962" target="_blank" rel="noopener">RFC 6962 — Certificate Transparency</a> / <a href="https://www.rfc-editor.org/rfc/rfc9162" target="_blank" rel="noopener">RFC 9162 — Certificate Transparency Version 2.0（Experimental）</a></li>
+          <li><a href="https://www.rfc-editor.org/rfc/rfc8446#section-4.4.2" target="_blank" rel="noopener">RFC 8446 §4.4.2 — TLS 1.3 Certificate メッセージ</a></li>
+          <li><a href="https://cabforum.org/working-groups/server/baseline-requirements/requirements/" target="_blank" rel="noopener">CA/Browser Forum — TLS Baseline Requirements</a> / <a href="https://cabforum.org/2025/04/11/ballot-sc081v3-introduce-schedule-of-reducing-validity-and-data-reuse-periods/" target="_blank" rel="noopener">Ballot SC-081v3（有効期間の短縮）</a></li>
+          <li><a href="https://eff-certbot.readthedocs.io/en/stable/using.html#where-are-my-certificates" target="_blank" rel="noopener">Certbot — Where are my certificates?</a> / <a href="https://letsencrypt.org/2024/12/05/ending-ocsp/" target="_blank" rel="noopener">Let's Encrypt — Ending OCSP Support in 2025</a></li>
+          <li><a href="https://docs.openssl.org/3.5/man1/openssl-verify/" target="_blank" rel="noopener">openssl-verify(1)</a> / <a href="https://docs.openssl.org/3.5/man1/openssl-req/" target="_blank" rel="noopener">openssl-req(1)</a> / <a href="https://docs.openssl.org/3.5/man1/openssl-x509/" target="_blank" rel="noopener">openssl-x509(1)</a> / <a href="https://docs.openssl.org/3.5/man1/openssl-ocsp/" target="_blank" rel="noopener">openssl-ocsp(1)</a> / <a href="https://docs.openssl.org/3.5/man1/openssl-s_client/" target="_blank" rel="noopener">openssl-s_client(1)</a></li>
+          <li>関連：<a href="../x509/">X.509 証明書</a>（証明書ファイルの中身・DER・拡張）、<a href="../https-tls/">HTTPS / TLS 1.3</a>（Certificate / CertificateVerify がハンドシェイクのどこで送られるか）</li>
+        </ul>
+      </section>
+
+    </main>
+  </div>
+
+  <footer class="site-f"></footer>
+  <script src="../../assets/js/topics.js"></script>
+  <script src="../../assets/js/tim.js"></script>
+  <script src="scenes.js"></script>
+</body>
+</html>

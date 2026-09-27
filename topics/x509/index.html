@@ -1,0 +1,801 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>X.509 証明書 — Tech in Motion</title>
+  <meta name="description" content="X.509 証明書ファイル（PEM/DER）の中身を、TBSCertificate・X.501 識別名・DER の TLV・拡張・署名まで openssl の実出力で 1 バイトずつ分解します。">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Space+Grotesk:wght@500;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="../../assets/css/tim.css">
+  <link rel="stylesheet" href="page.css">
+</head>
+<body data-root="../../" data-topic="x509">
+  <header class="site-h"></header>
+
+  <div class="page">
+    <aside class="toc"></aside>
+    <main class="doc">
+
+      <!-- 0. HERO -->
+      <section class="hero">
+        <p class="kicker">Crypto / PKI · X.509 v3</p>
+        <h1>X.509 証明書<small>server.crt の中身を、ASN.1 と DER のバイト列まで全部読む</small></h1>
+        <p class="lead">証明書は「公開鍵」と「その持ち主の名前（X.501 の識別名 DN）」と「使い道の制約（拡張）」を 1 つの <code>TBSCertificate</code> にまとめ、発行 CA が秘密鍵で署名した DER バイト列です。このページでは <code>openssl x509 -text</code> の各行が DER のどのバイトに対応し、どこを 1 バイト書き換えると検証のどこで落ちるかを、実際に生成した証明書（OpenSSL 3.5 で作成）で追いかけます。</p>
+        <div class="facts">
+          <div class="fact"><span>ファイル</span><b><code>server.crt</code>（PEM）/ <code>server.der</code>（DER）</b></div>
+          <div class="fact"><span>中身</span><b><code>tbsCertificate</code> + <code>signatureAlgorithm</code> + <code>signatureValue</code></b></div>
+          <div class="fact"><span>読むコマンド</span><b><code>openssl x509 -in server.crt -noout -text</code></b></div>
+          <div class="fact"><span>仕様</span><b>ITU-T X.509 / X.501、RFC 5280、RFC 4514、X.690（DER）</b></div>
+        </div>
+      </section>
+
+      <!-- 1. 構造 -->
+      <section class="chapter" id="structure">
+        <h2>全体像：証明書の構造</h2>
+        <p>左が <code>openssl x509 -in server.crt -noout -text</code> の出力（抜粋）、右が RFC 5280 §4.1 の ASN.1 定義です。ステップごとに「表示の 1 行」と「ASN.1 のフィールド」を対応づけます。署名がかかっているのは <b>tbsCertificate の DER バイト列全体</b>で、外側の 2 つ（<code>signatureAlgorithm</code> と <code>signatureValue</code>）は署名の対象外です。</p>
+
+        <div class="scene" id="sc-structure" data-title="openssl -text の各行 = ASN.1 のどのフィールドか">
+          <div class="stage" data-w="960" data-h="520">
+            <div class="file hide" data-el="out" style="left:16px;top:16px;width:452px;height:440px">
+              <div class="file-h">$ openssl x509 -in server.crt -noout -text（抜粋）</div>
+              <div class="file-b">
+                <div class="orow" data-el="o-cert"><b>Certificate:</b></div>
+                <div class="orow" data-el="o-data">    <b>Data:</b></div>
+                <div class="orow" data-el="o-ver">        <b>Version:</b> 3 (0x2)</div>
+                <div class="orow" data-el="o-ser">        <b>Serial Number:</b>
+            <i>2a:4c:d0:f3:dc:a7:2b:02:84:4e:35:98:…:66:ba</i></div>
+                <div class="orow" data-el="o-sig">        <b>Signature Algorithm:</b> ecdsa-with-SHA384</div>
+                <div class="orow" data-el="o-iss">        <b>Issuer:</b> C=JP, O=Example Trust,
+                CN=Example Issuing CA E1</div>
+                <div class="orow" data-el="o-val">        <b>Validity</b>
+            <b>Not Before:</b> Sep 27 18:54:21 2026 GMT
+            <b>Not After :</b> Dec 26 18:54:21 2026 GMT</div>
+                <div class="orow" data-el="o-sub">        <b>Subject:</b> C=JP, ST=Tokyo, L=Chiyoda-ku,
+                 O=Example Inc, CN=www.example.com</div>
+                <div class="orow" data-el="o-spki">        <b>Subject Public Key Info:</b>
+            <b>Public Key Algorithm:</b> id-ecPublicKey
+                Public-Key: (256 bit) … NIST CURVE: P-256</div>
+                <div class="orow" data-el="o-ext">        <b>X509v3 extensions:</b>
+            X509v3 Basic Constraints: critical
+            … Key Usage / SAN / AIA など計 9 個</div>
+                <div class="orow" data-el="o-salg">    <b>Signature Algorithm:</b> ecdsa-with-SHA384</div>
+                <div class="orow" data-el="o-sval">    <b>Signature Value:</b>
+        <i data-el="sv">30:65:02:31:00:a5:64:a6:62:b6:94:90:…</i></div>
+              </div>
+            </div>
+            <div class="chip hide" data-el="sig1" style="left:16px;top:470px">SHA-384( DER(tbsCertificate) )</div>
+            <div class="chip hide c-amber" data-el="sig2" style="left:262px;top:470px"><i data-icon="key"></i>ECDSA P-384 · E1 の秘密鍵</div>
+
+            <div class="zone hide" data-el="cert" data-label="Certificate ::= SEQUENCE · 30 82 03 1b" style="left:486px;top:22px;width:458px;height:486px"></div>
+            <div class="zone hide c-amber" data-el="tbs" data-label="tbsCertificate · 30 82 02 a1（署名対象）" style="left:498px;top:48px;width:434px;height:344px"></div>
+            <div class="asn hide" data-el="f-ver" style="left:510px;top:66px;width:410px"><b>version</b><span>[0] EXPLICIT INTEGER</span><code>a0 03 02 01 02</code></div>
+            <div class="asn hide" data-el="f-ser" style="left:510px;top:106px;width:410px"><b>serialNumber</b><span>INTEGER (20 bytes)</span><code>02 14 2a 4c …</code></div>
+            <div class="asn hide" data-el="f-sig" style="left:510px;top:146px;width:410px"><b>signature</b><span>AlgorithmIdentifier</span><code>30 0a 06 08 …</code></div>
+            <div class="asn hide" data-el="f-iss" style="left:510px;top:186px;width:410px"><b>issuer</b><span>Name (X.501)</span><code>30 45 31 0b …</code></div>
+            <div class="asn hide" data-el="f-val" style="left:510px;top:226px;width:410px"><b>validity</b><span>SEQUENCE (Time ×2)</span><code>30 1e 17 0d …</code></div>
+            <div class="asn hide" data-el="f-sub" style="left:510px;top:266px;width:410px"><b>subject</b><span>Name (X.501)</span><code>30 62 31 0b …</code></div>
+            <div class="asn hide" data-el="f-spki" style="left:510px;top:306px;width:410px"><b>subjectPublicKeyInfo</b><span>SEQUENCE</span><code>30 59 30 13 …</code></div>
+            <div class="asn hide" data-el="f-ext" style="left:510px;top:346px;width:410px"><b>extensions</b><span>[3] EXPLICIT</span><code>a3 82 01 50 …</code></div>
+            <div class="asn hide" data-el="f-salg" style="left:498px;top:412px;width:434px"><b>signatureAlgorithm</b><span>AlgorithmIdentifier</span><code>30 0a 06 08 …</code></div>
+            <div class="asn hide" data-el="f-sval" style="left:498px;top:454px;width:434px"><b>signatureValue</b><span>BIT STRING (r, s)</span><code>03 68 00 30 65 …</code></div>
+          </div>
+        </div>
+
+        <h3>TBSCertificate のフィールド早見表</h3>
+        <div class="tbl">
+          <table class="ref">
+            <thead><tr><th>フィールド</th><th>ASN.1 型</th><th>DER の先頭</th><th>server.crt での値</th><th>ポイント</th></tr></thead>
+            <tbody>
+              <tr><td><code>version</code></td><td><code>[0] EXPLICIT Version DEFAULT v1</code></td><td><code>a0 03 02 01 02</code></td><td>3 (0x2)</td><td>v1=0, v2=1, v3=2。拡張を持つ証明書は v3。v1 のときはフィールドごと省略されます。</td></tr>
+              <tr><td><code>serialNumber</code></td><td><code>INTEGER</code></td><td><code>02 14 …</code></td><td>2a:4c:d0:…:66:ba（20 バイト）</td><td>発行 CA の中で一意な正の整数、最大 20 オクテット（RFC 5280 §4.1.2.2）。公開 CA は CSPRNG 出力 64 ビット以上を含めます（CA/B Forum BR §7.1）。</td></tr>
+              <tr><td><code>signature</code></td><td><code>AlgorithmIdentifier</code></td><td><code>30 0a 06 08 2a 86 48 ce 3d 04 03 03</code></td><td>ecdsa-with-SHA384（1.2.840.10045.4.3.3）</td><td>外側の <code>signatureAlgorithm</code> と同じ値でなければなりません（§4.1.1.2）。</td></tr>
+              <tr><td><code>issuer</code></td><td><code>Name</code>（X.501）</td><td><code>30 45 31 0b …</code></td><td>C=JP, O=Example Trust, CN=Example Issuing CA E1</td><td>署名した CA の <code>subject</code> と一致。チェーンをつなぐ鍵。</td></tr>
+              <tr><td><code>validity</code></td><td><code>SEQUENCE { notBefore, notAfter }</code></td><td><code>30 1e 17 0d …</code></td><td>2026-09-27 18:54:21Z 〜 2026-12-26 18:54:21Z</td><td>2049 年までは <code>UTCTime</code>（<code>17</code>）、2050 年以降は <code>GeneralizedTime</code>（<code>18</code>）。</td></tr>
+              <tr><td><code>subject</code></td><td><code>Name</code>（X.501）</td><td><code>30 62 31 0b …</code></td><td>C=JP, ST=Tokyo, L=Chiyoda-ku, O=Example Inc, CN=www.example.com</td><td>公開鍵の持ち主。ホスト名の照合には使われず、SAN を使います。</td></tr>
+              <tr><td><code>subjectPublicKeyInfo</code></td><td><code>SEQUENCE { algorithm, subjectPublicKey BIT STRING }</code></td><td><code>30 59 30 13 …</code></td><td>id-ecPublicKey / prime256v1 / <code>04‖X‖Y</code>（65 バイト）</td><td>対応する秘密鍵はサーバーの <code>server.key</code> にだけあります。</td></tr>
+              <tr><td><code>issuerUniqueID</code> / <code>subjectUniqueID</code></td><td><code>[1]</code> / <code>[2] IMPLICIT</code></td><td>—</td><td>（なし）</td><td>RFC 5280 準拠の CA は生成してはいけません（MUST NOT）。</td></tr>
+              <tr><td><code>extensions</code></td><td><code>[3] EXPLICIT Extensions</code></td><td><code>a3 82 01 50 …</code></td><td>9 個</td><td>v3 だけが持てます。詳細は「拡張」の章。</td></tr>
+              <tr><td><code>signatureAlgorithm</code></td><td><code>AlgorithmIdentifier</code></td><td><code>30 0a …</code></td><td>ecdsa-with-SHA384</td><td>署名対象外（改ざんされても TBS 内の <code>signature</code> と不一致で弾かれます）。</td></tr>
+              <tr><td><code>signatureValue</code></td><td><code>BIT STRING</code></td><td><code>03 68 00 30 65 …</code></td><td>ECDSA-Sig-Value（r, s）</td><td>DER(tbsCertificate) を SHA-384 → 発行 CA の秘密鍵で ECDSA 署名した値。</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <pre data-lang="text" data-title="RFC 5280 §4.1 — 証明書の ASN.1 定義（抜粋）">Certificate  ::=  SEQUENCE  {
+     tbsCertificate       TBSCertificate,
+     signatureAlgorithm   AlgorithmIdentifier,
+     signatureValue       BIT STRING  }
+
+TBSCertificate  ::=  SEQUENCE  {
+     version         [0]  EXPLICIT Version DEFAULT v1,
+     serialNumber         CertificateSerialNumber,
+     signature            AlgorithmIdentifier,
+     issuer               Name,
+     validity             Validity,
+     subject              Name,
+     subjectPublicKeyInfo SubjectPublicKeyInfo,
+     issuerUniqueID  [1]  IMPLICIT UniqueIdentifier OPTIONAL,
+     subjectUniqueID [2]  IMPLICIT UniqueIdentifier OPTIONAL,
+     extensions      [3]  EXPLICIT Extensions OPTIONAL }
+
+Version  ::=  INTEGER  {  v1(0), v2(1), v3(2)  }
+
+Validity ::= SEQUENCE {
+     notBefore      Time,
+     notAfter       Time }
+
+Time ::= CHOICE {
+     utcTime        UTCTime,
+     generalTime    GeneralizedTime }</pre>
+      </section>
+
+      <!-- 2. X.501 DN -->
+      <section class="chapter" id="dn">
+        <h2>X.501 の識別名（DN）：Subject と Issuer の正体</h2>
+        <p>X.509 は ITU-T の X.500 シリーズ（ディレクトリ）の一部です。そのうち <b>X.501</b>（The Directory: Models）が「名前」のモデル＝<b>識別名 Distinguished Name（DN）</b>を定義し、<b>X.509</b> がその名前を使って証明書の形式を定義しています。証明書の <code>subject</code> と <code>issuer</code> はどちらも X.501 の <code>Name</code> 型で、RFC 5280 §4.1.2.4 がインターネット用のプロファイルを決めています。</p>
+        <div class="note"><b>表記の注意：</b>「X.501 証明書」というものはありません。X.501 は名前のモデル、X.509 は証明書の形式です。X.500 ディレクトリでは DN がツリー上のエントリの住所（例：<code>C=JP</code> → <code>O=Example Inc</code> → <code>CN=www.example.com</code>）を表していたため、上位から順に並ぶ構造になっています。</div>
+
+        <div class="scene" id="sc-dn" data-title="Subject DN = RDNSequence をバイトまで分解">
+          <div class="stage" data-w="960" data-h="430">
+            <div class="label hide" data-el="l-disp" style="left:24px;top:12px">openssl x509 -noout -subject（OpenSSL 3.2 以降の既定表示）</div>
+            <div class="seg hide" data-el="disp" style="left:24px;top:34px">
+              <span class="c-gray">subject=</span><span class="c-cyan" data-el="s1">C=JP,</span><span class="c-lime" data-el="s2">ST=Tokyo,</span><span class="c-amber" data-el="s3">L=Chiyoda-ku,</span><span class="c-pink" data-el="s4">O=Example Inc,</span><span class="c-violet" data-el="s5">CN=www.example.com</span>
+            </div>
+
+            <div class="zone hide" data-el="rdnseq" data-label="subject Name ::= RDNSequence · 30 62（98 バイト）" style="left:16px;top:96px;width:928px;height:176px"></div>
+            <div class="node sm hide c-cyan" data-el="rdn1" style="left:23px;top:118px;width:178px">
+              <div class="node-h"><b class="node-t">RDN 1</b><span class="rr dim">SET 31 0b</span></div>
+              <div class="rr dim">SEQUENCE 30 09</div>
+              <div class="rr" data-el="ob1"><code>06 03 55 04 06</code></div>
+              <div class="rr v" data-el="oid1">2.5.4.6 → <b>C</b></div>
+              <div class="rr dim">countryName</div>
+              <div class="rr" data-el="vb1"><code>13 02</code> "JP"</div>
+              <div class="rr dim" data-el="ty1">PrintableString</div>
+            </div>
+            <div class="node sm hide c-lime" data-el="rdn2" style="left:207px;top:118px;width:178px">
+              <div class="node-h"><b class="node-t">RDN 2</b><span class="rr dim">SET 31 0e</span></div>
+              <div class="rr dim">SEQUENCE 30 0c</div>
+              <div class="rr" data-el="ob2"><code>06 03 55 04 08</code></div>
+              <div class="rr v" data-el="oid2">2.5.4.8 → <b>ST</b></div>
+              <div class="rr dim">stateOrProvinceName</div>
+              <div class="rr" data-el="vb2"><code>0c 05</code> "Tokyo"</div>
+              <div class="rr dim" data-el="ty2">UTF8String</div>
+            </div>
+            <div class="node sm hide c-amber" data-el="rdn3" style="left:391px;top:118px;width:178px">
+              <div class="node-h"><b class="node-t">RDN 3</b><span class="rr dim">SET 31 13</span></div>
+              <div class="rr dim">SEQUENCE 30 11</div>
+              <div class="rr" data-el="ob3"><code>06 03 55 04 07</code></div>
+              <div class="rr v" data-el="oid3">2.5.4.7 → <b>L</b></div>
+              <div class="rr dim">localityName</div>
+              <div class="rr" data-el="vb3"><code>0c 0a</code> "Chiyoda-ku"</div>
+              <div class="rr dim" data-el="ty3">UTF8String</div>
+            </div>
+            <div class="node sm hide c-pink" data-el="rdn4" style="left:575px;top:118px;width:178px">
+              <div class="node-h"><b class="node-t">RDN 4</b><span class="rr dim">SET 31 14</span></div>
+              <div class="rr dim">SEQUENCE 30 12</div>
+              <div class="rr" data-el="ob4"><code>06 03 55 04 0a</code></div>
+              <div class="rr v" data-el="oid4">2.5.4.10 → <b>O</b></div>
+              <div class="rr dim">organizationName</div>
+              <div class="rr" data-el="vb4"><code>0c 0b</code> "Example Inc"</div>
+              <div class="rr dim" data-el="ty4">UTF8String</div>
+            </div>
+            <div class="node sm hide c-violet" data-el="rdn5" style="left:759px;top:118px;width:178px">
+              <div class="node-h"><b class="node-t">RDN 5</b><span class="rr dim">SET 31 18</span></div>
+              <div class="rr dim">SEQUENCE 30 16</div>
+              <div class="rr" data-el="ob5"><code>06 03 55 04 03</code></div>
+              <div class="rr v" data-el="oid5">2.5.4.3 → <b>CN</b></div>
+              <div class="rr dim">commonName</div>
+              <div class="rr" data-el="vb5"><code>0c 0f</code> "www.example.com"</div>
+              <div class="rr dim" data-el="ty5">UTF8String</div>
+            </div>
+
+            <div class="file hide" data-el="cmp1" style="left:28px;top:118px;width:440px">
+              <div class="file-h">server.crt の issuer（offset 47, 71 バイト）</div>
+              <div class="file-b bytes">30 45 31 0b 30 09 06 03 55 04 06 13 02 4a 50 31 16 30 14 06 03
+55 04 0a 0c 0d 45 78 61 6d 70 6c 65 20 54 72 75 73 74 31 1e 30
+1c 06 03 55 04 03 0c 15 45 78 61 6d 70 6c 65 20 49 73 73 75 69
+6e 67 20 43 41 20 45 31</div>
+            </div>
+            <div class="file hide c-green" data-el="cmp2" style="left:492px;top:118px;width:440px">
+              <div class="file-h">inter.crt の subject（offset 147, 71 バイト）</div>
+              <div class="file-b bytes">30 45 31 0b 30 09 06 03 55 04 06 13 02 4a 50 31 16 30 14 06 03
+55 04 0a 0c 0d 45 78 61 6d 70 6c 65 20 54 72 75 73 74 31 1e 30
+1c 06 03 55 04 03 0c 15 45 78 61 6d 70 6c 65 20 49 73 73 75 69
+6e 67 20 43 41 20 45 31</div>
+            </div>
+            <div class="chip hide c-green" data-el="cmpok" style="left:28px;top:244px">issuer_hash = dd145d05 ＝ inter.crt の subject_hash = dd145d05</div>
+
+            <div class="label hide" data-el="l-rfc" style="left:24px;top:296px">RFC 4514 文字列（-nameopt RFC2253）：最後の RDN から逆順</div>
+            <div class="seg hide" data-el="rfc" style="left:24px;top:318px">
+              <span class="c-gray">subject=</span><span class="c-violet hide" data-el="r5">CN=www.example.com,</span><span class="c-pink hide" data-el="r4">O=Example Inc,</span><span class="c-amber hide" data-el="r3">L=Chiyoda-ku,</span><span class="c-lime hide" data-el="r2">ST=Tokyo,</span><span class="c-cyan hide" data-el="r1">C=JP</span>
+            </div>
+            <div class="chip hide c-gray" data-el="alt" style="left:24px;top:378px">subject=C = JP, ST = Tokyo, L = Chiyoda-ku, O = Example Inc, CN = www.example.com</div>
+          </div>
+        </div>
+
+        <h3>DN 属性と OID の早見表</h3>
+        <div class="tbl">
+          <table class="ref">
+            <thead><tr><th>略号</th><th>属性名</th><th>OID</th><th>DER の OID 部</th><th>値の型</th><th>メモ</th></tr></thead>
+            <tbody>
+              <tr><td><code>C</code></td><td>countryName</td><td>2.5.4.6</td><td><code>06 03 55 04 06</code></td><td>PrintableString（2 文字）</td><td>ISO 3166 の 2 文字コード（<code>JP</code>）</td></tr>
+              <tr><td><code>ST</code></td><td>stateOrProvinceName</td><td>2.5.4.8</td><td><code>06 03 55 04 08</code></td><td>DirectoryString</td><td>都道府県（<code>Tokyo</code>）</td></tr>
+              <tr><td><code>L</code></td><td>localityName</td><td>2.5.4.7</td><td><code>06 03 55 04 07</code></td><td>DirectoryString</td><td>市区町村</td></tr>
+              <tr><td><code>O</code></td><td>organizationName</td><td>2.5.4.10</td><td><code>06 03 55 04 0a</code></td><td>DirectoryString</td><td>OV/EV 証明書で CA が審査した組織名</td></tr>
+              <tr><td><code>OU</code></td><td>organizationalUnitName</td><td>2.5.4.11</td><td><code>06 03 55 04 0b</code></td><td>DirectoryString</td><td>公開 TLS 証明書では 2022-09-01 以降使用禁止（CA/B Forum Ballot SC47v2）</td></tr>
+              <tr><td><code>CN</code></td><td>commonName</td><td>2.5.4.3</td><td><code>06 03 55 04 03</code></td><td>DirectoryString</td><td>表示用。ホスト名照合には SAN を使う</td></tr>
+              <tr><td><code>serialNumber</code></td><td>serialNumber</td><td>2.5.4.5</td><td><code>06 03 55 04 05</code></td><td>PrintableString</td><td>証明書のシリアル番号とは別物（EV の登記番号など）</td></tr>
+              <tr><td><code>DC</code></td><td>domainComponent</td><td>0.9.2342.19200300.100.1.25</td><td><code>06 0a 09 92 26 89 93 f2 2c 64 01 19</code></td><td>IA5String</td><td>Active Directory CA などで <code>DC=example,DC=com</code></td></tr>
+              <tr><td><code>emailAddress</code></td><td>emailAddress（PKCS #9）</td><td>1.2.840.113549.1.9.1</td><td><code>06 09 2a 86 48 86 f7 0d 01 09 01</code></td><td>IA5String</td><td>DN に入れるのは古い流儀。SAN の <code>email:</code>（rfc822Name）を使う</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="cols">
+          <pre data-lang="text" data-title="RFC 5280 §4.1.2.4 — Name の ASN.1">Name ::= CHOICE { -- only one possibility for now --
+  rdnSequence  RDNSequence }
+
+RDNSequence ::= SEQUENCE OF RelativeDistinguishedName
+
+RelativeDistinguishedName ::=
+  SET SIZE (1..MAX) OF AttributeTypeAndValue
+
+AttributeTypeAndValue ::= SEQUENCE {
+  type     AttributeType,
+  value    AttributeValue }
+
+AttributeType ::= OBJECT IDENTIFIER
+AttributeValue ::= ANY -- DEFINED BY AttributeType</pre>
+          <pre data-lang="bash" data-title="同じ DN の 4 通りの表示（OpenSSL 3.5）">$ openssl x509 -in server.crt -noout -subject
+subject=C=JP, ST=Tokyo, L=Chiyoda-ku, O=Example Inc, CN=www.example.com
+$ openssl x509 -in server.crt -noout -subject -nameopt RFC2253
+subject=CN=www.example.com,O=Example Inc,L=Chiyoda-ku,ST=Tokyo,C=JP
+$ openssl x509 -in server.crt -noout -subject -nameopt oneline
+subject=C = JP, ST = Tokyo, L = Chiyoda-ku, O = Example Inc, CN = www.example.com
+$ openssl x509 -in server.crt -noout -subject -nameopt RFC2253,oid
+subject=2.5.4.3=www.example.com,2.5.4.10=Example Inc,2.5.4.7=Chiyoda-ku,2.5.4.8=Tokyo,2.5.4.6=JP</pre>
+        </div>
+      </section>
+
+      <!-- 3. DER / PEM -->
+      <section class="chapter" id="encoding">
+        <h2>エンコード：DER の TLV と PEM</h2>
+        <p>証明書の実体は ASN.1 を <b>DER</b>（X.690 Distinguished Encoding Rules）で符号化したバイナリです。DER はすべての値を <b>T</b>ag・<b>L</b>ength・<b>V</b>alue の 3 つ組で表し、同じ値の符号化が 1 通りに決まる（署名対象として安定する）ように規則を絞っています。<b>PEM</b> は DER を base64 にして <code>-----BEGIN CERTIFICATE-----</code> 行で挟んだテキスト形式（RFC 7468）です。</p>
+
+        <div class="scene" id="sc-der" data-title="PEM → DER → TLV を 1 バイトずつ読む">
+          <div class="stage" data-w="960" data-h="540">
+            <div class="file hide" data-el="pem" style="left:16px;top:16px;width:470px">
+              <div class="file-h">server.crt（PEM · 19 行）</div>
+              <pre data-lang="pem">-----BEGIN CERTIFICATE-----
+MIIDGzCCAqGgAwIBAgIUKkzQ89ynKwKETjWYJU+d3jPwZrowCgYIKoZIzj0EAwMw
+RTELMAkGA1UEBhMCSlAxFjAUBgNVBAoMDUV4YW1wbGUgVHJ1c3QxHjAcBgNVBAMM
+…（中略：64 文字 × 14 行）…
+dgOX7Griwzai8WCsMgjrFmCaGql/4t6CnwaDdw+EDg==
+-----END CERTIFICATE-----</pre>
+            </div>
+            <div class="term tiny hide" data-el="t3" style="left:502px;top:16px;width:442px;height:160px">
+              <div class="term-h">bash — ~/pki</div>
+              <div class="term-b"></div>
+            </div>
+
+            <div class="file hide" data-el="hexf" style="left:16px;top:188px;width:928px">
+              <div class="file-h">server.der（799 バイト）— 行頭は 16 進オフセット、構造の区切りごとに抜粋</div>
+              <div class="bytes hex" style="padding:4px 10px"><i>000  </i><span data-el="h-cert">30 82 03 1b</span> <span data-el="h-tbs">30 82 02 a1</span> <span data-el="h-ver">a0 03 02 01 02</span> <span data-el="h-ser">02 14 2a 4c d0 f3 dc a7 2b 02 84 4e 35 98 25 4f 9d de 33 f0 66 ba</span>
+<i>023  </i><span data-el="h-alg">30 0a 06 08 2a 86 48 ce 3d 04 03 03</span> <span data-el="h-iss">30 45 31 0b 30 09 06 03 55 04 06 13 02 4a 50</span> <span data-el="h-iss2">31 16 30 14 06 03 55 04 0a 0c 0d …</span>
+<i>076  </i><span data-el="h-val">30 1e</span> <span data-el="h-nb">17 0d 32 36 30 39 32 37 31 38 35 34 32 31 5a</span> <span data-el="h-na">17 0d 32 36 31 32 32 36 31 38 35 34 32 31 5a</span>
+<i>0fa  </i><span data-el="h-spki">30 59 30 13 06 07 2a 86 48 ce 3d 02 01 06 08 2a 86 48 ce 3d 03 01 07</span> <span data-el="h-bit">03 42 00 04 40 05 5e c5 d8 …</span>
+<i>155  </i><span data-el="h-ext">a3 82 01 50 30 82 01 4c</span> <span data-el="h-bc">30 0c 06 03 55 1d 13 01 01 ff 04 02 30 00</span> …
+<i>2a9  </i><span data-el="h-salg">30 0a 06 08 2a 86 48 ce 3d 04 03 03</span> <span data-el="h-sig">03 68 00 30 65 02 31 00 a5 64 a6 62 …</span></div>
+            </div>
+
+            <div class="seg hide" data-el="tlv" style="left:16px;top:386px;width:564px">
+              <span class="c-cyan" style="width:150px"><small>Tag</small><b data-el="tv-t">30</b></span><span class="c-amber" style="width:150px"><small>Length</small><b data-el="tv-l">82 03 1b</b></span><span class="c-violet" style="flex:1"><small>Value</small><b data-el="tv-v">795 バイト</b></span>
+            </div>
+            <div class="txt hide" data-el="tlvx" style="left:16px;top:452px;width:564px">0x30 = SEQUENCE（構造型）。長さの先頭 0x82 は「続く 2 バイトが長さ」の長形式。</div>
+
+            <div class="file hide" data-el="tags" style="left:600px;top:386px;width:344px">
+              <div class="file-h">DER タグ早見（1 バイト目）</div>
+              <pre data-lang="text">30 SEQUENCE         31 SET
+02 INTEGER          06 OBJECT IDENTIFIER
+03 BIT STRING       04 OCTET STRING
+0c UTF8String       13 PrintableString
+17 UTCTime          18 GeneralizedTime
+a0 [0] EXPLICIT     a3 [3] EXPLICIT</pre>
+            </div>
+          </div>
+        </div>
+
+        <h3>DER のタグと長さ</h3>
+        <div class="tbl">
+          <table class="ref">
+            <thead><tr><th>1 バイト目</th><th>型</th><th>証明書のどこに出るか</th><th>例（server.der）</th></tr></thead>
+            <tbody>
+              <tr><td><code>30</code></td><td>SEQUENCE（構造型）</td><td>Certificate / TBSCertificate / AlgorithmIdentifier / Validity / Extension</td><td><code>30 82 03 1b</code>（795 バイトの SEQUENCE）</td></tr>
+              <tr><td><code>31</code></td><td>SET（構造型）</td><td>DN の各 RDN</td><td><code>31 0b 30 09 …</code></td></tr>
+              <tr><td><code>02</code></td><td>INTEGER</td><td>version の中身、serialNumber、ECDSA の r / s</td><td><code>02 14 2a 4c …</code></td></tr>
+              <tr><td><code>06</code></td><td>OBJECT IDENTIFIER</td><td>アルゴリズム、DN 属性、拡張の種類</td><td><code>06 03 55 04 03</code> = 2.5.4.3</td></tr>
+              <tr><td><code>0c</code> / <code>13</code> / <code>16</code></td><td>UTF8String / PrintableString / IA5String</td><td>DN の値、SAN の文字列（dNSName は IA5String）</td><td><code>13 02 4a 50</code> = "JP"</td></tr>
+              <tr><td><code>17</code> / <code>18</code></td><td>UTCTime / GeneralizedTime</td><td>validity</td><td><code>17 0d 32 36 30 39 …5a</code> = "260927185421Z"</td></tr>
+              <tr><td><code>03</code></td><td>BIT STRING</td><td>公開鍵、署名値、keyUsage</td><td><code>03 42 00 04 …</code>（先頭 00 は未使用ビット数）</td></tr>
+              <tr><td><code>04</code></td><td>OCTET STRING</td><td>拡張の <code>extnValue</code>（中にさらに DER）、SKI</td><td><code>04 02 30 00</code></td></tr>
+              <tr><td><code>01</code></td><td>BOOLEAN</td><td>拡張の <code>critical</code></td><td><code>01 01 ff</code> = TRUE</td></tr>
+              <tr><td><code>a0</code> / <code>a3</code></td><td>文脈タグ [0] / [3]（構造型）</td><td>version / extensions</td><td><code>a0 03 02 01 02</code></td></tr>
+              <tr><td><code>82</code> / <code>87</code> / <code>86</code></td><td>文脈タグ [2] / [7] / [6]（単純型, IMPLICIT）</td><td>SAN の dNSName / iPAddress、AIA 等の URI</td><td><code>82 0f 77 77 77 …</code> = DNS:www.example.com</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>長さは 127 以下なら 1 バイト（短形式：<code>0d</code> = 13）、128 以上なら先頭バイトの上位ビットを立てて「後ろに続く長さバイト数」を示します（長形式：<code>82 03 1b</code> = 2 バイトで 0x031b = 795）。OID は先頭 2 要素を <code>40×X+Y</code> の 1 バイトに、以降を 7 ビットずつの可変長に詰めます（<code>2a 86 48 ce 3d 04 03 03</code> = 1.2.840.10045.4.3.3）。</p>
+
+        <pre data-lang="bash" data-title="openssl asn1parse -in server.crt（全文）">    0:d=0  hl=4 l= 795 cons: SEQUENCE
+    4:d=1  hl=4 l= 673 cons: SEQUENCE
+    8:d=2  hl=2 l=   3 cons: cont [ 0 ]
+   10:d=3  hl=2 l=   1 prim: INTEGER           :02
+   13:d=2  hl=2 l=  20 prim: INTEGER           :2A4CD0F3DCA72B02844E3598254F9DDE33F066BA
+   35:d=2  hl=2 l=  10 cons: SEQUENCE
+   37:d=3  hl=2 l=   8 prim: OBJECT            :ecdsa-with-SHA384
+   47:d=2  hl=2 l=  69 cons: SEQUENCE
+   49:d=3  hl=2 l=  11 cons: SET
+   51:d=4  hl=2 l=   9 cons: SEQUENCE
+   53:d=5  hl=2 l=   3 prim: OBJECT            :countryName
+   58:d=5  hl=2 l=   2 prim: PRINTABLESTRING   :JP
+   62:d=3  hl=2 l=  22 cons: SET
+   64:d=4  hl=2 l=  20 cons: SEQUENCE
+   66:d=5  hl=2 l=   3 prim: OBJECT            :organizationName
+   71:d=5  hl=2 l=  13 prim: UTF8STRING        :Example Trust
+   86:d=3  hl=2 l=  30 cons: SET
+   88:d=4  hl=2 l=  28 cons: SEQUENCE
+   90:d=5  hl=2 l=   3 prim: OBJECT            :commonName
+   95:d=5  hl=2 l=  21 prim: UTF8STRING        :Example Issuing CA E1
+  118:d=2  hl=2 l=  30 cons: SEQUENCE
+  120:d=3  hl=2 l=  13 prim: UTCTIME           :260927185421Z
+  135:d=3  hl=2 l=  13 prim: UTCTIME           :261226185421Z
+  150:d=2  hl=2 l=  98 cons: SEQUENCE
+  152:d=3  hl=2 l=  11 cons: SET
+  154:d=4  hl=2 l=   9 cons: SEQUENCE
+  156:d=5  hl=2 l=   3 prim: OBJECT            :countryName
+  161:d=5  hl=2 l=   2 prim: PRINTABLESTRING   :JP
+  165:d=3  hl=2 l=  14 cons: SET
+  167:d=4  hl=2 l=  12 cons: SEQUENCE
+  169:d=5  hl=2 l=   3 prim: OBJECT            :stateOrProvinceName
+  174:d=5  hl=2 l=   5 prim: UTF8STRING        :Tokyo
+  181:d=3  hl=2 l=  19 cons: SET
+  183:d=4  hl=2 l=  17 cons: SEQUENCE
+  185:d=5  hl=2 l=   3 prim: OBJECT            :localityName
+  190:d=5  hl=2 l=  10 prim: UTF8STRING        :Chiyoda-ku
+  202:d=3  hl=2 l=  20 cons: SET
+  204:d=4  hl=2 l=  18 cons: SEQUENCE
+  206:d=5  hl=2 l=   3 prim: OBJECT            :organizationName
+  211:d=5  hl=2 l=  11 prim: UTF8STRING        :Example Inc
+  224:d=3  hl=2 l=  24 cons: SET
+  226:d=4  hl=2 l=  22 cons: SEQUENCE
+  228:d=5  hl=2 l=   3 prim: OBJECT            :commonName
+  233:d=5  hl=2 l=  15 prim: UTF8STRING        :www.example.com
+  250:d=2  hl=2 l=  89 cons: SEQUENCE
+  252:d=3  hl=2 l=  19 cons: SEQUENCE
+  254:d=4  hl=2 l=   7 prim: OBJECT            :id-ecPublicKey
+  263:d=4  hl=2 l=   8 prim: OBJECT            :prime256v1
+  273:d=3  hl=2 l=  66 prim: BIT STRING
+  341:d=2  hl=4 l= 336 cons: cont [ 3 ]
+  345:d=3  hl=4 l= 332 cons: SEQUENCE
+  349:d=4  hl=2 l=  12 cons: SEQUENCE
+  351:d=5  hl=2 l=   3 prim: OBJECT            :X509v3 Basic Constraints
+  356:d=5  hl=2 l=   1 prim: BOOLEAN           :255
+  359:d=5  hl=2 l=   2 prim: OCTET STRING      [HEX DUMP]:3000
+  363:d=4  hl=2 l=  14 cons: SEQUENCE
+  365:d=5  hl=2 l=   3 prim: OBJECT            :X509v3 Key Usage
+  370:d=5  hl=2 l=   1 prim: BOOLEAN           :255
+  373:d=5  hl=2 l=   4 prim: OCTET STRING      [HEX DUMP]:03020780
+  379:d=4  hl=2 l=  19 cons: SEQUENCE
+  381:d=5  hl=2 l=   3 prim: OBJECT            :X509v3 Extended Key Usage
+  386:d=5  hl=2 l=  12 prim: OCTET STRING      [HEX DUMP]:300A06082B06010505070301
+  400:d=4  hl=2 l=  29 cons: SEQUENCE
+  402:d=5  hl=2 l=   3 prim: OBJECT            :X509v3 Subject Key Identifier
+  407:d=5  hl=2 l=  22 prim: OCTET STRING      [HEX DUMP]:0414794079F30EA315778F45F8F8F81B61900181A152
+  431:d=4  hl=2 l=  31 cons: SEQUENCE
+  433:d=5  hl=2 l=   3 prim: OBJECT            :X509v3 Authority Key Identifier
+  438:d=5  hl=2 l=  24 prim: OCTET STRING      [HEX DUMP]:301680149221CB1D8F9ABA15795F8AF13485D47FD23345F5
+  464:d=4  hl=2 l=  45 cons: SEQUENCE
+  466:d=5  hl=2 l=   3 prim: OBJECT            :X509v3 Subject Alternative Name
+  471:d=5  hl=2 l=  38 prim: OCTET STRING      [HEX DUMP]:3024820F7777772E6578616D706C652E636F6D820B6578616D706C652E636F6D8704C000020A
+  511:d=4  hl=2 l=  96 cons: SEQUENCE
+  513:d=5  hl=2 l=   8 prim: OBJECT            :Authority Information Access
+  523:d=5  hl=2 l=  84 prim: OCTET STRING      [HEX DUMP]:3052302606082B06010505073001861A687474703A2F2F6F6373702E63612E6578616D706C652E636F6D302806082B06010505073002861C687474703A2F2F63612E6578616D706C652E636F6D2F65312E637274
+  609:d=4  hl=2 l=  49 cons: SEQUENCE
+  611:d=5  hl=2 l=   3 prim: OBJECT            :X509v3 CRL Distribution Points
+  616:d=5  hl=2 l=  42 prim: OCTET STRING      [HEX DUMP]:30283026A024A0228620687474703A2F2F63726C2E63612E6578616D706C652E636F6D2F65312E63726C
+  660:d=4  hl=2 l=  19 cons: SEQUENCE
+  662:d=5  hl=2 l=   3 prim: OBJECT            :X509v3 Certificate Policies
+  667:d=5  hl=2 l=  12 prim: OCTET STRING      [HEX DUMP]:300A3008060667810C010202
+  681:d=1  hl=2 l=  10 cons: SEQUENCE
+  683:d=2  hl=2 l=   8 prim: OBJECT            :ecdsa-with-SHA384
+  693:d=1  hl=2 l= 104 prim: BIT STRING</pre>
+        <p><code>d=</code> は入れ子の深さ、<code>hl=</code> はタグ＋長さのヘッダ長、<code>l=</code> は値の長さ、<code>cons</code>/<code>prim</code> は構造型／単純型です。たとえば 4 行目の <code>4:d=1 hl=4 l=673</code> が tbsCertificate で、<b>offset 4 から 4+673 = 677 バイト</b>が署名の対象です（<code>openssl asn1parse -in server.crt -strparse 4 -noout -out tbs.der</code> で取り出せます）。</p>
+      </section>
+
+      <!-- 4. 拡張 -->
+      <section class="chapter" id="extensions">
+        <h2>拡張（X509v3 extensions）</h2>
+        <p>v3 証明書の <code>extensions</code> は <code>Extension</code> の SEQUENCE です。各拡張は OID・critical フラグ・<code>extnValue</code>（中にさらに DER が入った OCTET STRING）の 3 つ組で、<b>「この鍵は CA として使えるか」「どのホスト名に有効か」「失効はどこで確かめるか」</b>といった検証ルールはすべてここに書かれています。</p>
+
+        <div class="scene" id="sc-ext" data-title="拡張を 1 つずつ：何が書かれ、誰がどう使うか">
+          <div class="stage" data-w="960" data-h="520">
+            <div class="label acc" style="left:16px;top:10px">X509v3 extensions · a3 82 01 50（server.crt）</div>
+            <div class="asn hide" data-el="e-bc" style="left:16px;top:34px;width:424px"><b>basicConstraints</b><span>2.5.29.19</span><em class="crit">CRITICAL</em></div>
+            <div class="asn hide" data-el="e-ku" style="left:16px;top:81px;width:424px"><b>keyUsage</b><span>2.5.29.15</span><em class="crit">CRITICAL</em></div>
+            <div class="asn hide" data-el="e-eku" style="left:16px;top:128px;width:424px"><b>extendedKeyUsage</b><span>2.5.29.37</span></div>
+            <div class="asn hide" data-el="e-ski" style="left:16px;top:175px;width:424px"><b>subjectKeyIdentifier</b><span>2.5.29.14</span></div>
+            <div class="asn hide" data-el="e-aki" style="left:16px;top:222px;width:424px"><b>authorityKeyIdentifier</b><span>2.5.29.35</span></div>
+            <div class="asn hide" data-el="e-san" style="left:16px;top:269px;width:424px"><b>subjectAltName</b><span>2.5.29.17</span></div>
+            <div class="asn hide" data-el="e-aia" style="left:16px;top:316px;width:424px"><b>authorityInfoAccess</b><span>1.3.6.1.5.5.7.1.1</span></div>
+            <div class="asn hide" data-el="e-crl" style="left:16px;top:363px;width:424px"><b>cRLDistributionPoints</b><span>2.5.29.31</span></div>
+            <div class="asn hide" data-el="e-cp" style="left:16px;top:410px;width:424px"><b>certificatePolicies</b><span>2.5.29.32</span></div>
+            <div class="asn hide" data-el="e-sct" style="left:16px;top:457px;width:424px;border-style:dashed"><b>CT SCT list</b><span>1.3.6.1.4.1.11129.2.4.2（公開 CA）</span></div>
+
+            <div class="file hide" data-el="det" style="left:462px;top:16px;width:482px;height:236px">
+              <div class="file-h" data-el="det-h">RFC 5280 §4.1 — Extension</div>
+              <div data-el="det-b"></div>
+            </div>
+            <div class="file hide" data-el="der" style="left:462px;top:266px;width:482px;height:96px">
+              <div class="file-h">extnValue を含む Extension の DER</div>
+              <div class="file-b bytes" data-el="der-b"></div>
+            </div>
+            <div class="node hide" data-el="who" style="left:462px;top:378px;width:482px">
+              <div class="node-h"><i data-icon="eye"></i><b class="node-t" data-el="who-t">誰が見るか</b></div>
+              <div class="txt" data-el="who-b" style="margin-top:4px"></div>
+            </div>
+          </div>
+        </div>
+
+        <h3>主な拡張の早見表</h3>
+        <div class="tbl">
+          <table class="ref">
+            <thead><tr><th>拡張</th><th>OID</th><th>critical</th><th>openssl -text での例</th><th>誰がどう使うか</th></tr></thead>
+            <tbody>
+              <tr><td><code>basicConstraints</code></td><td>2.5.29.19</td><td>CA 証明書では MUST critical</td><td><code>CA:FALSE</code> / <code>CA:TRUE, pathlen:0</code></td><td>パス検証。署名者（中間・ルート）が <code>CA:TRUE</code> か、下に何段まで CA を置けるか</td></tr>
+              <tr><td><code>keyUsage</code></td><td>2.5.29.15</td><td>SHOULD critical</td><td><code>Digital Signature</code> / <code>Certificate Sign, CRL Sign</code></td><td>鍵の暗号的な用途。CA には <code>keyCertSign</code> が必須</td></tr>
+              <tr><td><code>extendedKeyUsage</code></td><td>2.5.29.37</td><td>どちらも可</td><td><code>TLS Web Server Authentication</code></td><td>アプリ用途。<code>serverAuth</code>=1.3.6.1.5.5.7.3.1、<code>clientAuth</code>=…3.2</td></tr>
+              <tr><td><code>subjectAltName</code></td><td>2.5.29.17</td><td>subject が空なら MUST critical</td><td><code>DNS:www.example.com, IP Address:192.0.2.10</code></td><td>TLS クライアントのホスト名照合（CN は使わない）</td></tr>
+              <tr><td><code>subjectKeyIdentifier</code></td><td>2.5.29.14</td><td>MUST NOT critical</td><td><code>79:40:79:F3:…</code></td><td>この証明書の公開鍵の ID（下位証明書の AKI と照合）</td></tr>
+              <tr><td><code>authorityKeyIdentifier</code></td><td>2.5.29.35</td><td>MUST NOT critical</td><td><code>92:21:CB:1D:…</code></td><td>発行者の SKI。同名 CA が複数鍵を持つときのパス構築</td></tr>
+              <tr><td><code>authorityInfoAccess</code></td><td>1.3.6.1.5.5.7.1.1</td><td>MUST NOT critical</td><td><code>OCSP - URI:…</code> / <code>CA Issuers - URI:…</code></td><td>OCSP 問い合わせ先、中間証明書の取得先</td></tr>
+              <tr><td><code>cRLDistributionPoints</code></td><td>2.5.29.31</td><td>SHOULD non-critical</td><td><code>URI:http://crl.ca.example.com/e1.crl</code></td><td>CRL（失効リスト）の取得先</td></tr>
+              <tr><td><code>certificatePolicies</code></td><td>2.5.29.32</td><td>通常 non-critical</td><td><code>Policy: 2.23.140.1.2.2</code></td><td>発行ポリシー。2.23.140.1.2.1=DV、.2.2=OV、.2.3=IV、2.23.140.1.1=EV</td></tr>
+              <tr><td>CT Precertificate SCTs</td><td>1.3.6.1.4.1.11129.2.4.2</td><td>non-critical</td><td><code>Signed Certificate Timestamp: …</code></td><td>CT ログの受領証。ブラウザが公開ログ登録を確認</td></tr>
+              <tr><td>CT Precertificate Poison</td><td>1.3.6.1.4.1.11129.2.4.3</td><td>critical</td><td><code>CT Precertificate Poison: critical</code></td><td>ログ提出用プレ証明書だけに入る（TLS では使えないようにする毒）</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- 5. 失敗 -->
+      <section class="chapter" id="failures">
+        <h2>失敗・改ざんケース</h2>
+        <p>検証が落ちる場所は「名前（SAN）」「時刻（validity）」「署名（signatureValue）」の 3 つに大別できます。最後の署名は、TBS のどこを 1 ビット変えても SHA-384 が別物になるため必ず検出されます。</p>
+
+        <div class="scene" id="sc-fail" data-title="ホスト名違い・期限切れ・1 バイト改ざん">
+          <div class="stage" data-w="960" data-h="500">
+            <div class="node" data-el="cli" style="left:16px;top:20px;width:440px">
+              <div class="node-h"><i data-icon="terminal"></i><b class="node-t">検証する側</b></div>
+              <div class="node-s">openssl verify / TLS クライアント<br>trust: root.crt, untrusted: inter.crt</div>
+            </div>
+            <div class="term" data-el="t5" style="left:16px;top:116px;width:440px;height:368px">
+              <div class="term-h">bash — ~/pki</div>
+              <div class="term-b"></div>
+            </div>
+
+            <div class="file stampable" data-el="crt" style="left:480px;top:20px;width:290px">
+              <div class="file-h">server.crt（TBS の一部）</div>
+              <div class="file-b">
+                <div class="orow" data-el="c-sub"><b>subject </b> CN=www.example.com …</div>
+                <div class="orow" data-el="c-san"><b>SAN     </b> DNS:www.example.com
+          DNS:example.com, IP:192.0.2.10</div>
+                <div class="orow" data-el="c-nb"><b>notBefore</b> 260927185421Z</div>
+                <div class="orow" data-el="c-na"><b>notAfter </b> <span data-el="na-v">261226185421Z</span></div>
+                <div class="orow" data-el="c-sig"><b>signature</b> 30:65:02:31:00:a5:64:…</div>
+              </div>
+            </div>
+            <div class="node" data-el="ca" style="left:794px;top:20px;width:150px">
+              <div class="node-h"><i data-icon="key"></i><b class="node-t">E1 の公開鍵</b></div>
+              <div class="node-s">inter.crt の SPKI<br>P-384</div>
+            </div>
+
+            <div class="file hide" data-el="hc" style="left:480px;top:196px;width:464px">
+              <div class="file-h">署名の再計算（検証側）</div>
+              <div class="file-b">
+                <div class="orow"><b>e = SHA-384(DER(tbs))</b></div>
+                <div class="orow" data-el="hv"><i data-el="hvv">1879dd12dc69e0759875e7fc0c0507f35259e658…</i></div>
+                <div class="orow" data-el="ver"><b>ECDSA-Verify(Q_E1, e, (r, s))</b> → <span data-el="vres">OK</span></div>
+              </div>
+            </div>
+            <div class="file fs10 hide c-red" data-el="diff" style="left:480px;top:318px;width:464px">
+              <div class="file-h">攻撃者が notAfter の 1 バイトを書き換え（0x89）</div>
+              <pre data-lang="text">$ cmp -l server.der evil.der
+138  62  63
+$ xxd -s 0x87 -l 15 -c 15 server.der
+00000087: 170d 3236 3132 3236 3138 3534 3231 5a  ..261226185421Z
+$ xxd -s 0x87 -l 15 -c 15 evil.der
+00000087: 170d 3336 3132 3236 3138 3534 3231 5a  ..361226185421Z</pre>
+            </div>
+          </div>
+        </div>
+
+        <h3>どこで何のエラーになるか</h3>
+        <div class="tbl">
+          <table class="ref">
+            <thead><tr><th>原因</th><th>openssl verify（3.x）</th><th>curl（OpenSSL バックエンド）</th><th>Chrome</th></tr></thead>
+            <tbody>
+              <tr><td>SAN にないホスト名</td><td><code>error 62 at 0 depth lookup: hostname mismatch</code>（<code>-verify_hostname</code> 指定時）</td><td><code>curl: (60) SSL: no alternative certificate subject name matches target host name 'shop.example.com'</code></td><td><code>NET::ERR_CERT_COMMON_NAME_INVALID</code></td></tr>
+              <tr><td>期限切れ</td><td><code>error 10 at 0 depth lookup: certificate has expired</code></td><td><code>curl: (60) SSL certificate problem: certificate has expired</code></td><td><code>NET::ERR_CERT_DATE_INVALID</code></td></tr>
+              <tr><td>TBS の改ざん</td><td><code>error 7 at 0 depth lookup: certificate signature failure</code></td><td><code>curl: (60) SSL certificate problem: certificate signature failure</code></td><td>（接続拒否。表示コードは状況により異なる）</td></tr>
+              <tr><td>知らない critical 拡張</td><td><code>error 34 at 0 depth lookup: unhandled critical extension</code></td><td><code>curl: (60) SSL certificate problem: unhandled critical extension</code></td><td>（接続拒否）</td></tr>
+              <tr><td>用途違い（EKU）</td><td><code>error 26 at 0 depth lookup: unsuitable certificate purpose</code>（<code>-purpose sslclient</code>）</td><td>—</td><td>—</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="note">OpenSSL の <code>verify</code> は <code>-verify_hostname</code> を付けない限りホスト名を見ません。上表の curl / Chrome のメッセージは各クライアントの表示で、OpenSSL のエラー番号とは独立です。</div>
+      </section>
+
+      <!-- 6. 実物の全文 -->
+      <section class="chapter" id="fulltext">
+        <h2>実物：openssl x509 -text の全文</h2>
+        <p>このページのシーンで使っている <code>server.crt</code>（OV 相当の DN、P-256 鍵、中間 CA「Example Issuing CA E1」が P-384 で署名）の全出力です。</p>
+        <pre data-lang="cert" data-title="$ openssl x509 -in server.crt -noout -text">Certificate:
+    Data:
+        Version: 3 (0x2)
+        Serial Number:
+            2a:4c:d0:f3:dc:a7:2b:02:84:4e:35:98:25:4f:9d:de:33:f0:66:ba
+        Signature Algorithm: ecdsa-with-SHA384
+        Issuer: C=JP, O=Example Trust, CN=Example Issuing CA E1
+        Validity
+            Not Before: Sep 27 18:54:21 2026 GMT
+            Not After : Dec 26 18:54:21 2026 GMT
+        Subject: C=JP, ST=Tokyo, L=Chiyoda-ku, O=Example Inc, CN=www.example.com
+        Subject Public Key Info:
+            Public Key Algorithm: id-ecPublicKey
+                Public-Key: (256 bit)
+                pub:
+                    04:40:05:5e:c5:d8:07:d9:bb:a4:4d:be:94:52:28:
+                    c2:30:1c:0d:8b:16:8d:1c:b0:9a:7f:46:64:c5:2a:
+                    87:5d:55:c7:0f:92:b3:f2:ef:0d:30:5b:3f:1c:b8:
+                    61:4f:27:94:f4:f5:fc:b0:c8:03:59:01:8e:a8:63:
+                    79:be:93:4b:1f
+                ASN1 OID: prime256v1
+                NIST CURVE: P-256
+        X509v3 extensions:
+            X509v3 Basic Constraints: critical
+                CA:FALSE
+            X509v3 Key Usage: critical
+                Digital Signature
+            X509v3 Extended Key Usage:
+                TLS Web Server Authentication
+            X509v3 Subject Key Identifier:
+                79:40:79:F3:0E:A3:15:77:8F:45:F8:F8:F8:1B:61:90:01:81:A1:52
+            X509v3 Authority Key Identifier:
+                92:21:CB:1D:8F:9A:BA:15:79:5F:8A:F1:34:85:D4:7F:D2:33:45:F5
+            X509v3 Subject Alternative Name:
+                DNS:www.example.com, DNS:example.com, IP Address:192.0.2.10
+            Authority Information Access:
+                OCSP - URI:http://ocsp.ca.example.com
+                CA Issuers - URI:http://ca.example.com/e1.crt
+            X509v3 CRL Distribution Points:
+                Full Name:
+                  URI:http://crl.ca.example.com/e1.crl
+
+            X509v3 Certificate Policies:
+                Policy: 2.23.140.1.2.2
+    Signature Algorithm: ecdsa-with-SHA384
+    Signature Value:
+        30:65:02:31:00:a5:64:a6:62:b6:94:90:04:cc:c4:7d:bf:e0:
+        cf:0f:a6:41:02:e2:a7:36:33:81:cd:bd:89:06:fd:3b:0c:c6:
+        2e:1b:a5:69:c3:53:9e:c2:14:c8:97:d9:31:de:e3:d4:f2:02:
+        30:13:be:92:09:ce:8e:b9:46:68:6f:4b:90:ea:ff:25:12:52:
+        76:03:97:ec:6a:e2:c3:36:a2:f1:60:ac:32:08:eb:16:60:9a:
+        1a:a9:7f:e2:de:82:9f:06:83:77:0f:84:0e</pre>
+        <pre data-lang="pem" data-title="server.crt（PEM 全文 · デモ用に生成した証明書）">-----BEGIN CERTIFICATE-----
+MIIDGzCCAqGgAwIBAgIUKkzQ89ynKwKETjWYJU+d3jPwZrowCgYIKoZIzj0EAwMw
+RTELMAkGA1UEBhMCSlAxFjAUBgNVBAoMDUV4YW1wbGUgVHJ1c3QxHjAcBgNVBAMM
+FUV4YW1wbGUgSXNzdWluZyBDQSBFMTAeFw0yNjA5MjcxODU0MjFaFw0yNjEyMjYx
+ODU0MjFaMGIxCzAJBgNVBAYTAkpQMQ4wDAYDVQQIDAVUb2t5bzETMBEGA1UEBwwK
+Q2hpeW9kYS1rdTEUMBIGA1UECgwLRXhhbXBsZSBJbmMxGDAWBgNVBAMMD3d3dy5l
+eGFtcGxlLmNvbTBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABEAFXsXYB9m7pE2+
+lFIowjAcDYsWjRywmn9GZMUqh11Vxw+Ss/LvDTBbPxy4YU8nlPT1/LDIA1kBjqhj
+eb6TSx+jggFQMIIBTDAMBgNVHRMBAf8EAjAAMA4GA1UdDwEB/wQEAwIHgDATBgNV
+HSUEDDAKBggrBgEFBQcDATAdBgNVHQ4EFgQUeUB58w6jFXePRfj4+BthkAGBoVIw
+HwYDVR0jBBgwFoAUkiHLHY+auhV5X4rxNIXUf9IzRfUwLQYDVR0RBCYwJIIPd3d3
+LmV4YW1wbGUuY29tggtleGFtcGxlLmNvbYcEwAACCjBgBggrBgEFBQcBAQRUMFIw
+JgYIKwYBBQUHMAGGGmh0dHA6Ly9vY3NwLmNhLmV4YW1wbGUuY29tMCgGCCsGAQUF
+BzAChhxodHRwOi8vY2EuZXhhbXBsZS5jb20vZTEuY3J0MDEGA1UdHwQqMCgwJqAk
+oCKGIGh0dHA6Ly9jcmwuY2EuZXhhbXBsZS5jb20vZTEuY3JsMBMGA1UdIAQMMAow
+CAYGZ4EMAQICMAoGCCqGSM49BAMDA2gAMGUCMQClZKZitpSQBMzEfb/gzw+mQQLi
+pzYzgc29iQb9OwzGLhulacNTnsIUyJfZMd7j1PICMBO+kgnOjrlGaG9LkOr/JRJS
+dgOX7Griwzai8WCsMgjrFmCaGql/4t6CnwaDdw+EDg==
+-----END CERTIFICATE-----</pre>
+        <p>公開 CA が発行した実際の証明書には、さらに CT の SCT が入っています。以下は 2026-09 時点で <code>example.com</code> が返したリーフ証明書の該当部分です（<code>openssl s_client -connect example.com:443 -servername example.com &lt;/dev/null | openssl x509 -noout -text</code>）。</p>
+        <pre data-lang="cert" data-title="実在の証明書の CT Precertificate SCTs（抜粋）">            CT Precertificate SCTs:
+                Signed Certificate Timestamp:
+                    Version   : v1 (0x0)
+                    Log ID    : 94:4E:43:87:FA:EC:C1:EF:81:F3:19:24:26:A8:18:65:
+                                01:C7:D3:5F:38:02:01:3F:72:67:7D:55:37:2E:19:D8
+                    Timestamp : Sep 26 22:59:12.866 2026 GMT
+                    Extensions: none
+                    Signature : ecdsa-with-SHA256
+                                30:45:02:21:00:AE:09:46:A1:45:AC:F0:39:CA:A3:DC:
+                                ...
+                Signed Certificate Timestamp:
+                    Version   : v1 (0x0)
+                    Log ID    : CB:38:F7:15:89:7C:84:A1:44:5F:5B:C1:DD:FB:C9:6E:
+                                F2:9A:59:CD:47:0A:69:05:85:B0:CB:14:C3:14:58:E7
+                    Timestamp : Sep 26 22:59:12.894 2026 GMT
+                    ...</pre>
+      </section>
+
+      <!-- 7. コマンド早見表 -->
+      <section class="chapter" id="commands">
+        <h2>コマンド早見表：openssl x509</h2>
+        <div class="tbl">
+          <table class="ref">
+            <thead><tr><th>コマンド / フラグ</th><th>何が出るか</th><th>出力例（server.crt）</th></tr></thead>
+            <tbody>
+              <tr><td><code>-in server.crt -noout -text</code></td><td>全フィールドを人間向けに表示</td><td>上の全文</td></tr>
+              <tr><td><code>-noout</code></td><td>末尾に PEM を出力しない（他のフラグと併用）</td><td>—</td></tr>
+              <tr><td><code>-subject</code> / <code>-issuer</code></td><td>DN を 1 行で</td><td><code>subject=C=JP, ST=Tokyo, L=Chiyoda-ku, O=Example Inc, CN=www.example.com</code></td></tr>
+              <tr><td><code>-nameopt RFC2253</code></td><td>DN を RFC 2253/4514 形式（逆順・区切り <code>,</code>）で</td><td><code>subject=CN=www.example.com,O=Example Inc,…,C=JP</code></td></tr>
+              <tr><td><code>-dates</code>（<code>-startdate</code> / <code>-enddate</code>）</td><td>notBefore / notAfter</td><td><code>notAfter=Dec 26 18:54:21 2026 GMT</code></td></tr>
+              <tr><td><code>-serial</code></td><td>シリアル番号（16 進）</td><td><code>serial=2A4CD0F3DCA72B02844E3598254F9DDE33F066BA</code></td></tr>
+              <tr><td><code>-fingerprint -sha256</code></td><td>DER 全体の SHA-256（指定なしは SHA-1）</td><td><code>sha256 Fingerprint=62:31:42:77:…:7A:5C:11</code></td></tr>
+              <tr><td><code>-ext subjectAltName,keyUsage</code></td><td>指定した拡張だけ（OpenSSL 3.0+）</td><td><code>DNS:www.example.com, DNS:example.com, IP Address:192.0.2.10</code></td></tr>
+              <tr><td><code>-pubkey</code></td><td>SubjectPublicKeyInfo を PEM で</td><td><code>-----BEGIN PUBLIC KEY-----</code></td></tr>
+              <tr><td><code>-checkend 86400</code></td><td>N 秒後に期限切れか（終了コード 1 = 切れる）</td><td><code>Certificate will not expire</code></td></tr>
+              <tr><td><code>-ocsp_uri</code></td><td>AIA の OCSP URL</td><td><code>http://ocsp.ca.example.com</code></td></tr>
+              <tr><td><code>-subject_hash</code> / <code>-issuer_hash</code></td><td>CApath の <code>&lt;hash&gt;.0</code> 用ハッシュ</td><td><code>-issuer_hash</code> → <code>dd145d05</code>（<code>-subject_hash</code> → <code>37792547</code>）</td></tr>
+              <tr><td><code>-purpose</code></td><td>用途ごとの可否</td><td><code>SSL server : Yes</code></td></tr>
+              <tr><td><code>-inform der</code> / <code>-outform der</code></td><td>入力／出力を DER に</td><td>—</td></tr>
+              <tr><td><code>openssl asn1parse -in server.crt</code></td><td>DER の TLV をそのまま列挙</td><td><code>0:d=0 hl=4 l= 795 cons: SEQUENCE</code></td></tr>
+              <tr><td><code>openssl verify -CAfile root.crt -untrusted inter.crt server.crt</code></td><td>チェーン検証（<code>-verify_hostname</code>、<code>-attime</code>、<code>-show_chain</code>）</td><td><code>server.crt: OK</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>形式の変換と拡張子の慣習</h3>
+        <div class="tbl">
+          <table class="ref">
+            <thead><tr><th>形式</th><th>中身</th><th>よくある拡張子</th><th>見分け方</th><th>変換コマンド</th></tr></thead>
+            <tbody>
+              <tr><td>PEM</td><td>DER を base64 化し BEGIN/END 行で挟む（RFC 7468）。1 ファイルに複数枚連結可</td><td><code>.pem</code> <code>.crt</code> <code>.cer</code></td><td><code>-----BEGIN CERTIFICATE-----</code></td><td><code>openssl x509 -in a.der -inform der -out a.pem</code></td></tr>
+              <tr><td>DER</td><td>ASN.1 のバイナリ 1 枚</td><td><code>.der</code> <code>.cer</code></td><td>先頭 <code>30 82</code></td><td><code>openssl x509 -in a.pem -outform der -out a.der</code></td></tr>
+              <tr><td>PKCS #12</td><td>証明書＋秘密鍵＋チェーンをパスワードで保護（RFC 7292）</td><td><code>.p12</code> <code>.pfx</code></td><td>DER（先頭 <code>30 82</code>）、<code>openssl pkcs12 -info</code></td><td><code>openssl pkcs12 -export -inkey server.key -in server.crt -certfile inter.crt -out server.pfx</code></td></tr>
+              <tr><td>PKCS #7（CMS）</td><td>証明書の束（鍵なし）</td><td><code>.p7b</code> <code>.p7c</code></td><td><code>-----BEGIN PKCS7-----</code></td><td><code>openssl crl2pkcs7 -nocrl -certfile fullchain.pem -out chain.p7b</code> / 戻す：<code>openssl pkcs7 -in chain.p7b -print_certs</code></td></tr>
+              <tr><td>秘密鍵（PKCS #8）</td><td>秘密鍵（暗号化なし／あり）</td><td><code>.key</code> <code>.pem</code></td><td><code>-----BEGIN PRIVATE KEY-----</code> / <code>ENCRYPTED PRIVATE KEY</code></td><td><code>openssl pkey -in old.key -out new.key</code></td></tr>
+              <tr><td>CSR（PKCS #10）</td><td>公開鍵＋subject＋申請者の署名</td><td><code>.csr</code> <code>.req</code></td><td><code>-----BEGIN CERTIFICATE REQUEST-----</code></td><td><code>openssl req -in server.csr -noout -text</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="note">拡張子は慣習にすぎず、中身の形式を保証しません。<code>.cer</code> は Windows のエクスポート時に DER と Base64（PEM）のどちらも選べるため、開く前に <code>head -c 30 file.cer | xxd</code> で先頭が <code>30 82</code>（DER）か <code>-----BEGIN</code>（PEM）かを確かめてください。OpenSSL 3.x の <code>pkcs12 -export</code> は既定で AES-256-CBC + PBKDF2 で暗号化します。古い環境で読めない場合は <code>-legacy</code> を付けます。</div>
+      </section>
+
+      <!-- 8. 手元で試す -->
+      <section class="chapter" id="try">
+        <h2>手元で試す</h2>
+        <p>OpenSSL 3.x（本ページは 3.5.7 で確認）と <code>xxd</code> があれば再現できます。小さな CA を 1 つ作り、そこで署名したサーバー証明書を読んで、1 バイト改ざんまで試します。Windows の Git Bash では <code>-subj "/C=…"</code> がパス変換されるため、先に <code>export MSYS_NO_PATHCONV=1</code> を実行してください。</p>
+        <pre data-lang="bash" data-title="手元で試す（OpenSSL 3.x）">mkdir -p ~/x509-lab &amp;&amp; cd ~/x509-lab
+
+# 1) 検証用の小さな CA（自己署名, P-384）
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-384 -noenc \
+  -keyout ca.key -out ca.crt -days 365 \
+  -subj "/C=JP/O=Example Trust/CN=Example Test CA"
+
+# 2) サーバー鍵（P-256）と CSR
+openssl req -new -newkey ec -pkeyopt ec_paramgen_curve:P-256 -noenc \
+  -keyout server.key -out server.csr \
+  -subj "/C=JP/ST=Tokyo/L=Chiyoda-ku/O=Example Inc/CN=www.example.com"
+
+# 3) CA が署名（拡張はここで付ける）
+cat > leaf.ext &lt;&lt;'EOF'
+basicConstraints = critical, CA:FALSE
+keyUsage         = critical, digitalSignature
+extendedKeyUsage = serverAuth
+subjectAltName   = DNS:www.example.com, DNS:example.com, IP:192.0.2.10
+EOF
+openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -sha384 -days 90 \
+  -extfile leaf.ext -out server.crt
+
+# 4) 中身を読む
+openssl x509 -in server.crt -noout -text
+openssl x509 -in server.crt -noout -subject -issuer -dates -serial
+openssl x509 -in server.crt -noout -subject -nameopt RFC2253
+openssl x509 -in server.crt -noout -ext subjectAltName,basicConstraints,keyUsage
+openssl x509 -in server.crt -noout -fingerprint -sha256
+
+# 5) DER にして先頭バイトと TLV を見る
+openssl x509 -in server.crt -outform der -out server.der
+xxd server.der | head -4
+openssl asn1parse -in server.crt -i | head -30
+
+# 6) 検証：成功 / ホスト名違い / 期限切れ（120 日後の時刻で検証。GNU date の書式）
+openssl verify -CAfile ca.crt -verify_hostname www.example.com server.crt
+openssl verify -CAfile ca.crt -verify_hostname shop.example.com server.crt
+openssl verify -CAfile ca.crt -attime "$(date -d '+120 days' +%s)" server.crt
+
+# 7) SAN の "www.example.com" の l(0x6c) を 1(0x31) に 1 バイト改ざん → 署名検証失敗
+xxd -p server.der | tr -d '\n' \
+  | sed 's/820f7777772e6578616d706c652e636f6d/820f7777772e6578616d7031652e636f6d/' \
+  | xxd -r -p > evil.der
+cmp -l server.der evil.der                       # 1 バイトだけ違う
+openssl x509 -in evil.der -inform der -out evil.crt
+openssl x509 -in evil.crt -noout -ext subjectAltName   # DNS:www.examp1e.com
+openssl verify -CAfile ca.crt evil.crt           # error 7: certificate signature failure
+
+# 8) 署名を手で検証する（TBS を切り出して dgst で）
+openssl asn1parse -in server.crt -strparse 4 -noout -out tbs.der
+SIGOFF=$(openssl asn1parse -in server.crt | tail -1 | cut -d: -f1 | tr -d ' ')
+openssl asn1parse -in server.crt -strparse "$SIGOFF" -noout -out sig.der
+openssl x509 -in ca.crt -noout -pubkey > ca.pub
+openssl dgst -sha384 -verify ca.pub -signature sig.der tbs.der   # Verified OK</pre>
+        <pre data-lang="tree" data-title="実行後のファイル">~/x509-lab/
+├── ca.key            # CA の秘密鍵（PKCS #8 PEM・デモ用）
+├── ca.crt            # CA の自己署名証明書
+├── server.key        # サーバーの秘密鍵
+├── server.csr        # CSR（PKCS #10）
+├── leaf.ext          # 付ける拡張の定義（-extfile）
+├── server.crt        # サーバー証明書（PEM）
+├── server.der        # 同じ証明書の DER
+├── evil.der          # 1 バイト改ざん版（DER）
+├── evil.crt          # 1 バイト改ざん版（PEM）
+├── tbs.der           # 署名対象（tbsCertificate）
+├── sig.der           # 署名値（ECDSA-Sig-Value）
+└── ca.pub            # CA の公開鍵（-pubkey）</pre>
+        <pre data-lang="text" data-title="期待される出力（抜粋）">server.crt: OK
+C=JP, ST=Tokyo, L=Chiyoda-ku, O=Example Inc, CN=www.example.com
+error 62 at 0 depth lookup: hostname mismatch
+error server.crt: verification failed
+C=JP, ST=Tokyo, L=Chiyoda-ku, O=Example Inc, CN=www.example.com
+error 10 at 0 depth lookup: certificate has expired
+error server.crt: verification failed
+C=JP, ST=Tokyo, L=Chiyoda-ku, O=Example Inc, CN=www.example.com
+error 7 at 0 depth lookup: certificate signature failure
+error evil.crt: verification failed
+Verified OK</pre>
+      </section>
+
+      <!-- 9. ハマりどころ -->
+      <section class="chapter" id="pitfalls">
+        <h2>ハマりどころ</h2>
+        <div class="note warn"><b>CN にホスト名を書いても照合されない：</b>ブラウザは SAN の <code>dNSName</code>／<code>iPAddress</code> だけで照合します（Chrome 58 以降、RFC 9525 は CN-ID を廃止）。SAN なしで CN だけの証明書は Chrome で <code>NET::ERR_CERT_COMMON_NAME_INVALID</code> です。一方 <code>openssl verify -verify_hostname</code> は SAN に DNS 名が 1 つも無いと CN にフォールバックするので、<b>openssl では OK でもブラウザでは NG</b> になり得ます。</div>
+        <div class="note warn"><b>DN の表示順と区切りはツールとバージョンで違う：</b>OpenSSL 3.2 以降の既定は <code>C=JP, O=…, CN=…</code>、1.1.1 / 3.0 / 3.1 の既定（<code>-nameopt oneline</code>）は <code>C = JP, O = …</code>、RFC 4514 形式（<code>-nameopt RFC2253</code>、Java、LDAP）は <code>CN=…,O=…,C=JP</code> と逆順です。出力を grep／パースするスクリプトは <code>-nameopt</code> を明示してください。</div>
+        <div class="note warn"><b>フィンガープリントの既定は SHA-1：</b><code>openssl x509 -fingerprint</code> はダイジェスト未指定だと SHA-1 です。ピン留めや照合では <code>-sha256</code> を付け、比較相手（ブラウザの証明書ビューア等）と同じアルゴリズムか確かめます。</div>
+        <div class="note warn"><b>PEM の中身が 1 枚とは限らない：</b><code>fullchain.pem</code> のように複数枚が連結されていても、<code>openssl x509 -in</code> は<b>先頭の 1 枚だけ</b>を表示します。全部見るには <code>openssl crl2pkcs7 -nocrl -certfile fullchain.pem | openssl pkcs7 -print_certs -noout</code> を使います。</div>
+        <div class="note warn"><b>有効期間は短くなり続ける：</b>CA/B Forum Ballot SC-081v3 により、公開 TLS 証明書の最大有効期間は 2026-03-15 から 200 日、2027-03-15 から 100 日、2029-03-15 から 47 日です。<code>notAfter</code> の監視（<code>-checkend</code>）と自動更新が前提になります。</div>
+        <div class="note warn"><b>OU は使えない：</b>公開 TLS 証明書の Subject に <code>OU</code> を入れることは 2022-09-01 以降禁止されています（Ballot SC47v2）。社内 CA のテンプレートを流用すると CSR に残りがちです。</div>
+        <div class="note warn"><b>改ざん検出は「署名」だけが担う：</b><code>openssl x509 -text</code> や証明書ビューアは改ざんされた証明書も普通に表示します（パースと検証は別処理）。「表示できた＝正しい」ではありません。</div>
+      </section>
+
+      <!-- 10. 仕様 -->
+      <section class="chapter" id="spec">
+        <h2>仕様・参考</h2>
+        <ul>
+          <li><a href="https://www.itu.int/rec/T-REC-X.509" target="_blank" rel="noopener">ITU-T X.509 — Public-key and attribute certificate frameworks</a></li>
+          <li><a href="https://www.itu.int/rec/T-REC-X.501" target="_blank" rel="noopener">ITU-T X.501 — The Directory: Models（Name / RDN / AttributeTypeAndValue）</a></li>
+          <li><a href="https://www.itu.int/rec/T-REC-X.690" target="_blank" rel="noopener">ITU-T X.690 — ASN.1 encoding rules: BER, CER and DER</a></li>
+          <li><a href="https://www.rfc-editor.org/rfc/rfc5280" target="_blank" rel="noopener">RFC 5280 — Internet X.509 PKI Certificate and CRL Profile</a>（§4.1 証明書、§4.1.2.4 Name、§4.2 拡張、§6 パス検証）</li>
+          <li><a href="https://www.rfc-editor.org/rfc/rfc4514" target="_blank" rel="noopener">RFC 4514 — LDAP: String Representation of Distinguished Names</a></li>
+          <li><a href="https://www.rfc-editor.org/rfc/rfc7468" target="_blank" rel="noopener">RFC 7468 — Textual Encodings of PKIX, PKCS, and CMS Structures（PEM）</a></li>
+          <li><a href="https://www.rfc-editor.org/rfc/rfc5480" target="_blank" rel="noopener">RFC 5480 — Elliptic Curve Cryptography Subject Public Key Information</a> / <a href="https://www.rfc-editor.org/rfc/rfc5758" target="_blank" rel="noopener">RFC 5758（ecdsa-with-SHA384 など）</a></li>
+          <li><a href="https://www.rfc-editor.org/rfc/rfc9525" target="_blank" rel="noopener">RFC 9525 — Service Identity in TLS（ホスト名照合）</a></li>
+          <li><a href="https://www.rfc-editor.org/rfc/rfc6962" target="_blank" rel="noopener">RFC 6962 — Certificate Transparency（SCT 拡張）</a></li>
+          <li><a href="https://www.rfc-editor.org/rfc/rfc7292" target="_blank" rel="noopener">RFC 7292 — PKCS #12</a></li>
+          <li><a href="https://cabforum.org/working-groups/server/baseline-requirements/requirements/" target="_blank" rel="noopener">CA/Browser Forum — TLS Baseline Requirements</a></li>
+          <li><a href="https://docs.openssl.org/3.5/man1/openssl-x509/" target="_blank" rel="noopener">openssl-x509(1)</a> / <a href="https://docs.openssl.org/3.5/man1/openssl-asn1parse/" target="_blank" rel="noopener">openssl-asn1parse(1)</a> / <a href="https://docs.openssl.org/3.5/man1/openssl-namedisplay-options/" target="_blank" rel="noopener">openssl-namedisplay-options(1)</a> / <a href="https://docs.openssl.org/3.5/man1/openssl-verify/" target="_blank" rel="noopener">openssl-verify(1)</a></li>
+          <li>関連：<a href="../ca-pki/">CA と証明書チェーン</a>（この証明書を誰がどこで署名し、どう検証するか）、<a href="../https-tls/">HTTPS / TLS 1.3</a></li>
+        </ul>
+      </section>
+
+    </main>
+  </div>
+
+  <footer class="site-f"></footer>
+  <script src="../../assets/js/topics.js"></script>
+  <script src="../../assets/js/tim.js"></script>
+  <script src="scenes.js"></script>
+</body>
+</html>

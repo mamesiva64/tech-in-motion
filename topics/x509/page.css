@@ -1,0 +1,70 @@
+/* x509 — page-specific stage parts (engine/tim.css は編集しない) */
+
+/* openssl -text の 1 行（ステージ上の擬似ターミナル行） */
+.stage .orow {
+  font: 11px/1.62 var(--mono);
+  color: #97a5c4;
+  white-space: pre;
+  padding: 0 6px;
+  margin: 0 -6px;
+  border-radius: 4px;
+  transition: background 0.3s, color 0.3s;
+}
+.stage .orow b { color: #89dceb; font-weight: 400; }
+.stage .orow i { font-style: normal; color: #fab387; }
+.stage .orow[data-state] { background: color-mix(in srgb, var(--accent) 16%, transparent); color: var(--tx); }
+
+/* ASN.1 構造の 1 行 */
+.stage .asn {
+  display: flex; align-items: center; gap: 10px;
+  height: 30px;
+  padding: 0 10px;
+  border: 1px solid var(--line2);
+  border-radius: 8px;
+  background: #0c1322;
+  font: 11px/1 var(--mono);
+  white-space: nowrap;
+  overflow: hidden;
+  transition: border-color 0.3s, box-shadow 0.3s, opacity 0.3s;
+}
+.stage .asn b { color: var(--accent); font-weight: 600; min-width: 142px; }
+.stage .asn span { color: var(--tx3); flex: 1; overflow: hidden; text-overflow: ellipsis; }
+.stage .asn code, .stage .rr code, .stage .hexbox code {
+  background: none; border: 0; padding: 0;
+  color: #fab387; font-size: 10.5px;
+}
+.stage .asn .crit { color: var(--red); font: 700 9.5px var(--mono); letter-spacing: 0.08em; border: 1px solid color-mix(in srgb, var(--red) 55%, transparent); border-radius: 4px; padding: 1px 4px; }
+
+/* 16 進ダンプ（オフセット + バイト群） */
+.stage .hex.bytes { font: 12px/2 var(--mono); color: #4e5b7a; white-space: pre; word-break: normal; }
+.stage .hex i { font-style: normal; color: var(--tx3); }
+.stage .hex span { color: #b5c3e3; border-radius: 4px; padding: 2px 0; transition: background 0.3s, color 0.3s; }
+.stage .hex span[data-state] { background: color-mix(in srgb, var(--accent) 22%, transparent); color: #fff; }
+
+/* DN の RDN カラム */
+.stage .rr { font: 11px/1.6 var(--mono); color: var(--tx2); white-space: nowrap; }
+.stage .rr.dim { color: var(--tx3); }
+.stage .rr.v { color: var(--tx); }
+.stage .rr em { font-style: normal; color: #fab387; }
+.stage .rr b { color: var(--accent); font-weight: 600; }
+
+/* 小さな説明ボックス */
+.stage .hexbox { font: 11px/1.6 var(--mono); color: var(--tx2); }
+.stage .hexbox b { color: var(--accent); font-weight: 600; }
+
+/* seg の中の小見出しを少し詰める */
+.stage .seg.tight > span { padding: 5px 9px; }
+
+/* 小さめの端末・ファイル（1 行 70 文字前後を収める） */
+.stage .term.tiny .term-b { font-size: 10px; line-height: 1.55; }
+.stage .file.fs10 pre { font-size: 10.5px; }
+
+/* ラベルにコマンド・ファイル名・ASN.1 名（大小文字に意味がある）を書くので大文字化しない */
+.stage .label, .stage .zone::before { text-transform: none; letter-spacing: 0.04em; }
+
+/* 判子（stamp）を .file に押すとき、はみ出し部分が切れないようにする */
+.stage .file.stampable { overflow: visible; }
+.stage .file.stampable > .file-h { border-radius: 9px 9px 0 0; }
+
+/* 行ハイライトは控えめに（枠と発光ではなく、左バー + 背景） */
+.stage .orow[data-state] { box-shadow: inset 2px 0 var(--accent) !important; border-color: transparent !important; }
