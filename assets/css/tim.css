@@ -626,6 +626,18 @@ a.rel-a:hover { border-color: var(--accent); transform: translateY(-2px); box-sh
 .label.raw { text-transform: none; letter-spacing: 0.04em; }
 .file.tight .file-h { font-size: 10px; padding: 4px 9px; }
 .tl.out { color: #97a5c4; }
+.tl.out[class*="c-"] { color: var(--accent); }
+
+/* line / value states shared by all pages */
+.ln.ok { background: rgba(52, 211, 153, 0.1); box-shadow: inset 2px 0 var(--green); }
+.ln.bad { background: rgba(248, 113, 113, 0.12); box-shadow: inset 2px 0 var(--red); }
+.ln.warn { background: rgba(251, 191, 36, 0.1); box-shadow: inset 2px 0 var(--amber); }
+.ln.dim { opacity: 0.35; }
+.kv dd.ok { color: var(--green); }
+.kv dd.bad { color: var(--red); }
+.kv dd.warn { color: var(--amber); }
+.kv dd.dim { opacity: 0.4; }
+.chip.on { color: var(--accent-ink); background: var(--accent); border-color: var(--accent); box-shadow: 0 0 14px -2px var(--accent); }
 .typing::after { content: "▋"; color: var(--accent); animation: blink 0.9s steps(1) infinite; margin-left: 1px; }
 @keyframes blink { 50% { opacity: 0; } }
 

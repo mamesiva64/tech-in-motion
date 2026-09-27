@@ -181,6 +181,7 @@ TIM.scene('#sc-flow', {
 | `s.spawn(html, {x, y, into, fx})` | 要素を動的生成して返す（同期） |
 | `s.hl(lines, blockIndex)` | 下部コードパネルの行をハイライト（1 始まり） |
 | `s.code(sel, src, lang)` | ステージ内の `pre` をハイライト付きコードで差し替え |
+| `s.lines(sel, [3,4], cls, {only, remove})` | ステージ内 `pre` の特定行（1 始まり）にクラスを付ける。`cls`: `hl` `ok` `bad` `warn` `dim`。`only:true` で他の行から外す |
 | `s.wait(ms)` | 待機 |
 
 - 座標指定 `from/to` は `'name'`（中心）、`'name:r'`（右端中央。`c t b l r tl tr bl br`）、または `{x, y}`。

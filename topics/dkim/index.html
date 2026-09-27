@@ -1,0 +1,766 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>DKIM (+SPF/DMARC) — Tech in Motion</title>
+  <meta name="description" content="DKIM を実物で。opendkim-genkey で作った鍵を DNS に公開し、送信 MTA が bh= と b= を計算して DKIM-Signature を付け、受信 MTA が DNS の公開鍵で検証するまでを、実際のヘッダ・DNS レコード・コマンド出力でステップ再生します。">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Space+Grotesk:wght@500;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="../../assets/css/tim.css">
+  <link rel="stylesheet" href="page.css">
+</head>
+<body data-root="../../" data-topic="dkim">
+  <header class="site-h"></header>
+
+  <div class="page">
+    <aside class="toc"></aside>
+    <main class="doc">
+
+      <!-- 0. HERO -->
+      <section class="hero">
+        <p class="kicker">Mail · DKIM / SPF / DMARC</p>
+        <h1>DKIM (+SPF/DMARC)<small>送信 MTA が署名し、受信 MTA が DNS の公開鍵で検証する</small></h1>
+        <p class="lead">DKIM は「メールのどのヘッダと本文を、どのドメインの鍵で署名したか」を <code>DKIM-Signature</code> ヘッダに書き込む仕組みです。このページでは Postfix + OpenDKIM での鍵生成から、<code>bh=</code> と <code>b=</code> の計算、受信側での検証、改ざんで失敗する瞬間、そして SPF / DMARC との役割分担までを、実際のヘッダ・DNS レコード・コマンド出力で追います。ページ内の <code>bh=</code> と署名検証は、ブラウザの WebCrypto で実際に計算しています。</p>
+        <div class="facts">
+          <div class="fact"><span>署名する場所</span><b>送信側 MTA（Postfix → OpenDKIM milter）<br><code>/etc/opendkim/keys/example.com/sel1.private</code></b></div>
+          <div class="fact"><span>検証する場所</span><b>受信側 MTA（mx.example.net）が <code>sel1._domainkey.example.com</code> の TXT を引く</b></div>
+          <div class="fact"><span>署名の対象</span><b><code>h=</code> に列挙したヘッダ + 本文ハッシュ <code>bh=</code> → 署名値 <code>b=</code></b></div>
+          <div class="fact"><span>仕様</span><b>DKIM RFC 6376 / 8301 / 8463<br>SPF RFC 7208 · DMARC RFC 9989（旧 7489）</b></div>
+        </div>
+      </section>
+
+      <!-- 1. 全体像 -->
+      <section class="chapter" id="overview">
+        <h2>全体像：鍵はどこに置かれるか</h2>
+        <p>DKIM の登場人物は 3 つです。<strong>送信側 MTA</strong>（Postfix と、milter として動く OpenDKIM）は<strong>秘密鍵</strong>を持ち、<strong>権威 DNS</strong> は<strong>公開鍵</strong>を TXT レコードで配り、<strong>受信側 MTA</strong> はメールが届くたびに DNS から公開鍵を取って検証します。秘密鍵が送信側ホストの外に出ることはなく、受信側は事前の鍵交換なしに検証できます。</p>
+
+        <div class="scene" id="sc-keys" data-title="鍵ペアの生成と DNS への公開">
+          <div class="stage" data-w="960" data-h="500">
+            <div class="zone" style="left:16px;top:16px;width:564px;height:468px" data-label="mail.example.com · 送信側 MTA · 203.0.113.25"></div>
+            <div class="node" data-el="postfix" style="left:34px;top:38px;width:200px">
+              <div class="node-h"><i data-icon="mail"></i><b class="node-t">Postfix</b></div>
+              <div class="node-s">smtpd :25 / :587</div>
+            </div>
+            <div class="node" data-el="opendkim" style="left:362px;top:38px;width:200px">
+              <div class="node-h"><i data-icon="sign"></i><b class="node-t">OpenDKIM</b></div>
+              <div class="node-s">inet:8891@localhost</div>
+            </div>
+            <div class="term" data-el="t" style="left:34px;top:120px;width:528px;height:176px">
+              <div class="term-h">root@mail:~ — bash</div>
+              <div class="term-b"></div>
+            </div>
+            <div class="file hide" data-el="fpriv" style="left:34px;top:310px;width:528px">
+              <div class="file-h">/etc/opendkim/keys/example.com/sel1.private<small>600 opendkim</small></div>
+              <pre data-lang="pem">-----BEGIN PRIVATE KEY-----
+MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQD…
+（RSA 2048bit 秘密鍵 · このホストから外に出さない）
+-----END PRIVATE KEY-----</pre>
+            </div>
+            <div class="file hide" data-el="ftxt" style="left:34px;top:310px;width:528px">
+              <div class="file-h">/etc/opendkim/keys/example.com/sel1.txt<small>DNS に貼る</small></div>
+              <pre data-lang="dns">sel1._domainkey IN TXT ( "v=DKIM1; h=sha256; k=rsa; "
+  "p=MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA3Tz3+7…"
+  "N/aaRbKWqUcRvFPhTt+mYOEsue3mpzGaxPw5…pPFswIDAQAB" )
+; ----- DKIM key sel1 for example.com</pre>
+            </div>
+            <div class="file hide" data-el="fconf" style="left:34px;top:310px;width:528px">
+              <div class="file-h">/etc/opendkim.conf（抜粋）</div>
+              <pre data-lang="ini">Mode              sv
+Socket            inet:8891@localhost
+Canonicalization  relaxed/relaxed
+OversignHeaders   From
+KeyTable          refile:/etc/opendkim/KeyTable
+SigningTable      refile:/etc/opendkim/SigningTable
+InternalHosts     /etc/opendkim/TrustedHosts</pre>
+            </div>
+            <div class="file hide" data-el="ftab" style="left:34px;top:310px;width:528px">
+              <div class="file-h">/etc/opendkim/{KeyTable,SigningTable,TrustedHosts}</div>
+              <pre data-lang="text"># KeyTable     鍵名 → ドメイン:セレクタ:秘密鍵
+sel1._domainkey.example.com example.com:sel1:/etc/…/sel1.private
+# SigningTable From のアドレス → 鍵名
+*@example.com  sel1._domainkey.example.com
+# TrustedHosts 署名する（内部とみなす）接続元
+127.0.0.1
+203.0.113.0/24</pre>
+            </div>
+            <div class="file hide" data-el="fmain" style="left:34px;top:310px;width:528px">
+              <div class="file-h">/etc/postfix/main.cf（追記）</div>
+              <pre data-lang="ini"># OpenDKIM が落ちていても配送は止めない（既定は tempfail）
+milter_default_action = accept
+milter_protocol = 6
+smtpd_milters = inet:localhost:8891
+non_smtpd_milters = $smtpd_milters</pre>
+            </div>
+
+            <div class="zone" style="left:598px;top:16px;width:346px;height:264px" data-label="ns1.example.com · 権威 DNS"></div>
+            <div class="node" data-el="dns" style="left:614px;top:38px;width:314px">
+              <div class="node-h"><i data-icon="globe"></i><b class="node-t">BIND 9 (named)</b></div>
+              <div class="node-s">/etc/bind/db.example.com</div>
+            </div>
+            <div class="file" data-el="fzone" style="left:614px;top:116px;width:314px">
+              <div class="file-h">db.example.com</div>
+              <pre data-lang="dns">$TTL 3600
+@     IN SOA ns1 hostmaster ( … )
+      IN NS  ns1
+      IN MX  10 mail
+mail  IN A   203.0.113.25</pre>
+            </div>
+
+            <div class="zone" style="left:598px;top:300px;width:346px;height:184px" data-label="mx.example.net · 受信側 MTA"></div>
+            <div class="node" data-el="mx" style="left:614px;top:322px;width:314px">
+              <div class="node-h"><i data-icon="server"></i><b class="node-t">Postfix + OpenDKIM</b></div>
+              <div class="node-s">Mode v · 秘密鍵は持たない</div>
+            </div>
+            <div class="chip hide" data-el="mxq" style="left:614px;top:394px">TXT? sel1._domainkey.example.com</div>
+            <div class="chip hide c-green" data-el="mxa" style="left:614px;top:422px">p=MIIBIjANBgkqhkiG9w0BAQEF…IDAQAB</div>
+          </div>
+        </div>
+      </section>
+
+      <!-- 2. 実物の中身 -->
+      <section class="chapter" id="anatomy">
+        <h2>DKIM-Signature ヘッダの中身</h2>
+        <p>このページの例で送信側が付けた <code>DKIM-Signature</code> の全文です。<code>b=</code> は 2048bit RSA の署名（256 バイト）を base64 にした 344 文字で、途中の改行とタブは「折り返し（folding）」です。値は下のシーンで実際に検証できる本物です（鍵はこのページ用に生成したデモ鍵で、秘密鍵は公開していません）。</p>
+        <pre data-lang="mail" data-title="送信側 MTA が付けた DKIM-Signature">DKIM-Signature: v=1; a=rsa-sha256; c=relaxed/relaxed;
+	d=example.com; s=sel1; t=1790558103;
+	bh=bo8O1PQAIkYltLnLg/rfWUvvkQPYwAOFn0pcjkhn8qc=;
+	h=From:To:Subject:Date:Message-ID:From;
+	b=OjpufJm2i1jt9alLUwptwuCKOo7z1Eh69uNF+zzeQ3d5yK/qsS/PlSbuXxiW
+	 LKx1/etiP8aKKCInPzkFLUpZUnlVS3jwNngwTGGNtT5xOzU352OoYzz1U3sd
+	 Tn3GZ4rF6JB8y0SwXax5+H2+d+qW30+XLXA/Wk0THLr8Q9ncqasjoEd4AtgR
+	 GCpW98WRixA+OtqnXwEYnfZSRYEkQ7cdXHOP0RFRM2joKimeitdcHQMg4+4o
+	 i/7Lk9KdCyqwvEnwZAQMC2lfvxq23IxK1gX57WoBzfjxaEMXA1q2ajv7ybrZ
+	 Re2BWLf6H33KXLZKJar7HAq4h8NS55AaEikIkCiZvQ==</pre>
+
+        <h3>タグ一覧（RFC 6376 §3.5）</h3>
+        <div class="tbl">
+          <table class="ref">
+            <thead><tr><th>タグ</th><th>必須</th><th>この例の値</th><th>意味・注意</th></tr></thead>
+            <tbody>
+              <tr><td><code>v=</code></td><td>必須</td><td><code>1</code></td><td>バージョン。常に <code>1</code></td></tr>
+              <tr><td><code>a=</code></td><td>必須</td><td><code>rsa-sha256</code></td><td>署名アルゴリズム。<code>rsa-sha1</code> は RFC 8301 で署名にも検証にも使ってはならない（MUST NOT）。<code>ed25519-sha256</code> は RFC 8463</td></tr>
+              <tr><td><code>c=</code></td><td>任意</td><td><code>relaxed/relaxed</code></td><td>正規化「ヘッダ/本文」。省略時 <code>simple/simple</code>。<code>c=relaxed</code> だけなら本文は <code>simple</code></td></tr>
+              <tr><td><code>d=</code></td><td>必須</td><td><code>example.com</code></td><td>署名ドメイン（SDID）。公開鍵の場所と、DMARC の DKIM アラインメントに使われる</td></tr>
+              <tr><td><code>s=</code></td><td>必須</td><td><code>sel1</code></td><td>セレクタ。公開鍵は <code>&lt;s&gt;._domainkey.&lt;d&gt;</code> の TXT</td></tr>
+              <tr><td><code>t=</code></td><td>推奨</td><td><code>1790558103</code></td><td>署名時刻（UNIX 秒）。<code>date -u -d @1790558103</code> → 2026-09-28 01:15:03 UTC</td></tr>
+              <tr><td><code>x=</code></td><td>任意</td><td>（なし）</td><td>有効期限（UNIX 秒）。OpenDKIM では <code>SignatureTTL</code> を設定したときだけ付く</td></tr>
+              <tr><td><code>h=</code></td><td>必須</td><td><code>From:To:Subject:Date:Message-ID:From</code></td><td>署名対象のヘッダ名（順序どおりに連結）。<code>From</code> は必須。存在しない名前を書くと「空」として署名され、後から追加されると検証が壊れる（オーバーサイン）</td></tr>
+              <tr><td><code>bh=</code></td><td>必須</td><td><code>bo8O1PQA…8qc=</code></td><td>正規化した本文の SHA-256 を base64（44 文字）</td></tr>
+              <tr><td><code>b=</code></td><td>必須</td><td><code>OjpufJm2…ZvQ==</code></td><td>署名値の base64。計算時は <code>b=</code> の値を空にした自分自身も署名対象に含める</td></tr>
+              <tr><td><code>l=</code></td><td>任意</td><td>（なし）</td><td>本文の先頭 <code>l</code> オクテットだけを署名対象にする。後ろへの追記を許してしまう（→ 改ざんケース）</td></tr>
+              <tr><td><code>i=</code></td><td>任意</td><td>（なし）</td><td>AUID。<code>d=</code> と同じかそのサブドメイン（例 <code>@example.com</code>）</td></tr>
+              <tr><td><code>q=</code></td><td>任意</td><td>（なし）</td><td>鍵の取得方法。既定かつ唯一の定義値は <code>dns/txt</code></td></tr>
+              <tr><td><code>z=</code></td><td>任意</td><td>（なし）</td><td>署名時のヘッダ値のコピー（診断用）</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>公開鍵レコードのタグ（RFC 6376 §3.6.1）</h3>
+        <div class="tbl">
+          <table class="ref">
+            <thead><tr><th>タグ</th><th>例</th><th>意味</th></tr></thead>
+            <tbody>
+              <tr><td><code>v=</code></td><td><code>DKIM1</code></td><td>バージョン（推奨）。書くなら先頭</td></tr>
+              <tr><td><code>h=</code></td><td><code>sha256</code></td><td>受け入れるハッシュ。省略時はすべて</td></tr>
+              <tr><td><code>k=</code></td><td><code>rsa</code></td><td>鍵の種類。省略時 <code>rsa</code>。Ed25519 は <code>k=ed25519</code>（RFC 8463、<code>p=</code> は 32 バイトの生の公開鍵を base64 にした 44 文字）</td></tr>
+              <tr><td><code>p=</code></td><td><code>MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA…</code></td><td>公開鍵（必須）。RSA は SubjectPublicKeyInfo（DER）の base64。<strong>空にすると失効</strong></td></tr>
+              <tr><td><code>t=</code></td><td><code>y</code> / <code>s</code></td><td><code>y</code>＝テスト中、<code>s</code>＝<code>i=</code> のドメインが <code>d=</code> と完全一致すること</td></tr>
+              <tr><td><code>s=</code></td><td><code>email</code></td><td>サービス種別。省略時 <code>*</code></td></tr>
+              <tr><td><code>n=</code></td><td>—</td><td>人間向けメモ</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- 3. 署名 -->
+      <section class="chapter" id="sign">
+        <h2>署名：送信側 MTA で起きること</h2>
+        <p>Postfix は受け取ったメッセージを milter プロトコルで OpenDKIM に渡します。OpenDKIM は <code>SigningTable</code> で From のアドレスから鍵を選び、本文とヘッダを正規化してハッシュを取り、秘密鍵で署名した結果を <code>DKIM-Signature</code> ヘッダとして Postfix に返します。下のシーンの <code>bh=</code> は、ページ上で本文を relaxed 正規化して SHA-256 を実際に計算した値です。</p>
+
+        <div class="scene" id="sc-sign" data-title="送信側 MTA が DKIM-Signature を組み立てる">
+          <div class="stage" data-w="960" data-h="520">
+            <div class="node sm" data-el="mua" style="left:16px;top:16px;width:190px">
+              <div class="node-h"><i data-icon="laptop"></i><b class="node-t">MUA (Alice)</b></div>
+              <div class="node-s">203.0.113.77 · SMTP AUTH</div>
+            </div>
+            <div class="node sm" data-el="postfix" style="left:236px;top:16px;width:200px">
+              <div class="node-h"><i data-icon="mail"></i><b class="node-t">Postfix</b></div>
+              <div class="node-s">submission :587</div>
+            </div>
+            <div class="node sm" data-el="opendkim" style="left:470px;top:16px;width:230px">
+              <div class="node-h"><i data-icon="sign"></i><b class="node-t">OpenDKIM (sign)</b></div>
+              <div class="node-s">KeyTable → sel1.private</div>
+            </div>
+            <div class="node sm" data-el="out" style="left:744px;top:16px;width:200px">
+              <div class="node-h"><i data-icon="globe"></i><b class="node-t">mx.example.net</b></div>
+              <div class="node-s">198.51.100.10:25</div>
+            </div>
+
+            <div class="file hide" data-el="msg" style="left:16px;top:96px;width:430px">
+              <div class="file-h">キュー 4F2A1C0B7E · 署名前のメッセージ</div>
+              <pre data-lang="mail">From: Alice &lt;alice@example.com&gt;
+To: Bob &lt;bob@example.net&gt;
+Subject: Invoice 2026-09
+Date: Mon, 28 Sep 2026 10:15:00 +0900
+Message-ID: &lt;20260928011500.4F2A1C0B7E@mail.example.com&gt;
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+
+Hi Bob,
+
+Total:  12,800 JPY
+Due:    2026-10-31
+https://billing.example.com/inv/0928
+
+Alice
+
+</pre>
+            </div>
+            <div class="file hide" data-el="msg2" style="left:16px;top:96px;width:430px">
+              <div class="file-h">キュー 4F2A1C0B7E · 署名後（先頭に追加）</div>
+              <pre data-lang="mail">DKIM-Signature: v=1; a=rsa-sha256; c=relaxed/relaxed;
+	d=example.com; s=sel1; t=1790558103;
+	bh=bo8O1PQAIkYltLnLg/rfWUvvkQPYwAOFn0pcjkhn8qc=;
+	h=From:To:Subject:Date:Message-ID:From;
+	b=OjpufJm2i1jt9alLUwptwuCKOo7z1Eh69uNF+zzeQ3d5yK/q…
+From: Alice &lt;alice@example.com&gt;
+To: Bob &lt;bob@example.net&gt;
+Subject: Invoice 2026-09
+Date: Mon, 28 Sep 2026 10:15:00 +0900
+Message-ID: &lt;20260928011500.4F2A1C0B7E@mail.example.com&gt;
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+
+Hi Bob,
+（本文は変更されない）</pre>
+            </div>
+            <div class="chip hide" data-el="cbh" style="left:16px;top:452px">sha256(本文) = <span data-el="cbhv">…</span></div>
+            <div class="chip hide c-violet" data-el="chh" style="left:16px;top:484px">sha256(署名対象) = <span data-el="chhv">…</span></div>
+
+            <div class="file hide" data-el="sig" style="left:470px;top:96px;width:474px">
+              <div class="file-h">DKIM-Signature（組み立て中）</div>
+              <div class="file-b">
+                <dl class="kv">
+                  <dt>v=</dt><dd class="dim" data-el="tv">…</dd>
+                  <dt>a=</dt><dd class="dim" data-el="ta">…</dd>
+                  <dt>c=</dt><dd class="dim" data-el="tc">…</dd>
+                  <dt>d=</dt><dd class="dim" data-el="td">…</dd>
+                  <dt>s=</dt><dd class="dim" data-el="ts">…</dd>
+                  <dt>t=</dt><dd class="dim" data-el="tt">…</dd>
+                  <dt>bh=</dt><dd class="dim" data-el="tbh">…</dd>
+                  <dt>h=</dt><dd class="dim" data-el="th">…</dd>
+                  <dt>b=</dt><dd class="dim" data-el="tb">…</dd>
+                </dl>
+              </div>
+            </div>
+
+            <div class="file hide" data-el="canon" style="left:470px;top:330px;width:474px">
+              <div class="file-h">c=relaxed で正規化した本文<small>94 bytes</small></div>
+              <div class="file-b cz">Hi Bob,<i>\r\n</i>
+<i>\r\n</i>
+Total: 12,800 JPY<i>\r\n</i>   <em>← 連続空白を 1 つに・行末空白を削除</em>
+Due: 2026-10-31<i>\r\n</i>     <em>← 連続空白を 1 つに</em>
+https://billing.example.com/inv/0928<i>\r\n</i>
+<i>\r\n</i>
+Alice<i>\r\n</i>   <s>\r\n\r\n</s> <em>← 末尾の空行は無視</em></div>
+            </div>
+            <div class="file hide" data-el="hdata" style="left:470px;top:330px;width:474px">
+              <div class="file-h">署名対象データ（ヘッダ正規化・h= の順）<small>359 bytes</small></div>
+              <div class="file-b cz">from:Alice &lt;alice@example.com&gt;<i>\r\n</i>
+to:Bob &lt;bob@example.net&gt;<i>\r\n</i>
+subject:Invoice 2026-09<i>\r\n</i>
+date:Mon, 28 Sep 2026 10:15:00 +0900<i>\r\n</i>
+message-id:&lt;20260928011500.4F2A1C0B7E@mail.example.com&gt;<i>\r\n</i>
+dkim-signature:v=1; a=rsa-sha256; … h=…:From; <b>b=</b><em>(空・改行なし)</em></div>
+            </div>
+            <div class="term hide" data-el="log" style="left:470px;top:330px;width:474px;height:174px">
+              <div class="term-h">journalctl -f -u postfix -u opendkim</div>
+              <div class="term-b"></div>
+            </div>
+          </div>
+        </div>
+
+        <h3>正規化（canonicalization）の 2 方式</h3>
+        <p>メールは経路上で空白や折り返しが変わることがあります。正規化は「ハッシュを取る前に揃える」規則で、<code>c=ヘッダ/本文</code> の組で指定します。</p>
+        <div class="tbl">
+          <table class="ref">
+            <thead><tr><th>方式</th><th>ヘッダ</th><th>本文</th></tr></thead>
+            <tbody>
+              <tr><td><code>simple</code></td><td>一切変更しない（大文字小文字・空白・折り返しもそのまま）</td><td>末尾の空行を削除（空本文は <code>CRLF</code> 1 つ）。それ以外は変更しない</td></tr>
+              <tr><td><code>relaxed</code></td><td>ヘッダ名を小文字化、折り返しの <code>CRLF</code> を除去、連続する空白（WSP）を 1 つの SP に、値の末尾とコロン前後の空白を削除</td><td>行末の空白を削除、行内の連続空白を 1 つの SP に、末尾の空行を削除（空本文は空文字列）</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="note tip">空本文のハッシュは実物で覚えておくと便利です。<code>simple</code> の空本文（<code>CRLF</code>）は <code>bh=frcCV1k9oG9oKj3dpUqdJg1PxRT2RSN/XKdLCPjaYaY=</code>、<code>relaxed</code> の空本文（0 バイト）は <code>bh=47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=</code> です。</div>
+      </section>
+
+      <!-- 4. 検証 -->
+      <section class="chapter" id="verify">
+        <h2>検証：受信側 MTA で起きること</h2>
+        <p>受信側は署名側と「同じ手順」を繰り返します。違いは鍵だけで、秘密鍵の代わりに DNS から取った公開鍵で <code>b=</code> を検証します。経路上の MTA が付ける <code>Received:</code> は <code>h=</code> に含まれないので、何行増えても検証には影響しません。</p>
+
+        <div class="scene" id="sc-verify" data-title="受信側 MTA が DNS の公開鍵で検証する">
+          <div class="stage" data-w="960" data-h="520">
+            <div class="node sm" data-el="snd" style="left:16px;top:16px;width:200px">
+              <div class="node-h"><i data-icon="server"></i><b class="node-t">mail.example.com</b></div>
+              <div class="node-s">203.0.113.25 · 送信側</div>
+            </div>
+            <div class="node sm" data-el="mx" style="left:246px;top:16px;width:200px">
+              <div class="node-h"><i data-icon="mail"></i><b class="node-t">mx.example.net</b></div>
+              <div class="node-s">Postfix · 198.51.100.10</div>
+            </div>
+            <div class="node sm" data-el="ver" style="left:470px;top:16px;width:210px">
+              <div class="node-h"><i data-icon="shieldok"></i><b class="node-t">OpenDKIM (verify)</b></div>
+              <div class="node-s">milter · Mode v</div>
+            </div>
+            <div class="node sm" data-el="dns" style="left:744px;top:16px;width:200px">
+              <div class="node-h"><i data-icon="globe"></i><b class="node-t">DNS</b></div>
+              <div class="node-s">ns1.example.com</div>
+            </div>
+
+            <div class="term" data-el="smtp" style="left:16px;top:96px;width:430px;height:152px">
+              <div class="term-h">SMTP 203.0.113.25 → 198.51.100.10:25</div>
+              <div class="term-b"></div>
+            </div>
+            <div class="file hide" data-el="hdata" style="left:16px;top:96px;width:430px">
+              <div class="file-h">受信側で再構成した署名対象データ</div>
+              <div class="file-b cz">from:Alice &lt;alice@example.com&gt;<i>\r\n</i>
+to:Bob &lt;bob@example.net&gt;<i>\r\n</i>
+subject:Invoice 2026-09<i>\r\n</i>
+date:Mon, 28 Sep 2026 10:15:00 +0900<i>\r\n</i>
+message-id:&lt;20260928011500.4F2A1C0B7E@mail.exa…<i>\r\n</i>
+dkim-signature:v=1; … h=…:From; <b>b=</b></div>
+            </div>
+            <div class="file hide" data-el="ar" style="left:16px;top:96px;width:430px">
+              <div class="file-h">受信側が先頭に追加したヘッダ</div>
+              <pre data-lang="mail">Authentication-Results: mx.example.net;
+	dkim=pass header.d=example.com
+	header.s=sel1 header.b=OjpufJm2</pre>
+            </div>
+            <div class="file hide" data-el="msg" style="left:16px;top:262px;width:430px">
+              <div class="file-h">受信したメッセージ（ヘッダ部）</div>
+              <pre data-lang="mail">Received: from mail.example.com (mail.example.com
+	[203.0.113.25]) (using TLSv1.3 …)
+	by mx.example.net (Postfix) with ESMTPS id 9C1D2E3F4A
+	for &lt;bob@example.net&gt;; Mon, 28 Sep 2026 10:15:04 +0900
+DKIM-Signature: v=1; a=rsa-sha256; c=relaxed/relaxed;
+	d=example.com; s=sel1; t=1790558103;
+	bh=bo8O1PQAIkYltLnLg/rfWUvvkQPYwAOFn0pcjkhn8qc=;
+	h=From:To:Subject:Date:Message-ID:From;
+	b=OjpufJm2i1jt9alLUwptwuCKOo7z1Eh69uNF+zzeQ3d5yK/q…
+From: Alice &lt;alice@example.com&gt;
+To: Bob … (以下 Subject / Date / 本文)</pre>
+            </div>
+
+            <div class="chip hide c-gray" data-el="rcv" style="left:470px;top:270px">Received は h= に含まれない → 署名対象外</div>
+            <div class="file hide" data-el="tags" style="left:470px;top:96px;width:474px">
+              <div class="file-h">DKIM-Signature をパース</div>
+              <div class="file-b">
+                <dl class="kv">
+                  <dt>d= s=</dt><dd>example.com · sel1 → <span class="acc">sel1._domainkey.example.com</span></dd>
+                  <dt>a= c=</dt><dd>rsa-sha256 · relaxed/relaxed</dd>
+                  <dt>h=</dt><dd>From:To:Subject:Date:Message-ID:From</dd>
+                  <dt>bh=</dt><dd>bo8O1PQAIkYltLnLg/rfWUvvkQPYwAOFn0pcjkhn8qc=</dd>
+                  <dt>b=</dt><dd>OjpufJm2i1jt9alLUwptwuCKOo7z1Eh6…（344 文字）</dd>
+                </dl>
+              </div>
+            </div>
+            <div class="file hide" data-el="txt" style="left:470px;top:250px;width:474px">
+              <div class="file-h">sel1._domainkey.example.com. 3600 IN TXT</div>
+              <pre data-lang="dns">"v=DKIM1; h=sha256; k=rsa; "
+"p=MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA3Tz3+7m…"
+"N/aaRbKWqUcRvFPhTt+mYOEsue3mpzGaxPw5NKEOlofGE…IDAQAB"</pre>
+            </div>
+            <div class="chip hide c-violet" data-el="key" style="left:470px;top:350px">RSA 公開鍵 <span data-el="keyv">…</span></div>
+            <div class="file hide" data-el="chk" style="left:470px;top:392px;width:474px">
+              <div class="file-h">検証</div>
+              <div class="file-b">
+                <dl class="kv">
+                  <dt>bh 署名値</dt><dd>bo8O1PQAIkYltLnLg/rfWUvvkQPYwAOFn0pcjkhn8qc=</dd>
+                  <dt>bh 再計算</dt><dd data-el="bhc" class="dim">…</dd>
+                  <dt>b= 検証</dt><dd data-el="sigc" class="dim">…</dd>
+                </dl>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <h3>受信箱に届いたメールのヘッダ（全文）</h3>
+        <p>Bob のメールボックスに保存されたメッセージの先頭部分です。上ほど「後から付いた」ヘッダで、<code>Authentication-Results</code> と <code>Received</code> は受信側 MTA が付けたもの、<code>DKIM-Signature</code> から下が送信側から届いたものです（SPF・DMARC の結果も同じヘッダにまとめて書かれます）。</p>
+        <pre data-lang="mail" data-title="~bob/Maildir/new/… の先頭">Return-Path: &lt;alice@example.com&gt;
+Delivered-To: bob@example.net
+Authentication-Results: mx.example.net;
+	dkim=pass header.d=example.com header.s=sel1 header.b=OjpufJm2;
+	spf=pass smtp.mailfrom=alice@example.com;
+	dmarc=pass header.from=example.com
+Received-SPF: pass (mx.example.net: domain of alice@example.com designates 203.0.113.25 as permitted sender) client-ip=203.0.113.25; envelope-from="alice@example.com"; helo=mail.example.com;
+Received: from mail.example.com (mail.example.com [203.0.113.25])
+	(using TLSv1.3 with cipher TLS_AES_256_GCM_SHA384 (256/256 bits))
+	by mx.example.net (Postfix) with ESMTPS id 9C1D2E3F4A
+	for &lt;bob@example.net&gt;; Mon, 28 Sep 2026 10:15:04 +0900 (JST)
+DKIM-Signature: v=1; a=rsa-sha256; c=relaxed/relaxed;
+	d=example.com; s=sel1; t=1790558103;
+	bh=bo8O1PQAIkYltLnLg/rfWUvvkQPYwAOFn0pcjkhn8qc=;
+	h=From:To:Subject:Date:Message-ID:From;
+	b=OjpufJm2i1jt9alLUwptwuCKOo7z1Eh69uNF+zzeQ3d5yK/qsS/PlSbuXxiW
+	 LKx1/etiP8aKKCInPzkFLUpZUnlVS3jwNngwTGGNtT5xOzU352OoYzz1U3sd
+	 Tn3GZ4rF6JB8y0SwXax5+H2+d+qW30+XLXA/Wk0THLr8Q9ncqasjoEd4AtgR
+	 GCpW98WRixA+OtqnXwEYnfZSRYEkQ7cdXHOP0RFRM2joKimeitdcHQMg4+4o
+	 i/7Lk9KdCyqwvEnwZAQMC2lfvxq23IxK1gX57WoBzfjxaEMXA1q2ajv7ybrZ
+	 Re2BWLf6H33KXLZKJar7HAq4h8NS55AaEikIkCiZvQ==
+Received: from alice-pc (unknown [203.0.113.77])
+	by mail.example.com (Postfix) with ESMTPSA id 4F2A1C0B7E
+	for &lt;bob@example.net&gt;; Mon, 28 Sep 2026 10:15:03 +0900 (JST)
+From: Alice &lt;alice@example.com&gt;
+To: Bob &lt;bob@example.net&gt;
+Subject: Invoice 2026-09
+Date: Mon, 28 Sep 2026 10:15:00 +0900
+Message-ID: &lt;20260928011500.4F2A1C0B7E@mail.example.com&gt;
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8</pre>
+        <div class="note">送信側 Postfix が付けた 2 つ目の <code>Received:</code>（alice-pc からの受信）が <code>DKIM-Signature</code> より下にあるのは、OpenDKIM が署名したのが「Postfix が自分の <code>Received:</code> を付けた後」だからです。<code>Received:</code> は <code>h=</code> に含まれないので、どちらの位置でも署名には影響しません。<code>header.b=</code> は <code>b=</code> の先頭 8 文字で、同じメールに複数の署名があるときにどれの結果かを区別するためのものです（RFC 6008）。</div>
+      </section>
+
+      <!-- 5. 改ざん -->
+      <section class="chapter" id="tamper">
+        <h2>改ざん・失敗ケース</h2>
+        <p>DKIM の検証は 2 段階です。まず本文ハッシュ <code>bh=</code> を比べ、一致したらヘッダの署名 <code>b=</code> を検証します（RFC 6376 §6.1.3）。どちらで失敗したかで、原因が「本文が変わった」のか「署名対象のヘッダが変わった」のかが分かります。下のシーンの値はすべてページ上で再計算・再検証した結果です。</p>
+
+        <div class="scene" id="sc-tamper" data-title="どこが変わると、どこで失敗するか">
+          <div class="stage" data-w="960" data-h="540">
+            <div class="node sm" data-el="snd" style="left:16px;top:16px;width:190px">
+              <div class="node-h"><i data-icon="server"></i><b class="node-t">mail.example.com</b></div>
+              <div class="node-s">署名 d=example.com</div>
+            </div>
+            <div class="node sm hide c-amber" data-el="ml" style="left:256px;top:16px;width:190px">
+              <div class="node-h"><i data-icon="users"></i><b class="node-t">lists.example.net</b></div>
+              <div class="node-s">Mailman 3 · フッタ追加</div>
+            </div>
+            <div class="node sm hide c-red" data-el="atk" style="left:256px;top:16px;width:190px">
+              <div class="node-h"><i data-icon="attacker"></i><b class="node-t">攻撃者</b></div>
+              <div class="node-s">経路上で本文を改変</div>
+            </div>
+            <div class="node sm hide c-amber" data-el="gw" style="left:256px;top:16px;width:190px">
+              <div class="node-h"><i data-icon="shield"></i><b class="node-t">gw.example.net</b></div>
+              <div class="node-s">件名に [EXTERNAL]</div>
+            </div>
+            <div class="node sm" data-el="ver" style="left:744px;top:16px;width:200px">
+              <div class="node-h"><i data-icon="shieldok"></i><b class="node-t">mx.example.net</b></div>
+              <div class="node-s">OpenDKIM (verify)</div>
+            </div>
+
+            <div class="file" data-el="msg" style="left:16px;top:96px;width:430px">
+              <div class="file-h">検証対象のメッセージ</div>
+              <pre data-lang="mail">DKIM-Signature: v=1; a=rsa-sha256; c=relaxed/relaxed;
+	d=example.com; s=sel1; t=1790558103;
+	bh=bo8O1PQAIkYltLnLg/rfWUvvkQPYwAOFn0pcjkhn8qc=;
+	h=From:To:Subject:Date:Message-ID:From; b=OjpufJm2…
+From: Alice &lt;alice@example.com&gt;
+Subject: Invoice 2026-09
+
+Hi Bob,
+
+Total:  12,800 JPY
+Due:    2026-10-31
+https://billing.example.com/inv/0928
+
+Alice</pre>
+            </div>
+
+            <div class="file" data-el="chk" style="left:470px;top:96px;width:474px">
+              <div class="file-h">受信側の再計算（WebCrypto）</div>
+              <div class="file-b">
+                <dl class="kv">
+                  <dt>bh 署名値</dt><dd data-el="bhs">bo8O1PQAIkYltLnLg/rfWUvvkQPYwAOFn0pcjkhn8qc=</dd>
+                  <dt>bh 再計算</dt><dd data-el="bhc" class="dim">—</dd>
+                  <dt>b= 検証</dt><dd data-el="sigc" class="dim">—</dd>
+                </dl>
+              </div>
+            </div>
+            <div class="file" data-el="ar" style="left:470px;top:210px;width:474px">
+              <div class="file-h">Authentication-Results（mx.example.net）</div>
+              <pre data-lang="mail" data-el="arp">dkim=… header.d=example.com header.s=sel1</pre>
+            </div>
+            <div class="term hide" data-el="dig" style="left:470px;top:300px;width:474px;height:130px">
+              <div class="term-h">bash — 受信側で確認</div>
+              <div class="term-b"></div>
+            </div>
+
+            <div class="chip c-gray" data-el="k0" style="left:16px;top:500px">基準</div>
+            <div class="chip c-gray" data-el="k1" style="left:88px;top:500px">A 本文にフッタ</div>
+            <div class="chip c-gray" data-el="k2" style="left:218px;top:500px">B 本文を改変</div>
+            <div class="chip c-gray" data-el="k3" style="left:334px;top:500px">C 件名を改変</div>
+            <div class="chip c-gray" data-el="k4" style="left:450px;top:500px">D l= の悪用</div>
+            <div class="chip c-gray" data-el="k5" style="left:562px;top:500px">E 鍵がない</div>
+          </div>
+        </div>
+
+        <div class="tbl">
+          <table class="ref">
+            <thead><tr><th>何が変わったか</th><th>どこで失敗するか</th><th>結果の例（Authentication-Results）</th></tr></thead>
+            <tbody>
+              <tr><td>本文（フッタ追加・改変・再エンコード）</td><td>本文ハッシュの比較（<code>bh=</code>）</td><td><code>dkim=fail (body hash did not verify)</code></td></tr>
+              <tr><td><code>h=</code> に含まれるヘッダ（Subject 等）</td><td>RSA 署名の検証（<code>b=</code>）</td><td><code>dkim=fail (signature did not verify)</code></td></tr>
+              <tr><td><code>h=</code> に含まれないヘッダ（Received 等）</td><td>失敗しない</td><td><code>dkim=pass</code></td></tr>
+              <tr><td>DNS に鍵がない（セレクタ誤り・削除済み）</td><td>鍵の取得（RFC 6376 §6.1.2）</td><td>RFC の表現は <code>PERMFAIL (no key for signature)</code>。結果名は実装により <code>permerror</code> / <code>neutral</code> など</td></tr>
+              <tr><td><code>p=</code> が空（失効）</td><td>鍵の取得</td><td>RFC の表現は <code>PERMFAIL (key revoked)</code></td></tr>
+              <tr><td>DNS が一時的に引けない</td><td>鍵の取得</td><td><code>dkim=temperror</code>（後で再試行）</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="note bad"><b><code>l=</code> は使わない：</b><code>l=</code> 付きの署名は「本文の先頭 N オクテット」しか保護しません。攻撃者は署名済みメールの末尾に任意の文章やリンクを追記でき、受信側では <code>dkim=pass</code> のまま表示されます（RFC 6376 §8.2）。OpenDKIM は <code>BodyLengthDB</code> を設定しない限り <code>l=</code> を付けません。</div>
+      </section>
+
+      <!-- 6. SPF / DMARC -->
+      <section class="chapter" id="spf-dmarc">
+        <h2>SPF と DMARC：3 つの検査が見るもの</h2>
+        <p>DKIM が保証するのは「<code>d=</code> のドメインが、このヘッダと本文に署名した」ことだけで、利用者が目にする <code>From:</code> のドメインと一致しているかは見ません。SPF は SMTP の <strong>エンベロープ（MAIL FROM）</strong>のドメインに対して<strong>送信元 IP</strong> を検査します。そして DMARC が「SPF か DKIM のどちらかが pass し、かつそのドメインが<strong>ヘッダ From とアラインしている</strong>か」を判定し、失敗時の扱い（<code>p=</code>）を From ドメインの所有者が宣言します。</p>
+
+        <div class="scene" id="sc-dmarc" data-title="SPF・DKIM・DMARC を 1 通のメールで比べる">
+          <div class="stage" data-w="960" data-h="520">
+            <div class="node sm" data-el="snd" style="left:16px;top:16px;width:200px">
+              <div class="node-h"><i data-icon="server"></i><b class="node-t">mail.example.com</b></div>
+              <div class="node-s">203.0.113.25</div>
+            </div>
+            <div class="node sm hide c-red" data-el="atk" style="left:16px;top:96px;width:200px">
+              <div class="node-h"><i data-icon="attacker"></i><b class="node-t">attacker.example</b></div>
+              <div class="node-s">198.51.100.66</div>
+            </div>
+            <div class="node sm hide c-amber" data-el="fwd" style="left:16px;top:96px;width:200px">
+              <div class="node-h"><i data-icon="arrow"></i><b class="node-t">fwd.example.net</b></div>
+              <div class="node-s">198.51.100.20 · 転送</div>
+            </div>
+            <div class="file" data-el="env" style="left:240px;top:16px;width:470px">
+              <div class="file-h" data-el="envh">mail.example.com → mx.example.net</div>
+              <pre data-lang="mail" data-el="envp">;; SMTP エンベロープ（RFC 5321）
+MAIL FROM:&lt;alice@example.com&gt;
+RCPT TO:&lt;bob@example.net&gt;
+;; ヘッダ（RFC 5322）
+DKIM-Signature: v=1; a=rsa-sha256; d=example.com; s=sel1; …
+From: Alice &lt;alice@example.com&gt;</pre>
+            </div>
+            <div class="node sm" data-el="mx" style="left:734px;top:16px;width:210px">
+              <div class="node-h"><i data-icon="shieldok"></i><b class="node-t">mx.example.net</b></div>
+              <div class="node-s">198.51.100.10 · 検査する側</div>
+            </div>
+
+            <div class="file hide c-blue" data-el="spf" style="left:16px;top:196px;width:296px">
+              <div class="file-h">SPF · RFC 7208</div>
+              <div class="file-b"><dl class="kv" data-el="spfkv">
+                <dt>見る</dt><dd>MAIL FROM のドメイン + 接続元 IP</dd>
+                <dt>引く</dt><dd class="acc">TXT example.com</dd>
+                <dt>記録</dt><dd>v=spf1 ip4:203.0.113.0/24 include:_spf.example.net -all</dd>
+                <dt>判定</dt><dd>203.0.113.25 ∈ 203.0.113.0/24</dd>
+              </dl></div>
+            </div>
+            <div class="file hide c-violet" data-el="dkim" style="left:332px;top:196px;width:296px">
+              <div class="file-h">DKIM · RFC 6376</div>
+              <div class="file-b"><dl class="kv" data-el="dkimkv">
+                <dt>見る</dt><dd>DKIM-Signature の d= / s=</dd>
+                <dt>引く</dt><dd class="acc">TXT sel1._domainkey.example.com</dd>
+                <dt>記録</dt><dd>v=DKIM1; h=sha256; k=rsa; p=MIIBIjAN…</dd>
+                <dt>判定</dt><dd>bh 一致・b= 検証 OK</dd>
+              </dl></div>
+            </div>
+            <div class="file hide c-amber" data-el="dmarc" style="left:648px;top:196px;width:296px">
+              <div class="file-h">DMARC · RFC 9989</div>
+              <div class="file-b"><dl class="kv" data-el="dmarckv">
+                <dt>見る</dt><dd>ヘッダ From のドメイン</dd>
+                <dt>引く</dt><dd class="acc">TXT _dmarc.example.com</dd>
+                <dt>記録</dt><dd>v=DMARC1; p=reject; rua=mailto:dmarc-reports@example.com; adkim=s; aspf=r</dd>
+              </dl></div>
+            </div>
+            <div class="chip hide" data-el="rspf" style="left:16px;top:388px">spf=…</div>
+            <div class="chip hide" data-el="rdkim" style="left:332px;top:388px">dkim=…</div>
+            <div class="chip hide" data-el="rdmarc" style="left:648px;top:388px">dmarc=…</div>
+            <div class="file hide" data-el="ar" style="left:16px;top:424px;width:928px">
+              <div class="file-h">mx.example.net が付ける結果ヘッダ</div>
+              <pre data-lang="mail" data-el="arp">Authentication-Results: mx.example.net; spf=pass smtp.mailfrom=alice@example.com;
+	dkim=pass header.d=example.com header.s=sel1 header.b=OjpufJm2; dmarc=pass header.from=example.com</pre>
+            </div>
+          </div>
+        </div>
+
+        <h3>どの識別子を、どのレコードで、何と比べるか</h3>
+        <div class="tbl">
+          <table class="ref">
+            <thead><tr><th>検査</th><th>対象の識別子</th><th>引く DNS 名</th><th>比べるもの</th><th>転送されると</th></tr></thead>
+            <tbody>
+              <tr><td>SPF</td><td>エンベロープ <code>MAIL FROM</code>（空なら <code>HELO</code>）のドメイン</td><td><code>example.com</code> TXT</td><td>接続元 IP がレコードに含まれるか</td><td>転送サーバの IP になるので <strong>壊れる</strong></td></tr>
+              <tr><td>DKIM</td><td><code>DKIM-Signature</code> の <code>d=</code></td><td><code>sel1._domainkey.example.com</code> TXT</td><td>正規化したヘッダ・本文の署名</td><td>内容が変わらなければ <strong>残る</strong></td></tr>
+              <tr><td>DMARC</td><td>ヘッダ <code>From:</code> のドメイン</td><td><code>_dmarc.example.com</code> TXT</td><td>SPF/DKIM の pass したドメインと From のアラインメント</td><td>DKIM がアラインして pass なら pass</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>アラインメント（adkim / aspf）</h3>
+        <div class="tbl">
+          <table class="ref">
+            <thead><tr><th>From のドメイン</th><th>比べる相手</th><th><code>r</code>（relaxed・既定）</th><th><code>s</code>（strict）</th></tr></thead>
+            <tbody>
+              <tr><td><code>example.com</code></td><td>DKIM <code>d=example.com</code></td><td>一致</td><td>一致</td></tr>
+              <tr><td><code>example.com</code></td><td>DKIM <code>d=mail.example.com</code></td><td>一致（組織ドメインが同じ）</td><td>不一致</td></tr>
+              <tr><td><code>example.com</code></td><td>MAIL FROM <code>bounce@mail.example.com</code></td><td>一致（組織ドメインが同じ）</td><td>不一致</td></tr>
+              <tr><td><code>example.com</code></td><td>DKIM <code>d=esp.example.net</code>（配信業者の署名）</td><td>不一致</td><td>不一致</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>この例の <code>adkim=s; aspf=r</code> は「DKIM は <code>d=</code> が From と完全一致したときだけ、SPF は同じ組織ドメインなら認める」という意味です。組織ドメインの決め方は、RFC 7489 では Public Suffix List、RFC 9989 では DNS を親方向にたどる DNS Tree Walk に変わりました。</p>
+      </section>
+
+      <!-- 7. DNS レコード -->
+      <section class="chapter" id="records">
+        <h2>DNS レコード早見表（DKIM / SPF / DMARC）</h2>
+        <pre data-lang="dns" data-title="/etc/bind/db.example.com（抜粋）">$ORIGIN example.com.
+$TTL 3600
+@                IN  MX   10 mail.example.com.
+@                IN  TXT  "v=spf1 ip4:203.0.113.0/24 include:_spf.example.net -all"
+mail             IN  A    203.0.113.25
+_dmarc           IN  TXT  "v=DMARC1; p=reject; rua=mailto:dmarc-reports@example.com; adkim=s; aspf=r"
+sel1._domainkey  IN  TXT  ( "v=DKIM1; h=sha256; k=rsa; "
+       "p=MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA3Tz3+7m+hmCxHOE29S/J5/Z/ZKPL9sfUqrLPPi2NUqodPqX8PYUkqNm+jEzO2daharO2YgF7wpvJ76YjuW+pHw2WiCYW34qloTa5aKAe1mCbLt6NtjxMCwQAPERRbzRI7RInDdH/T4S5mrtvuF5qAPNqI64hs+U5YkLPxOJHkSo4sbG7YEPaCC3kKKEeS5mp2Jo/0EYiaX3qBd"
+       "N/aaRbKWqUcRvFPhTt+mYOEsue3mpzGaxPw5NKEOlofGE4QjwS1NyRF/PoW8QZdAmvuaeQT2Xep82lggE7MeL/IngDuayPE3Bc78V0zYSitrp508xYYWywd6aMrtMZjDzL9pPFswIDAQAB" )</pre>
+        <div class="tbl">
+          <table class="ref">
+            <thead><tr><th>要素</th><th>書式</th><th>意味</th></tr></thead>
+            <tbody>
+              <tr><td><code>ip4:</code> / <code>ip6:</code></td><td><code>ip4:203.0.113.0/24</code></td><td>このアドレス範囲からの送信を許可（DNS 参照なし）</td></tr>
+              <tr><td><code>include:</code></td><td><code>include:_spf.example.net</code></td><td>別ドメインの SPF を評価し、pass ならマッチ（配信業者を使うとき）</td></tr>
+              <tr><td><code>a</code> / <code>mx</code></td><td><code>mx</code></td><td>そのドメインの A / MX が指すアドレスを許可</td></tr>
+              <tr><td><code>all</code> と修飾子</td><td><code>-all</code> <code>~all</code> <code>?all</code> <code>+all</code></td><td>どれにも当たらないとき fail / softfail / neutral / pass</td></tr>
+              <tr><td>SPF の DNS 参照上限</td><td>—</td><td><code>include</code> <code>a</code> <code>mx</code> <code>ptr</code> <code>exists</code> <code>redirect</code> の合計 10 回を超えると <code>permerror</code>（RFC 7208 §4.6.4）</td></tr>
+              <tr><td>DMARC <code>p=</code> / <code>sp=</code></td><td><code>none</code> / <code>quarantine</code> / <code>reject</code></td><td>DMARC fail のときの扱い（<code>sp=</code> はサブドメイン）</td></tr>
+              <tr><td>DMARC <code>adkim=</code> / <code>aspf=</code></td><td><code>r</code>（既定） / <code>s</code></td><td>アラインメントの厳しさ</td></tr>
+              <tr><td>DMARC <code>rua=</code> / <code>ruf=</code></td><td><code>mailto:dmarc-reports@example.com</code></td><td>集計レポート（XML）/ 失敗レポートの送り先</td></tr>
+              <tr><td>DMARC <code>np=</code> / <code>t=</code></td><td><code>np=reject</code> / <code>t=y</code></td><td>RFC 9989 で追加：存在しないサブドメインのポリシー / テストモード。<code>pct=</code> は RFC 9989 で廃止</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- 8. コマンド -->
+      <section class="chapter" id="commands">
+        <h2>コマンド早見表</h2>
+        <div class="tbl">
+          <table class="ref">
+            <thead><tr><th>コマンド</th><th>主なフラグ</th><th>何が起きるか</th></tr></thead>
+            <tbody>
+              <tr><td><code>opendkim-genkey</code></td><td><code>-b 2048</code> 鍵長, <code>-d</code> ドメイン, <code>-s</code> セレクタ, <code>-D</code> 出力先, <code>-r</code> <code>s=email</code> を付ける, <code>-t</code> テストモード <code>t=y</code></td><td><code>&lt;selector&gt;.private</code>（秘密鍵）と <code>&lt;selector&gt;.txt</code>（TXT レコード）を作る</td></tr>
+              <tr><td><code>opendkim-testkey</code></td><td><code>-d</code> <code>-s</code>, <code>-k</code> 秘密鍵パス, <code>-x</code> 設定ファイル, <code>-vvv</code></td><td>DNS の鍵を取得・解析し、<code>-k</code>（または KeyTable）の秘密鍵と対になっているか確認。成功時 <code>key OK</code></td></tr>
+              <tr><td><code>dig +short TXT sel1._domainkey.example.com</code></td><td><code>+short</code>, <code>@8.8.8.8</code> でリゾルバ指定</td><td>公開鍵 TXT。分割された文字列が <code>" "</code> 区切りで表示される</td></tr>
+              <tr><td><code>dig +short TXT example.com</code></td><td></td><td>SPF（<code>v=spf1</code> で始まる TXT は 1 つだけであること）</td></tr>
+              <tr><td><code>dig +short TXT _dmarc.example.com</code></td><td></td><td>DMARC ポリシー</td></tr>
+              <tr><td><code>openssl rsa -in sel1.private -pubout</code></td><td><code>-outform DER</code></td><td>秘密鍵から公開鍵 PEM。<code>BEGIN PUBLIC KEY</code> の中身を 1 行にしたものが <code>p=</code></td></tr>
+              <tr><td><code>openssl pkey -pubin -in pub.pem -noout -text</code></td><td></td><td><code>Public-Key: (2048 bit)</code> と Modulus / Exponent を表示</td></tr>
+              <tr><td><code>postconf -n | grep milter</code></td><td></td><td>Postfix の milter 設定（<code>smtpd_milters</code> など）を確認</td></tr>
+              <tr><td><code>journalctl -u opendkim -f</code></td><td></td><td>署名時 <code>DKIM-Signature field added (s=sel1, d=example.com)</code>、検証時 <code>DKIM verification successful</code> などを確認</td></tr>
+              <tr><td><code>swaks</code></td><td><code>--to</code> <code>--from</code> <code>--server</code> <code>--tls</code> <code>--auth</code></td><td>SMTP でテストメールを送る</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- 9. ラボ -->
+      <section class="chapter" id="lab">
+        <h2>ブラウザで検証してみる</h2>
+        <p>下のテキストは上のシーンで使った署名済みメッセージそのものです。1 文字でも書き換えて「検証」を押すと、ページ上で relaxed 正規化 → SHA-256 → RSASSA-PKCS1-v1_5 の検証を行い、どこで失敗したかを表示します。DNS 問い合わせの代わりに、<code>sel1._domainkey.example.com</code> の <code>p=</code>（上の TXT レコードと同じ値）を使います。</p>
+        <div class="lab">
+          <div class="lab-h">DKIM VERIFIER · WebCrypto</div>
+          <label for="lab-msg">メッセージ（ヘッダ + 空行 + 本文）</label>
+          <textarea id="lab-msg" rows="22" spellcheck="false"></textarea>
+          <div class="btns">
+            <button class="btn pri" type="button" id="lab-run">検証</button>
+            <button class="btn" type="button" id="lab-body">本文にフッタを追加</button>
+            <button class="btn" type="button" id="lab-subj">Subject を書き換え</button>
+            <button class="btn" type="button" id="lab-recv">Received を追加</button>
+            <button class="btn" type="button" id="lab-ws">本文の空白を増やす</button>
+            <button class="btn danger" type="button" id="lab-reset">元に戻す</button>
+          </div>
+          <div id="lab-out" class="lab-out"></div>
+        </div>
+      </section>
+
+      <!-- 10. 手元で試す -->
+      <section class="chapter" id="try">
+        <h2>手元で試す</h2>
+        <p>OpenDKIM がなくても、<code>openssl</code> と <code>printf</code> だけで DKIM の計算を再現できます（GNU coreutils の <code>base64 -w0</code> を使います）。<code>bh=</code> は決定的なので、このページと同じ値になります。<code>b=</code> は鍵が違うので値は変わりますが、自分の鍵で署名・検証が通ることを確認できます。</p>
+        <pre data-lang="bash" data-title="openssl だけで bh= と b= を計算する">$ mkdir dkim-lab && cd dkim-lab
+$ openssl genrsa -out sel1.private 2048
+$ openssl rsa -in sel1.private -pubout -outform DER | base64 -w0 > p.txt   # これが p= の値
+$ head -c 44 p.txt; echo
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA
+
+# 1) relaxed 正規化済みの本文（行末 CRLF・連続空白は 1 つ・末尾空行なし）
+$ printf 'Hi Bob,\r\n\r\nTotal: 12,800 JPY\r\nDue: 2026-10-31\r\nhttps://billing.example.com/inv/0928\r\n\r\nAlice\r\n' > body.c
+$ BH=$(openssl dgst -sha256 -binary body.c | base64); echo "$BH"
+bo8O1PQAIkYltLnLg/rfWUvvkQPYwAOFn0pcjkhn8qc=
+
+# 2) h= の順に relaxed 正規化したヘッダ + b= を空にした DKIM-Signature（末尾の CRLF なし）
+$ printf 'from:Alice <alice@example.com>\r\nto:Bob <bob@example.net>\r\nsubject:Invoice 2026-09\r\ndate:Mon, 28 Sep 2026 10:15:00 +0900\r\nmessage-id:<20260928011500.4F2A1C0B7E@mail.example.com>\r\ndkim-signature:v=1; a=rsa-sha256; c=relaxed/relaxed; d=example.com; s=sel1; t=1790558103; bh=%s; h=From:To:Subject:Date:Message-ID:From; b=' "$BH" > hdr.c
+
+# 3) 署名（RSASSA-PKCS1-v1_5 + SHA-256）→ b=
+$ openssl dgst -sha256 -sign sel1.private -binary hdr.c | base64 -w0 > b.txt
+
+# 4) 検証（受信側の処理）
+$ openssl rsa -in sel1.private -pubout -out sel1.pub.pem
+$ base64 -d b.txt > sig.bin
+$ openssl dgst -sha256 -verify sel1.pub.pem -signature sig.bin hdr.c
+Verified OK
+$ sed -i 's/Invoice/INVOICE/' hdr.c && openssl dgst -sha256 -verify sel1.pub.pem -signature sig.bin hdr.c
+Verification failure</pre>
+        <pre data-lang="bash" data-title="Postfix + OpenDKIM（Ubuntu 24.04 の例）">$ sudo apt install opendkim opendkim-tools
+$ sudo mkdir -p /etc/opendkim/keys/example.com
+$ sudo opendkim-genkey -b 2048 -d example.com -s sel1 -D /etc/opendkim/keys/example.com
+$ sudo chown -R opendkim:opendkim /etc/opendkim/keys
+$ sudo cat /etc/opendkim/keys/example.com/sel1.txt      # これを DNS に登録
+# /etc/opendkim.conf, KeyTable, SigningTable, TrustedHosts を設定（上のシーン参照）
+$ sudo postconf -e 'smtpd_milters = inet:localhost:8891' 'non_smtpd_milters = $smtpd_milters' 'milter_default_action = accept'
+$ sudo systemctl restart opendkim postfix
+$ dig +short TXT sel1._domainkey.example.com
+$ sudo opendkim-testkey -d example.com -s sel1 -vvv
+$ swaks --to bob@example.net --from alice@example.com --server mail.example.com:587 --tls --auth-user alice
+$ sudo journalctl -u opendkim --since "5 min ago"</pre>
+        <div class="note tip">実際に届いたメールでは、Gmail の「メッセージのソースを表示」や Thunderbird の「ソースを表示」で <code>Authentication-Results</code> と <code>DKIM-Signature</code> を確認できます。</div>
+      </section>
+
+      <!-- 11. ハマりどころ -->
+      <section class="chapter" id="pitfalls">
+        <h2>ハマりどころ</h2>
+        <div class="note warn"><b>TXT の 255 文字分割：</b>TXT の 1 つの文字列（character-string）は最大 255 オクテットです（RFC 1035 §3.3）。2048bit 鍵の <code>p=</code> は 392 文字あるので、<code>"…" "…"</code> のように複数の文字列に分けて登録し、受信側はそれを<strong>間に何も挟まずに連結</strong>します（RFC 6376 §3.6.2.2）。DNS 管理画面によっては分割を自動でしない・引用符ごと値に入ってしまうことがあるので、<code>dig +short TXT</code> で <code>"v=DKIM1; …" "…"</code> の形になっているか確認します。</div>
+        <div class="note warn"><b>転送で SPF が壊れる：</b>転送サーバは元の <code>MAIL FROM</code> のまま自分の IP から再送するため、SPF は <code>fail</code> になります。DKIM は内容が変わらなければ残るので、DMARC は DKIM のアラインメントで pass できます。転送側で SRS（Sender Rewriting Scheme）により <code>MAIL FROM</code> を書き換える方法もあります。</div>
+        <div class="note warn"><b>メーリングリストで DKIM が壊れる：</b>件名への <code>[list]</code> 付加やフッタ追加で <code>b=</code> / <code>bh=</code> が不一致になります。対策は ML 側の From 書き換え（Mailman の DMARC 対策設定）、ARC（RFC 8617）による経路上の認証結果の引き継ぎ、または ML が自ドメインで再署名することです。</div>
+        <div class="note warn"><b>セレクタのローテーション：</b>(1) 新しいセレクタ <code>sel2</code> の TXT を先に公開 → (2) TTL 以上待ってから署名を <code>sel2</code> に切り替え → (3) 配送中・再送待ちのメールのために旧 <code>sel1</code> をしばらく残す → (4) <code>sel1</code> を <code>p=</code> 空（失効）にしてから削除、の順にします。いきなり消すと、配送途中のメールが検証できなくなります。</div>
+        <div class="note warn"><b>秘密鍵のパーミッション：</b>OpenDKIM は既定（<code>RequireSafeKeys yes</code>）で、他のユーザーが読み書きできる秘密鍵ファイルを安全でないとみなし、ログに <code>key data is not secure</code> を出して使いません。<code>chown opendkim:opendkim</code> と <code>chmod 600</code> にします。</div>
+        <div class="note warn"><b>署名される/されないの判定：</b><code>Mode sv</code> の OpenDKIM は、接続元が <code>InternalHosts</code>（既定 127.0.0.1 のみ）に含まれるメールに署名し、それ以外は検証します。社内ネットワークからのメールに署名されないときは、まず <code>InternalHosts</code> を確認します。</div>
+        <div class="note warn"><b>鍵長とアルゴリズム：</b>RFC 8301 により <code>rsa-sha1</code> は使えず、署名者は 1024bit 以上（推奨 2048bit 以上）の RSA 鍵を使います。Ed25519（RFC 8463）は受信側の対応にばらつきがあるため、使う場合は RSA 署名と併用する（1 通に 2 つの DKIM-Signature を付ける）運用が一般的です。</div>
+      </section>
+
+      <!-- 12. 仕様 -->
+      <section class="chapter" id="spec">
+        <h2>仕様・参考</h2>
+        <ul>
+          <li><a href="https://www.rfc-editor.org/rfc/rfc6376" target="_blank" rel="noopener">RFC 6376 — DomainKeys Identified Mail (DKIM) Signatures</a>（§3.4 正規化, §3.5 タグ, §3.6 鍵レコード, §3.7 ハッシュ計算, §6.1 検証, §8.2 <code>l=</code>）</li>
+          <li><a href="https://www.rfc-editor.org/rfc/rfc8301" target="_blank" rel="noopener">RFC 8301 — Cryptographic Algorithm and Key Usage Update to DKIM</a>（rsa-sha1 の禁止・鍵長）</li>
+          <li><a href="https://www.rfc-editor.org/rfc/rfc8463" target="_blank" rel="noopener">RFC 8463 — A New Cryptographic Signature Method for DKIM</a>（ed25519-sha256）</li>
+          <li><a href="https://www.rfc-editor.org/rfc/rfc7208" target="_blank" rel="noopener">RFC 7208 — Sender Policy Framework (SPF)</a></li>
+          <li><a href="https://www.rfc-editor.org/rfc/rfc9989" target="_blank" rel="noopener">RFC 9989 — DMARC</a>（2026 年 5 月、RFC 7489 を廃止）/ <a href="https://www.rfc-editor.org/rfc/rfc7489" target="_blank" rel="noopener">RFC 7489（旧版）</a></li>
+          <li><a href="https://www.rfc-editor.org/rfc/rfc8601" target="_blank" rel="noopener">RFC 8601 — Message Header Field for Indicating Message Authentication Status</a>（Authentication-Results）</li>
+          <li><a href="https://www.rfc-editor.org/rfc/rfc6008" target="_blank" rel="noopener">RFC 6008 — Authentication-Results Registration for Differentiating among Cryptographic Results</a>（<code>header.b</code>）</li>
+          <li><a href="https://www.rfc-editor.org/rfc/rfc8617" target="_blank" rel="noopener">RFC 8617 — Authenticated Received Chain (ARC)</a></li>
+          <li><a href="https://manpages.debian.org/testing/opendkim-tools/opendkim-genkey.8.en.html" target="_blank" rel="noopener">opendkim-genkey(8)</a> / <a href="https://manpages.debian.org/testing/opendkim-tools/opendkim-testkey.8.en.html" target="_blank" rel="noopener">opendkim-testkey(8)</a> / <a href="https://manpages.debian.org/testing/opendkim/opendkim.conf.5.en.html" target="_blank" rel="noopener">opendkim.conf(5)</a></li>
+          <li><a href="https://www.postfix.org/MILTER_README.html" target="_blank" rel="noopener">Postfix before-queue Milter support (MILTER_README)</a></li>
+          <li>関連ページ：<a href="../dns/">DNS 名前解決</a>（TXT レコードがどう引かれるか）</li>
+        </ul>
+      </section>
+
+    </main>
+  </div>
+
+  <footer class="site-f"></footer>
+  <script src="../../assets/js/topics.js"></script>
+  <script src="../../assets/js/tim.js"></script>
+  <script src="scenes.js"></script>
+</body>
+</html>

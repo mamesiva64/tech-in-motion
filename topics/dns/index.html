@@ -1,0 +1,569 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>DNS 名前解決 — Tech in Motion</title>
+  <meta name="description" content="DNS 名前解決を実物で。getaddrinfo() から /etc/nsswitch.conf・/etc/resolv.conf・systemd-resolved、フルサービスリゾルバ、ルート・TLD・権威サーバーまで、1 回の問い合わせを dig の出力と DNS メッセージのバイト列で追います。">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Space+Grotesk:wght@500;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="../../assets/css/tim.css">
+  <link rel="stylesheet" href="page.css">
+</head>
+<body data-root="../../" data-topic="dns">
+  <header class="site-h"></header>
+
+  <div class="page">
+    <aside class="toc"></aside>
+    <main class="doc">
+
+      <!-- 0. HERO -->
+      <section class="hero">
+        <p class="kicker">Network · DNS</p>
+        <h1>DNS 名前解決<small>getaddrinfo() から権威サーバーまで、1 回の問い合わせを追いかける</small></h1>
+        <p class="lead"><code>curl https://www.example.com/</code> を実行すると、IP アドレスを得るまでに <code>/etc/nsswitch.conf</code>・<code>/etc/hosts</code>・<code>/etc/resolv.conf</code>、ローカルのスタブリゾルバ、キャッシュ DNS、そしてルート → TLD → 権威サーバーへの問い合わせが順に動きます。このページでは、その 1 回の名前解決を <code>dig</code> の出力と DNS メッセージのバイト列で追い、ゾーンファイル・キャッシュ・失敗時の <code>status:</code> までを実物で見ます。</p>
+        <div class="facts">
+          <div class="fact"><span>問い合わせる側</span><b>アプリ → スタブ（<code>127.0.0.53</code> = systemd-resolved）→ フルサービスリゾルバ（キャッシュ DNS）</b></div>
+          <div class="fact"><span>答える側</span><b>ルート <code>a.root-servers.net</code>（198.41.0.4）→ TLD <code>a.gtld-servers.net</code> → 権威 <code>ns1.example.com</code></b></div>
+          <div class="fact"><span>運ぶもの</span><b>UDP/53 の DNS メッセージ（12 バイトのヘッダ + 4 セクション）。大きければ TCP/53</b></div>
+          <div class="fact"><span>仕様</span><b>RFC 1034 / 1035 / 2181 / 2308 / 6891 / 9499</b></div>
+        </div>
+      </section>
+
+      <!-- 1. 全体像 -->
+      <section class="chapter" id="overview">
+        <h2>全体像：1 回の名前解決で、誰が誰に何を聞くか</h2>
+        <p>アプリ自身は DNS を話さず、libc の <code>getaddrinfo()</code> を呼ぶだけです。libc（NSS）がローカルのファイルとスタブリゾルバに聞き、スタブは設定されたフルサービスリゾルバに<strong>再帰問い合わせ</strong>（RD=1：「最後まで調べて答えだけ返して」）を送ります。フルサービスリゾルバはキャッシュになければ、ルートから順に<strong>反復問い合わせ</strong>（RD=0：「知っている範囲で答えて」）を行い、紹介（リファラル）をたどって権威サーバーにたどり着きます。</p>
+
+        <div class="scene" id="sc-path" data-title="www.example.com の A レコードが解決されるまで">
+          <div class="stage" data-w="960" data-h="540">
+            <div class="zone" style="left:16px;top:16px;width:330px;height:508px" data-label="client01 · Ubuntu 24.04"></div>
+            <div class="node" data-el="app" style="left:32px;top:38px;width:298px">
+              <div class="node-h"><i data-icon="terminal"></i><b class="node-t">curl https://www.example.com/</b></div>
+              <div class="node-s">getaddrinfo("www.example.com", "443")</div>
+            </div>
+            <div class="file" data-el="nss" style="left:32px;top:122px;width:298px">
+              <div class="file-h">/etc/nsswitch.conf</div>
+              <pre data-lang="text">hosts:  files dns</pre>
+            </div>
+            <div class="file" data-el="hosts" style="left:32px;top:190px;width:298px">
+              <div class="file-h">/etc/hosts</div>
+              <pre data-lang="text">127.0.0.1  localhost
+127.0.1.1  client01
+::1        ip6-localhost ip6-loopback</pre>
+            </div>
+            <div class="file" data-el="resolv" style="left:32px;top:300px;width:298px">
+              <div class="file-h">/etc/resolv.conf → stub-resolv.conf</div>
+              <pre data-lang="text">nameserver 127.0.0.53
+options edns0 trust-ad
+search .</pre>
+            </div>
+            <div class="node" data-el="stub" style="left:32px;top:420px;width:298px">
+              <div class="node-h"><i data-icon="gear"></i><b class="node-t">systemd-resolved</b></div>
+              <div class="node-s">127.0.0.53:53 · 上流 DNS 192.0.2.1</div>
+            </div>
+
+            <div class="node" data-el="res" style="left:376px;top:200px;width:254px">
+              <div class="node-h"><i data-icon="server"></i><b class="node-t">フルサービスリゾルバ</b></div>
+              <div class="node-s">Unbound · 192.0.2.1 · キャッシュ</div>
+            </div>
+            <div class="file hide" data-el="rcache" style="left:376px;top:284px;width:254px">
+              <div class="file-h">キャッシュ（rrset と残り TTL）</div>
+              <pre data-lang="dns">com.                NS 172800
+a.gtld-servers.net. A  172800
+example.com.        NS 172800
+ns1.example.com.    A  172800
+www.example.com.    A  3600</pre>
+            </div>
+
+            <div class="node c-violet" data-el="root" style="left:660px;top:30px;width:284px">
+              <div class="node-h"><i data-icon="globe"></i><b class="node-t">a.root-servers.net</b></div>
+              <div class="node-s">198.41.0.4 · ルートゾーン「.」</div>
+            </div>
+            <div class="file hide c-violet" data-el="rootA" style="left:660px;top:104px;width:284px">
+              <div class="file-h">referral（AUTHORITY + ADDITIONAL）</div>
+              <pre data-lang="dns">com.  NS  a.gtld-servers.net.
+a.gtld-servers.net.  A  192.5.6.30</pre>
+            </div>
+            <div class="node c-cyan" data-el="tld" style="left:660px;top:196px;width:284px">
+              <div class="node-h"><i data-icon="globe"></i><b class="node-t">a.gtld-servers.net</b></div>
+              <div class="node-s">192.5.6.30 · TLD「com.」</div>
+            </div>
+            <div class="file hide c-cyan" data-el="tldA" style="left:660px;top:270px;width:284px">
+              <div class="file-h">referral + glue</div>
+              <pre data-lang="dns">example.com.  NS  ns1.example.com.
+ns1.example.com.  A  203.0.113.53</pre>
+            </div>
+            <div class="node c-green" data-el="auth" style="left:660px;top:362px;width:284px">
+              <div class="node-h"><i data-icon="db"></i><b class="node-t">ns1.example.com</b></div>
+              <div class="node-s">203.0.113.53 · example.com の権威</div>
+            </div>
+            <div class="file hide c-green" data-el="authA" style="left:660px;top:436px;width:284px">
+              <div class="file-h">answer（flags: qr aa）</div>
+              <pre data-lang="dns">www.example.com. 3600 A 203.0.113.10</pre>
+            </div>
+          </div>
+        </div>
+
+        <div class="tbl">
+          <table class="ref">
+            <thead><tr><th>役割</th><th>この例での実体</th><th>何をするか</th></tr></thead>
+            <tbody>
+              <tr><td>スタブリゾルバ</td><td>glibc の NSS <code>dns</code> モジュール → <code>127.0.0.53</code>（systemd-resolved）</td><td>自分では辿らず、設定されたリゾルバに RD=1 で聞くだけ。systemd-resolved は小さなキャッシュも持つ</td></tr>
+              <tr><td>フルサービスリゾルバ<br><small>（キャッシュ DNS・再帰リゾルバ）</small></td><td>Unbound / BIND（<code>192.0.2.1</code>）、公開リゾルバ <code>8.8.8.8</code> / <code>1.1.1.1</code> など</td><td>ルートから反復問い合わせで辿り、結果を TTL の間キャッシュする</td></tr>
+              <tr><td>ルートサーバー</td><td><code>a.root-servers.net</code>〜<code>m.root-servers.net</code>（13 の名前・エニーキャスト）</td><td>TLD（<code>com.</code> など）の NS と glue を返す</td></tr>
+              <tr><td>TLD サーバー</td><td><code>a.gtld-servers.net</code>〜<code>m.gtld-servers.net</code>（<code>com.</code>）</td><td><code>example.com.</code> の NS（委任）と glue を返す</td></tr>
+              <tr><td>権威サーバー</td><td><code>ns1.example.com</code>（BIND の <code>type primary</code> など）</td><td>ゾーンファイルの内容を <code>aa</code>（Authoritative Answer）付きで返す</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="note">このページの <code>example.com</code> の委任先（<code>ns1.example.com</code> / <code>ns2.example.com</code>）とゾーンの中身は説明用の値です。実在の <code>example.com</code> は別の権威サーバーで運用されています。ルートサーバー <code>a.root-servers.net</code>（198.41.0.4 / 2001:503:ba3e::2:30）と <code>a.gtld-servers.net</code>（192.5.6.30 / 2001:503:a83e::2:30）は実在の値です。</div>
+      </section>
+
+      <!-- 2. メッセージ -->
+      <section class="chapter" id="message">
+        <h2>DNS メッセージの中身</h2>
+        <p>問い合わせも応答も同じ形式のメッセージです。12 バイトのヘッダの後に Question / Answer / Authority / Additional の 4 セクションが続き、各セクションの件数はヘッダに入っています（RFC 1035 §4.1）。下のシーンでは <code>dig</code> が実際に送る 44 バイトのクエリと、60 バイトの応答を 1 バイトずつ分解します。</p>
+
+        <div class="scene" id="sc-msg" data-title="44 バイトのクエリと 60 バイトの応答を分解する">
+          <div class="stage" data-w="960" data-h="520">
+            <div class="term" data-el="t" style="left:16px;top:16px;width:440px;height:118px">
+              <div class="term-h">root@client01:~ — bash</div>
+              <div class="term-b"></div>
+            </div>
+            <div class="file hide" data-el="qhex" style="left:480px;top:16px;width:464px">
+              <div class="file-h">クエリ · UDP 192.0.2.77:41852 → 192.0.2.1:53<small>44 bytes</small></div>
+              <div class="file-b hx" data-el="qhexb"></div>
+            </div>
+            <div class="file hide" data-el="rhex" style="left:480px;top:16px;width:464px">
+              <div class="file-h">応答 · UDP 192.0.2.1:53 → 192.0.2.77:41852<small>60 bytes</small></div>
+              <div class="file-b hx" data-el="rhexb"></div>
+            </div>
+
+            <div class="label hide" data-el="lh" style="left:16px;top:144px">HEADER · 12 bytes</div>
+            <div class="seg hide c-blue" data-el="h1" style="left:16px;top:162px;width:928px">
+              <span style="flex:2" data-el="vid"><small>ID (16bit)</small>0xa1c4 = 41412</span>
+              <span style="flex:1" data-el="vqr"><small>QR</small>0</span>
+              <span style="flex:1"><small>OPCODE</small>0</span>
+              <span style="flex:1" data-el="vaa"><small>AA</small>0</span>
+              <span style="flex:1" data-el="vtc"><small>TC</small>0</span>
+              <span style="flex:1" data-el="vrd"><small>RD</small>1</span>
+              <span style="flex:1" data-el="vra"><small>RA</small>0</span>
+              <span style="flex:1"><small>Z</small>0</span>
+              <span style="flex:1" data-el="vad"><small>AD</small>1</span>
+              <span style="flex:1" data-el="vcd"><small>CD</small>0</span>
+              <span style="flex:1" data-el="vrc"><small>RCODE</small>0</span>
+            </div>
+            <div class="seg hide c-blue" data-el="h2" style="left:16px;top:216px;width:928px">
+              <span style="flex:1" data-el="vqd"><small>QDCOUNT</small>1</span>
+              <span style="flex:1" data-el="van"><small>ANCOUNT</small>0</span>
+              <span style="flex:1" data-el="vns"><small>NSCOUNT</small>0</span>
+              <span style="flex:1" data-el="var"><small>ARCOUNT</small>1 (OPT)</span>
+            </div>
+            <div class="label hide" data-el="lq" style="left:16px;top:276px">QUESTION</div>
+            <div class="seg hide c-lime" data-el="q1" style="left:16px;top:294px;width:928px">
+              <span style="flex:3"><small>QNAME（ラベル長 + 文字列 … 00）</small>03 www 07 example 03 com 00</span>
+              <span style="flex:1"><small>QTYPE</small>00 01 = A</span>
+              <span style="flex:1"><small>QCLASS</small>00 01 = IN</span>
+            </div>
+            <div class="label hide" data-el="lo" style="left:16px;top:352px">ADDITIONAL · OPT 疑似 RR（EDNS0）</div>
+            <div class="seg hide c-violet" data-el="o1" style="left:16px;top:370px;width:928px">
+              <span style="flex:1"><small>NAME</small>00 = ルート</span>
+              <span style="flex:1"><small>TYPE</small>00 29 = OPT</span>
+              <span style="flex:1"><small>CLASS → UDP サイズ</small>04 d0 = 1232</span>
+              <span style="flex:1"><small>TTL → EXT-RCODE/VER/DO</small>0 / 0 / DO=0</span>
+              <span style="flex:1"><small>RDLENGTH</small>0</span>
+            </div>
+            <div class="label hide" data-el="la" style="left:16px;top:428px">ANSWER</div>
+            <div class="seg hide c-green" data-el="a1" style="left:16px;top:446px;width:928px">
+              <span style="flex:1.6"><small>NAME（圧縮ポインタ）</small>c0 0c → offset 12</span>
+              <span style="flex:1"><small>TYPE</small>00 01 = A</span>
+              <span style="flex:1"><small>CLASS</small>00 01 = IN</span>
+              <span style="flex:1.7"><small>TTL</small>00 00 0e 10 = 3600</span>
+              <span style="flex:1"><small>RDLENGTH</small>00 04 = 4</span>
+              <span style="flex:2.4"><small>RDATA</small>cb 00 71 0a = 203.0.113.10</span>
+            </div>
+
+            <div class="file hide" data-el="out" style="left:16px;top:146px;width:928px">
+              <div class="file-h">dig @192.0.2.1 www.example.com の出力（バナー行は省略・右端の ; 以降は注釈）</div>
+              <pre data-lang="dns">;; Got answer:
+;; -&gt;&gt;HEADER&lt;&lt;- opcode: QUERY, status: NOERROR, id: 41412           ; ID / OPCODE / RCODE
+;; flags: qr rd ra; QUERY: 1, ANSWER: 1, AUTHORITY: 0, ADDITIONAL: 1  ; フラグと 4 つの COUNT
+
+;; OPT PSEUDOSECTION:
+; EDNS: version: 0, flags:; udp: 1232                               ; OPT 疑似 RR（Additional）
+;; QUESTION SECTION:
+;www.example.com.               IN      A                           ; Question
+
+;; ANSWER SECTION:
+www.example.com.        3600    IN      A       203.0.113.10        ; Answer（TTL 3600 秒）
+
+;; Query time: 23 msec
+;; SERVER: 192.0.2.1#53(192.0.2.1) (UDP)
+;; WHEN: Mon Sep 28 10:30:12 JST 2026
+;; MSG SIZE  rcvd: 60                                                ; 応答のバイト数</pre>
+            </div>
+          </div>
+        </div>
+
+        <h3>ヘッダのフラグとコード</h3>
+        <div class="tbl">
+          <table class="ref">
+            <thead><tr><th>フィールド</th><th>ビット</th><th>意味</th><th>dig の表示</th></tr></thead>
+            <tbody>
+              <tr><td><code>ID</code></td><td>16</td><td>問い合わせ ID。応答はクエリと同じ ID を返す（送信元ポートと合わせてなりすまし対策）</td><td><code>id: 41412</code></td></tr>
+              <tr><td><code>QR</code></td><td>1</td><td>0 = 問い合わせ, 1 = 応答</td><td><code>qr</code></td></tr>
+              <tr><td><code>OPCODE</code></td><td>4</td><td>0 = QUERY（標準問い合わせ）, 4 = NOTIFY, 5 = UPDATE</td><td><code>opcode: QUERY</code></td></tr>
+              <tr><td><code>AA</code></td><td>1</td><td>Authoritative Answer。権威サーバーが自分のゾーンから答えた</td><td><code>aa</code></td></tr>
+              <tr><td><code>TC</code></td><td>1</td><td>TrunCation。UDP に収まらず切り詰めた → TCP で再問い合わせ</td><td><code>tc</code></td></tr>
+              <tr><td><code>RD</code></td><td>1</td><td>Recursion Desired。「最後まで調べて」（スタブ → リゾルバ）</td><td><code>rd</code></td></tr>
+              <tr><td><code>RA</code></td><td>1</td><td>Recursion Available。このサーバーは再帰に応じる</td><td><code>ra</code></td></tr>
+              <tr><td><code>AD</code> / <code>CD</code></td><td>1 / 1</td><td>Authentic Data（DNSSEC 検証済み）/ Checking Disabled（検証しないで）。RFC 4035</td><td><code>ad</code> / <code>cd</code></td></tr>
+              <tr><td><code>RCODE</code></td><td>4</td><td>0 NOERROR, 1 FORMERR, 2 SERVFAIL, 3 NXDOMAIN, 4 NOTIMP, 5 REFUSED</td><td><code>status: NOERROR</code></td></tr>
+              <tr><td><code>QDCOUNT</code> ほか</td><td>16 × 4</td><td>Question / Answer / Authority / Additional の件数</td><td><code>QUERY: 1, ANSWER: 1, …</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="note"><b>UDP・TCP・EDNS：</b>DNS は通常 UDP/53 で、EDNS なしの UDP 応答は 512 バイトまでです（RFC 1035 §4.2.1）。EDNS(0)（RFC 6891）の OPT 疑似 RR で「この大きさまで受け取れる」と伝えると、それ以上の UDP 応答が可能になります。BIND 9.18 の dig や多くのリゾルバは既定で 1232 バイトを広告します。それでも収まらないと応答に <code>TC</code> が立ち、クライアントは TCP/53 で問い直します。TCP では各メッセージの前に 2 バイトの長さが付きます（RFC 1035 §4.2.2）。</div>
+      </section>
+
+      <!-- 3. ゾーン -->
+      <section class="chapter" id="zone">
+        <h2>ゾーンファイルとレコード</h2>
+        <p>権威サーバーが返す内容の元は、ゾーンファイル（RFC 1035 §5 のマスターファイル形式）です。名前の末尾に <code>.</code> がなければ <code>$ORIGIN</code> が補われ、TTL を省略した行には <code>$TTL</code> が使われます。</p>
+
+        <div class="scene" id="sc-zone" data-title="ゾーンファイルの各行が、dig の答えになる">
+          <div class="stage" data-w="960" data-h="520">
+            <div class="file" data-el="zone" style="left:16px;top:16px;width:484px">
+              <div class="file-h">/etc/bind/db.example.com<small>BIND 9 · type primary</small></div>
+              <pre data-lang="dns">$ORIGIN example.com.
+$TTL 3600
+@         IN SOA   ns1 hostmaster (
+                   2026092801 ; serial
+                   7200       ; refresh
+                   3600       ; retry
+                   1209600    ; expire
+                   300 )      ; minimum = ネガティブ TTL
+          IN NS    ns1
+          IN NS    ns2
+          IN A     203.0.113.10
+          IN MX    10 mail
+          IN TXT   "v=spf1 ip4:203.0.113.0/24 -all"
+          IN CAA   0 issue "letsencrypt.org"
+ns1       IN A     203.0.113.53
+ns2       IN A     198.51.100.53
+www       IN A     203.0.113.10
+www       IN AAAA  2001:db8::10
+mail      IN A     203.0.113.25
+shop      IN CNAME shops.example.net.
+_sip._tcp IN SRV   10 60 5060 sip
+sip       IN A     203.0.113.60</pre>
+            </div>
+            <div class="term" data-el="t" style="left:524px;top:16px;width:420px;height:196px">
+              <div class="term-h">root@client01:~ — dig</div>
+              <div class="term-b"></div>
+            </div>
+            <div class="node sm" data-el="res" style="left:524px;top:232px;width:196px">
+              <div class="node-h"><i data-icon="server"></i><b class="node-t">リゾルバ</b></div>
+              <div class="node-s">192.0.2.1</div>
+            </div>
+            <div class="node sm hide c-cyan" data-el="nsnet" style="left:748px;top:232px;width:196px">
+              <div class="node-h"><i data-icon="db"></i><b class="node-t">example.net の権威</b></div>
+              <div class="node-s">shops.example.net A</div>
+            </div>
+            <div class="file hide" data-el="ans" style="left:524px;top:310px;width:420px">
+              <div class="file-h">dig shop.example.com · ANSWER: 2</div>
+              <pre data-lang="dns">shop.example.com.  3600 IN CNAME shops.example.net.
+shops.example.net.  300 IN A     198.51.100.80</pre>
+            </div>
+            <div class="file hide c-red" data-el="dot" style="left:524px;top:400px;width:420px">
+              <div class="file-h">末尾の「.」を忘れると</div>
+              <pre data-lang="dns">shop IN CNAME shops.example.net
+; → shops.example.net.example.com. と解釈される</pre>
+            </div>
+          </div>
+        </div>
+
+        <h3>レコードタイプ早見表</h3>
+        <div class="tbl">
+          <table class="ref">
+            <thead><tr><th>タイプ</th><th>値の例</th><th>用途・注意</th></tr></thead>
+            <tbody>
+              <tr><td><code>SOA</code></td><td><code>ns1.example.com. hostmaster.example.com. 2026092801 7200 3600 1209600 300</code></td><td>ゾーンの起点。プライマリ名・管理者（最初の <code>.</code> が <code>@</code>）・シリアル・refresh / retry / expire・ネガティブキャッシュ TTL</td></tr>
+              <tr><td><code>NS</code></td><td><code>ns1.example.com.</code></td><td>このゾーンの権威サーバー。親ゾーン（<code>com.</code>）にも同じ NS を登録して委任する</td></tr>
+              <tr><td><code>A</code> / <code>AAAA</code></td><td><code>203.0.113.10</code> / <code>2001:db8::10</code></td><td>IPv4 / IPv6 アドレス</td></tr>
+              <tr><td><code>CNAME</code></td><td><code>shops.example.net.</code></td><td>別名。<strong>同じ名前に他のレコードを置けない</strong>ので、ゾーン頂点（SOA と NS がある）には置けない</td></tr>
+              <tr><td><code>MX</code></td><td><code>10 mail.example.com.</code></td><td>メールの配送先（優先度 + ホスト名）。値に CNAME の名前を指定しない</td></tr>
+              <tr><td><code>TXT</code></td><td><code>"v=spf1 ip4:203.0.113.0/24 -all"</code></td><td>任意の文字列。SPF・DKIM 公開鍵・DMARC・ドメイン所有確認。1 文字列 255 オクテットまで（複数文字列で連結）</td></tr>
+              <tr><td><code>CAA</code></td><td><code>0 issue "letsencrypt.org"</code></td><td>証明書を発行してよい CA（RFC 8659）</td></tr>
+              <tr><td><code>SRV</code></td><td><code>10 60 5060 sip.example.com.</code></td><td>優先度・重み・ポート・ホスト（RFC 2782）。名前は <code>_サービス._プロトコル</code></td></tr>
+              <tr><td><code>PTR</code></td><td><code>10.113.0.203.in-addr.arpa. PTR www.example.com.</code></td><td>逆引き。<code>dig -x 203.0.113.10</code> が組み立てる名前</td></tr>
+              <tr><td><code>HTTPS</code> / <code>SVCB</code></td><td><code>1 . alpn="h2,h3"</code></td><td>接続先のパラメータ（ALPN・ECH など）を事前に伝える（RFC 9460）</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- 4. キャッシュ -->
+      <section class="chapter" id="cache">
+        <h2>キャッシュと TTL</h2>
+        <p>フルサービスリゾルバは、受け取ったレコードを TTL（秒）の間キャッシュし、その間は権威サーバーに聞かずに答えます。キャッシュから返す応答の TTL は「残り時間」なので、同じ名前を 2 回 <code>dig</code> すると TTL が減って見えます。「存在しない」という答えも SOA の値に従ってキャッシュされます（ネガティブキャッシュ、RFC 2308）。</p>
+
+        <div class="scene" id="sc-cache" data-title="TTL が減っていく・消える・古い答えが残る">
+          <div class="stage" data-w="960" data-h="500">
+            <div class="node sm" data-el="cli" style="left:16px;top:16px;width:220px">
+              <div class="node-h"><i data-icon="terminal"></i><b class="node-t">client01</b></div>
+              <div class="node-s">dig @192.0.2.1</div>
+            </div>
+            <div class="node sm" data-el="res" style="left:330px;top:16px;width:280px">
+              <div class="node-h"><i data-icon="server"></i><b class="node-t">Unbound 192.0.2.1</b></div>
+              <div class="node-s">フルサービスリゾルバ · キャッシュ</div>
+            </div>
+            <div class="node sm c-green" data-el="auth" style="left:700px;top:16px;width:244px">
+              <div class="node-h"><i data-icon="db"></i><b class="node-t">ns1.example.com</b></div>
+              <div class="node-s">203.0.113.53 · 権威</div>
+            </div>
+            <div class="chip c-amber" data-el="clk" style="left:330px;top:92px"><i data-icon="clock"></i><span data-el="clkv">経過 0 秒</span></div>
+            <div class="file" data-el="cache" style="left:330px;top:128px;width:360px">
+              <div class="file-h">キャッシュ（名前 / タイプ / 値 / 残り TTL）</div>
+              <pre data-lang="dns" data-el="cachep">; （空）</pre>
+            </div>
+            <div class="file c-green" data-el="azone" style="left:700px;top:92px;width:244px">
+              <div class="file-h">db.example.com<small data-el="serial">serial 2026092801</small></div>
+              <pre data-lang="dns" data-el="azonep">www  3600 IN A 203.0.113.10
+@    SOA … minimum 300</pre>
+            </div>
+            <div class="term" data-el="t" style="left:16px;top:300px;width:928px;height:184px">
+              <div class="term-h">root@client01:~ — dig</div>
+              <div class="term-b"></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="note"><b>ネガティブキャッシュの TTL：</b>NXDOMAIN や NODATA の応答には Authority セクションにゾーンの SOA が付き、リゾルバはそれを「SOA の TTL」と「SOA の MINIMUM フィールド」の小さい方の秒数だけキャッシュします（RFC 2308 §5）。この例では <code>min(3600, 300) = 300</code> 秒です。新しいサブドメインを作る直前に一度引いてしまうと、最大でこの時間は「存在しない」と答えられ続けます。</div>
+      </section>
+
+      <!-- 5. 失敗 -->
+      <section class="chapter" id="failures">
+        <h2>失敗ケース：status: を読み分ける</h2>
+        <p><code>dig</code> のヘッダ行 <code>status:</code> は RCODE です。「名前がない」「名前はあるが型がない」「リゾルバが答えを得られなかった」は別物で、原因の場所も対処も違います。</p>
+
+        <div class="scene" id="sc-fail" data-title="NXDOMAIN / NODATA / SERVFAIL / lame delegation / 頂点 CNAME">
+          <div class="stage" data-w="960" data-h="520">
+            <div class="node sm" data-el="cli" style="left:16px;top:16px;width:200px">
+              <div class="node-h"><i data-icon="terminal"></i><b class="node-t">client01</b></div>
+              <div class="node-s">dig</div>
+            </div>
+            <div class="node sm" data-el="res" style="left:290px;top:16px;width:250px">
+              <div class="node-h"><i data-icon="server"></i><b class="node-t">リゾルバ 192.0.2.1</b></div>
+              <div class="node-s">再帰・キャッシュ</div>
+            </div>
+            <div class="node sm c-green" data-el="ns1" style="left:600px;top:16px;width:164px">
+              <div class="node-h"><i data-icon="db"></i><b class="node-t">ns1</b></div>
+              <div class="node-s">203.0.113.53</div>
+            </div>
+            <div class="node sm c-green" data-el="ns2" style="left:780px;top:16px;width:164px">
+              <div class="node-h"><i data-icon="db"></i><b class="node-t">ns2</b></div>
+              <div class="node-s">198.51.100.53</div>
+            </div>
+            <div class="big" data-el="st" style="left:16px;top:98px;width:440px"><small>status</small><span data-el="stv">—</span></div>
+            <div class="file" data-el="hdr" style="left:16px;top:170px;width:440px">
+              <div class="file-h">dig の要点</div>
+              <pre data-lang="dns" data-el="hdrp">;; （ステップを再生）</pre>
+            </div>
+            <div class="file" data-el="sum" style="left:480px;top:98px;width:464px">
+              <div class="file-h">読み方</div>
+              <div class="file-b"><dl class="kv" data-el="sumkv">
+                <dt>意味</dt><dd>—</dd>
+                <dt>決めた所</dt><dd>—</dd>
+                <dt>キャッシュ</dt><dd>—</dd>
+              </dl></div>
+            </div>
+            <div class="term" data-el="t" style="left:16px;top:330px;width:928px;height:174px">
+              <div class="term-h">root@client01:~ — dig</div>
+              <div class="term-b"></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="tbl">
+          <table class="ref">
+            <thead><tr><th>status</th><th>ANSWER</th><th>意味</th><th>決めた所</th><th>よくある原因</th></tr></thead>
+            <tbody>
+              <tr><td><code>NOERROR</code></td><td>1 以上</td><td>成功</td><td>権威（aa）またはキャッシュ</td><td>—</td></tr>
+              <tr><td><code>NOERROR</code>（NODATA）</td><td>0</td><td>名前はあるが、その型のレコードがない</td><td>権威。Authority に SOA</td><td>AAAA を作っていない・TXT のつもりが別名</td></tr>
+              <tr><td><code>NXDOMAIN</code></td><td>0</td><td>名前そのものが存在しない</td><td>権威。Authority に SOA</td><td>タイプミス・未登録・<code>search</code> ドメインの付加</td></tr>
+              <tr><td><code>SERVFAIL</code></td><td>0</td><td>リゾルバが答えを得られなかった</td><td>フルサービスリゾルバ</td><td>権威が全滅・lame delegation・DNSSEC 検証失敗</td></tr>
+              <tr><td><code>REFUSED</code></td><td>0</td><td>このサーバーは答えない</td><td>問い合わせ先のサーバー</td><td>権威サーバーにゾーンがない・再帰を許可していない</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- 6. DNSSEC -->
+      <section class="chapter" id="dnssec">
+        <h2>DNSSEC：署名の連鎖（概要）</h2>
+        <p>DNSSEC は各 RRset に署名（<code>RRSIG</code>）を付け、ゾーンの公開鍵（<code>DNSKEY</code>）のハッシュを親ゾーンに <code>DS</code> として登録することで、ルートから順に「この鍵は親が保証している」という連鎖を作ります（RFC 4033〜4035）。検証するのはフルサービスリゾルバで、ルートの鍵（トラストアンカー）だけを事前に持っています。</p>
+        <pre data-lang="text" data-title="www.example.com の A を検証するときの連鎖">トラストアンカー（ルート KSK）
+  └─ .            DNSKEY  ── RRSIG で自己署名
+       └─ com.    DS      ── ルートの鍵で署名（RRSIG）
+            └─ com.          DNSKEY  ── DS のハッシュと一致するか
+                 └─ example.com.  DS      ── com. の鍵で署名
+                      └─ example.com.  DNSKEY 257（KSK）/ 256（ZSK）
+                           └─ www.example.com. A + RRSIG  ── ZSK で署名</pre>
+        <div class="tbl">
+          <table class="ref">
+            <thead><tr><th>レコード</th><th>置かれる場所</th><th>中身</th></tr></thead>
+            <tbody>
+              <tr><td><code>DNSKEY</code></td><td>各ゾーンの頂点</td><td>公開鍵。flags 257 = KSK（鍵署名鍵）、256 = ZSK（ゾーン署名鍵）、protocol 3、アルゴリズム（13 = ECDSA P-256/SHA-256 など）</td></tr>
+              <tr><td><code>RRSIG</code></td><td>署名した RRset と同じ名前</td><td>対象タイプ・アルゴリズム・ラベル数・元の TTL・有効期限・開始時刻・鍵タグ・署名者名・署名値</td></tr>
+              <tr><td><code>DS</code></td><td><strong>親</strong>ゾーン（委任点）</td><td>子の KSK の鍵タグ・アルゴリズム・ダイジェスト種別（2 = SHA-256）・ダイジェスト</td></tr>
+              <tr><td><code>NSEC</code> / <code>NSEC3</code></td><td>各名前</td><td>「この間には名前がない」ことの署名付き証明（NXDOMAIN の検証）</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <pre data-lang="dns" data-title="dig +dnssec www.example.com（署名済みゾーンの場合の例）">;; flags: qr rd ra ad; QUERY: 1, ANSWER: 2, AUTHORITY: 0, ADDITIONAL: 1
+; EDNS: version: 0, flags: do; udp: 1232
+;; ANSWER SECTION:
+www.example.com.  3600 IN A     203.0.113.10
+www.example.com.  3600 IN RRSIG A 13 3 3600 20261012000000 20260928000000 31589 example.com. 2Q2eWeaS+oWjaceqsUVXDn15BDthtZYFrv7BLYQdVURco7fkpCDpOws4mIIgFbyKbLSZt7HUaXvwzLmDXKZU+A==
+
+$ dig +noall +answer DNSKEY example.com
+example.com.      3600 IN DNSKEY 257 3 13 jscTMu+ifa267E8KWAXST2fTa2Y33D4mNvu2q/RBo79Oaa8Av/yxUflXuX5UdpARp5T6YMMLlp4x8CK74zGuHQ==
+example.com.      3600 IN DNSKEY 256 3 13 cgPG1XhvdVTCaQ5/wVnvmuU5AYv9BR/dJmmSyh9b9zIA4ky1GkOj649vsJ26WOInGdP5TbLm8B6S7jNMY7nJkQ==
+
+$ dig +noall +answer DS example.com
+example.com.      86400 IN DS   2371 13 2 73E6ED998BD7D750AC240DA3A1A29F875C40C4E673BBFD31CC42D5DB 4CFB34A8</pre>
+        <p><code>ad</code> フラグは「リゾルバが DNSSEC で検証できた」ことを示します。<code>+dnssec</code> は OPT の <code>DO</code> ビットを立てて RRSIG を要求します。検証に失敗するとリゾルバは <code>SERVFAIL</code> を返し、<code>+cd</code>（Checking Disabled）を付けると検証をせずに答えを返すので、「DNSSEC のせいで引けないのか」を切り分けられます。BIND 付属の <code>delv</code> はローカルで検証を行い、結果を <code>; fully validated</code> / <code>; unsigned answer</code> などで表示します。</p>
+      </section>
+
+      <!-- 7. コマンド -->
+      <section class="chapter" id="commands">
+        <h2>dig コマンド早見表</h2>
+        <div class="tbl">
+          <table class="ref">
+            <thead><tr><th>書き方</th><th>何が起きるか</th></tr></thead>
+            <tbody>
+              <tr><td><code>dig www.example.com</code></td><td><code>/etc/resolv.conf</code> のサーバーに A を問い合わせ、全セクションを表示</td></tr>
+              <tr><td><code>dig @192.0.2.1 example.com MX</code></td><td>問い合わせ先サーバーとタイプを指定（<code>-t MX</code> と同じ）</td></tr>
+              <tr><td><code>dig +short www.example.com</code></td><td>答えの値だけを表示</td></tr>
+              <tr><td><code>dig +noall +answer www.example.com</code></td><td>全表示を消してから Answer セクションだけを出す（TTL も見える）</td></tr>
+              <tr><td><code>dig +trace www.example.com</code></td><td>dig 自身がルートから反復問い合わせを行い、各段の応答を表示（<code>+dnssec</code> も有効になる）</td></tr>
+              <tr><td><code>dig +norecurse @a.root-servers.net www.example.com</code></td><td>RD=0 で問い合わせ。そのサーバーが知っていることだけを返す（リファラルが見える）</td></tr>
+              <tr><td><code>dig -x 203.0.113.10</code></td><td>逆引き。<code>10.113.0.203.in-addr.arpa. PTR</code> を問い合わせる</td></tr>
+              <tr><td><code>dig +dnssec www.example.com</code></td><td>DO ビットを立てて RRSIG も受け取る。検証済みなら flags に <code>ad</code></td></tr>
+              <tr><td><code>dig +cd www.example.com</code></td><td>リゾルバに DNSSEC 検証をしないよう頼む（SERVFAIL の切り分け）</td></tr>
+              <tr><td><code>dig +tcp</code> / <code>+ignore</code> / <code>+bufsize=N</code></td><td>TCP で問い合わせ / TC が立っても TCP で再試行しない / EDNS の UDP サイズを指定</td></tr>
+              <tr><td><code>dig +nsid @192.0.2.1 example.com</code></td><td>EDNS の NSID を要求し、エニーキャストのどのサーバーが答えたかを見る</td></tr>
+              <tr><td><code>dig +multiline SOA example.com</code></td><td>SOA などを注釈付きの複数行で表示</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <h3>ほかのツール</h3>
+        <div class="tbl">
+          <table class="ref">
+            <thead><tr><th>コマンド</th><th>何を通るか</th><th>用途</th></tr></thead>
+            <tbody>
+              <tr><td><code>getent hosts www.example.com</code></td><td>NSS（<code>/etc/nsswitch.conf</code> の順）</td><td>アプリと同じ経路で引く。<code>/etc/hosts</code> の上書きも反映される</td></tr>
+              <tr><td><code>getent ahostsv4 www.example.com</code></td><td>NSS（<code>getaddrinfo()</code>）</td><td>ソケット種別ごとの結果を表示</td></tr>
+              <tr><td><code>resolvectl query www.example.com</code></td><td>systemd-resolved</td><td>どのリンク・プロトコルで得たか、キャッシュからか</td></tr>
+              <tr><td><code>resolvectl status</code> / <code>flush-caches</code> / <code>statistics</code></td><td>systemd-resolved</td><td>上流 DNS の確認 / キャッシュ削除 / ヒット率</td></tr>
+              <tr><td><code>host -t MX example.com</code></td><td>DNS 直接</td><td>簡潔な表示</td></tr>
+              <tr><td><code>nslookup www.example.com 192.0.2.1</code></td><td>DNS 直接</td><td>Windows でも使える。<code>Non-authoritative answer:</code> はキャッシュ由来の意味</td></tr>
+              <tr><td><code>unbound-control dump_cache</code> / <code>flush NAME</code></td><td>Unbound</td><td>キャッシュの中身を見る / 名前を消す</td></tr>
+              <tr><td><code>rndc flushname NAME</code></td><td>BIND</td><td>キャッシュから名前を消す</td></tr>
+              <tr><td><code>named-checkzone example.com FILE</code></td><td>BIND</td><td>ゾーンファイルの文法・CNAME 衝突などを検査</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- 8. ファイル -->
+      <section class="chapter" id="files">
+        <h2>関連ファイル</h2>
+        <pre data-lang="tree" data-title="Ubuntu 24.04（クライアント）と BIND 9（サーバー）">/etc/
+├── nsswitch.conf                 # hosts: files dns（参照順）
+├── hosts                         # 静的な名前 → アドレス（files）
+├── resolv.conf -> ../run/systemd/resolve/stub-resolv.conf
+├── systemd/resolved.conf         # DNS= FallbackDNS= DNSSEC= Cache=
+└── bind/
+    ├── named.conf.options        # recursion / allow-query / dnssec-validation
+    ├── named.conf.local          # zone "example.com" { type primary; file … };
+    └── db.example.com            # ゾーンファイル
+/run/systemd/resolve/
+├── stub-resolv.conf              # nameserver 127.0.0.53（スタブ経由）
+└── resolv.conf                   # 上流 DNS を直接列挙した版
+/usr/share/dns/root.hints         # ルートサーバーの名前とアドレス（ヒント）</pre>
+        <pre data-lang="text" data-title="/etc/bind/named.conf.local">zone "example.com" {
+    type primary;
+    file "/etc/bind/db.example.com";
+    allow-transfer { 198.51.100.53; };
+};</pre>
+      </section>
+
+      <!-- 9. 手元で試す -->
+      <section class="chapter" id="try">
+        <h2>手元で試す</h2>
+        <pre data-lang="bash" data-title="名前解決の経路を 1 段ずつ">$ cat /etc/nsswitch.conf | grep ^hosts          # どの順で引くか
+$ ls -l /etc/resolv.conf                         # systemd-resolved のスタブか
+$ resolvectl status | grep -i 'dns server'       # 上流のフルサービスリゾルバ
+$ getent hosts example.com                       # アプリと同じ経路（NSS）で解決
+$ dig example.com                                # スタブ（127.0.0.53）に RD=1 で問い合わせ
+$ dig +trace example.com                         # dig 自身がルートから辿る
+$ dig +norecurse @a.root-servers.net example.com # ルートは com. への紹介だけを返す
+$ dig +norecurse @a.gtld-servers.net example.com # TLD は example.com. の NS を返す</pre>
+        <pre data-lang="bash" data-title="TTL の減少とネガティブキャッシュを観察する">$ dig +noall +answer example.com @1.1.1.1; sleep 10; dig +noall +answer example.com @1.1.1.1
+# 2 回目は TTL が約 10 減っている（エニーキャストの別ノードに当たると揃わないこともある）
+$ dig nosuch-$(date +%s).example.com | grep -E 'status|SOA'
+# status: NXDOMAIN と、Authority の SOA（ネガティブ TTL の根拠）</pre>
+        <pre data-lang="bash" data-title="UDP → TCP のフォールバックを見る">$ dig +ignore +bufsize=512 TXT example.com | grep flags
+# 応答が 512 バイトを超える名前なら flags に tc が立つ（+ignore で TCP 再試行を止めている）
+$ dig +bufsize=512 TXT example.com | head -3
+# ;; Truncated, retrying in TCP mode. と表示されて TCP で問い直す
+$ sudo tcpdump -ni any port 53                   # 別端末で UDP/TCP の実パケットを見る</pre>
+        <pre data-lang="bash" data-title="ゾーンファイルを検査する（BIND）">$ named-checkzone example.com /etc/bind/db.example.com
+zone example.com/IN: loaded serial 2026092801
+OK
+$ sudo rndc reload example.com</pre>
+      </section>
+
+      <!-- 10. ハマりどころ -->
+      <section class="chapter" id="pitfalls">
+        <h2>ハマりどころ</h2>
+        <div class="note warn"><b>変更したのに反映されない：</b>リゾルバは古い答えを TTL が切れるまで返し続けます。切り替え前に TTL を短く（例 300）しておき、<strong>元の TTL 分待ってから</strong>値を変えます。急ぐときはリゾルバ側で <code>unbound-control flush</code> / <code>rndc flushname</code> / <code>resolvectl flush-caches</code>。ブラウザや OS のキャッシュ、アプリ内キャッシュ（JVM の <code>networkaddress.cache.ttl</code> など）も別にあります。</div>
+        <div class="note warn"><b>SOA のシリアルを上げ忘れる：</b>プライマリでゾーンを編集してもシリアルが増えないと、セカンダリはゾーン転送をしないため、NS によって答えが食い違います。</div>
+        <div class="note warn"><b>末尾のドット：</b>ゾーンファイルで <code>shops.example.net</code>（ドットなし）と書くと <code>$ORIGIN</code> が付いて <code>shops.example.net.example.com.</code> になります。MX・NS・CNAME の値で特に起きやすい間違いです。</div>
+        <div class="note warn"><b>ゾーン頂点に CNAME は置けない：</b>CNAME は同じ名前に他のデータを持てませんが（RFC 1034 §3.6.2、RFC 2181 §10.1）、頂点には必ず SOA と NS があります。CDN やロードバランサを頂点で使いたいときは、A/AAAA を直接書くか、DNS 事業者独自の ALIAS / ANAME / CNAME フラットニング、または <code>HTTPS</code> レコードを使います。</div>
+        <div class="note warn"><b>lame delegation：</b>親ゾーンの NS に載っているのに、そのサーバーがゾーンを持っていない（<code>REFUSED</code> や <code>aa</code> なしの応答）状態です。リゾルバは別の NS に回るので「たまに遅い・たまに SERVFAIL」という症状になります。<code>dig +norecurse @&lt;各NS&gt; example.com SOA</code> で全 NS が <code>aa</code> 付きで同じシリアルを返すか確認します。</div>
+        <div class="note warn"><b>search ドメイン：</b><code>/etc/resolv.conf</code> の <code>search corp.example.com</code> と <code>options ndots:N</code> により、ドット数の少ない名前には検索ドメインが付けて先に問い合わせられます。Kubernetes の Pod（<code>ndots:5</code>）で外部名の解決が遅くなる典型的な原因です。</div>
+        <div class="note warn"><b>/etc/hosts が勝つ：</b><code>hosts: files dns</code> では <code>/etc/hosts</code> が先に引かれます。<code>dig</code> は NSS を通らず DNS だけを見るので、「<code>dig</code> では正しいのにアプリは違う IP に行く」ときは <code>getent hosts</code> で確認します。</div>
+      </section>
+
+      <!-- 11. 仕様 -->
+      <section class="chapter" id="spec">
+        <h2>仕様・参考</h2>
+        <ul>
+          <li><a href="https://www.rfc-editor.org/rfc/rfc1034" target="_blank" rel="noopener">RFC 1034 — Domain Names: Concepts and Facilities</a>（§3.6.2 CNAME, §4.3 名前解決の流れ）</li>
+          <li><a href="https://www.rfc-editor.org/rfc/rfc1035" target="_blank" rel="noopener">RFC 1035 — Domain Names: Implementation and Specification</a>（§4.1 メッセージ形式, §4.1.4 名前の圧縮, §4.2 UDP/TCP, §5 マスターファイル）</li>
+          <li><a href="https://www.rfc-editor.org/rfc/rfc2181" target="_blank" rel="noopener">RFC 2181 — Clarifications to the DNS Specification</a>（§10.1 CNAME と他データ）</li>
+          <li><a href="https://www.rfc-editor.org/rfc/rfc2308" target="_blank" rel="noopener">RFC 2308 — Negative Caching of DNS Queries</a></li>
+          <li><a href="https://www.rfc-editor.org/rfc/rfc6891" target="_blank" rel="noopener">RFC 6891 — Extension Mechanisms for DNS (EDNS(0))</a></li>
+          <li><a href="https://www.rfc-editor.org/rfc/rfc4033" target="_blank" rel="noopener">RFC 4033</a> / <a href="https://www.rfc-editor.org/rfc/rfc4034" target="_blank" rel="noopener">4034</a> / <a href="https://www.rfc-editor.org/rfc/rfc4035" target="_blank" rel="noopener">4035 — DNSSEC</a></li>
+          <li><a href="https://www.rfc-editor.org/rfc/rfc9499" target="_blank" rel="noopener">RFC 9499 — DNS Terminology</a>（RFC 8499 を更新。スタブ・フルサービスリゾルバ・lame delegation などの用語）</li>
+          <li><a href="https://www.rfc-editor.org/rfc/rfc8914" target="_blank" rel="noopener">RFC 8914 — Extended DNS Errors</a>（<code>; EDE:</code> 行）</li>
+          <li><a href="https://www.iana.org/domains/root/servers" target="_blank" rel="noopener">IANA — Root Servers</a></li>
+          <li><a href="https://bind9.readthedocs.io/en/latest/manpages.html" target="_blank" rel="noopener">BIND 9 manual pages（dig / delv / named-checkzone / rndc）</a></li>
+          <li>関連ページ：<a href="../dkim/">DKIM (+SPF/DMARC)</a>（TXT レコードで公開鍵とポリシーを配る）</li>
+        </ul>
+      </section>
+
+    </main>
+  </div>
+
+  <footer class="site-f"></footer>
+  <script src="../../assets/js/topics.js"></script>
+  <script src="../../assets/js/tim.js"></script>
+  <script src="scenes.js"></script>
+</body>
+</html>

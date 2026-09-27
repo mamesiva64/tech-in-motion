@@ -1,0 +1,40 @@
+/* DNS page — page-specific stage parts */
+
+/* 16 進ダンプ（バイトをフィールドごとに色分け） */
+.stage .file-b.hx { white-space: pre; font: 11.5px/1.6 var(--mono); color: #7f8db0; overflow: hidden; }
+.stage .hx .off { color: #3c4867; }
+.stage .hx span[class^="g-"] { border-radius: 3px; transition: background 0.3s, color 0.3s; }
+.stage .hx .g-id, .stage .hx .g-fl, .stage .hx .g-ct { color: #93c5fd; }
+.stage .hx .g-qn, .stage .hx .g-qt { color: #bef264; }
+.stage .hx .g-op { color: #c4b5fd; }
+.stage .hx .g-an { color: #6ee7b7; }
+/* 注目中のフィールド */
+.stage .hx.f-id .g-id, .stage .hx.f-fl .g-fl, .stage .hx.f-ct .g-ct,
+.stage .hx.f-qn .g-qn, .stage .hx.f-qt .g-qt, .stage .hx.f-op .g-op, .stage .hx.f-an .g-an {
+  color: #0b1220; background: var(--amber); box-shadow: 0 0 0 1px var(--amber);
+}
+
+/* seg の値を少し詰める */
+.stage .seg > span { padding: 6px 9px; white-space: nowrap; overflow: hidden; }
+.stage .seg > span.on { background: color-mix(in srgb, var(--amber) 28%, #070b14); color: #ffe9a8; }
+.stage .seg > span.chg { color: #fff; }
+
+/* kv の値の色 */
+.stage .kv dd.dim { color: var(--tx3); }
+.stage .kv dd.ok { color: var(--green); }
+.stage .kv dd.bad { color: var(--red); }
+.stage .kv dd.warn { color: var(--amber); }
+
+/* 行の強調 */
+.stage .ln.bad { background: rgba(248, 113, 113, 0.14); box-shadow: inset 2px 0 var(--red); }
+.stage .ln.ok { background: rgba(52, 211, 153, 0.12); box-shadow: inset 2px 0 var(--green); }
+.stage .ln.warn { background: rgba(251, 191, 36, 0.13); box-shadow: inset 2px 0 var(--amber); }
+.stage .ln.dim { opacity: 0.4; }
+
+/* status の大きな表示 */
+.stage .big.ok span { color: var(--green); }
+.stage .big.bad span { color: var(--red); }
+.stage .big.warn span { color: var(--amber); }
+
+/* .file は overflow:hidden なので、判子はカードの内側に押す */
+.stage .file > .stamp { top: 4px; right: 8px; }

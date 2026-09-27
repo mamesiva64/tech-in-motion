@@ -232,6 +232,8 @@
       topics: TOPICS.length,
       cats: Object.keys(CATS).length,
       cmds: TOPICS.reduce((n, t) => n + (t.cmds || []).length, 0),
+      scenes: TOPICS.reduce((n, t) => n + (t.status === 'ready' ? t.scenes || 0 : 0), 0) + 1,
+      steps: TOPICS.reduce((n, t) => n + (t.status === 'ready' ? t.steps || 0 : 0), 0) + 8,
     };
     d.querySelectorAll('[data-count]').forEach((b) => {
       const to = vals[b.dataset.count] || 0;
@@ -439,7 +441,7 @@
         '<h3>' + esc(t.title) + '</h3><p>' + esc(t.sub) + '</p>' +
         '<div class="tc-cmd"><b>$</b>' + esc((t.cmds || [''])[0]) + '</div>' +
         '<div class="tc-tags">' + (t.tags || []).slice(0, 5).map((x) => '<span>' + esc(x) + '</span>').join('') + '</div>' +
-        '<div class="tc-go"><span>' + esc(cat.name || '') + '</span><em>' + (ready ? 'OPEN →' : 'SOON') + '</em></div>' +
+        '<div class="tc-go"><span>' + (t.scenes ? t.scenes + ' SCENES · ' + t.steps + ' STEPS' : esc(cat.name || '')) + '</span><em>' + (ready ? 'OPEN →' : 'SOON') + '</em></div>' +
         '</' + tag + '>';
     }).join('');
     grid.querySelectorAll('.tc').forEach((c) => {

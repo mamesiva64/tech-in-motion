@@ -674,6 +674,17 @@
       });
       return Promise.resolve();
     }
+    /** add/remove a class on specific lines (1-based) of a stage <pre>: s.lines('conf', [3, 4], 'hl') */
+    lines(sel, nums, cls, o = {}) {
+      const set = new Set([].concat(nums));
+      this.$(sel).forEach((e) => {
+        e.querySelectorAll('.ln').forEach((l, i) => {
+          if (o.only) l.classList.remove(cls || 'hl');
+          if (set.has(i + 1)) l.classList.toggle(cls || 'hl', o.remove ? false : true);
+        });
+      });
+      return Promise.resolve();
+    }
     /** replace a stage <pre> (or any element) with highlighted code */
     code(sel, src, lang) {
       return Promise.all(this.$(sel).map((e) => {
@@ -1164,7 +1175,7 @@
           const b = box(e);
           if (b.x < -1 || b.y < -1 || b.x + b.w > sc.W + 1 || b.y + b.h > sc.H + 1) out.push('scene ' + sc.no + ' step ' + (k + 1) + ': [' + name(e) + '] outside stage (' + b.x + ',' + b.y + ' ' + b.w + 'x' + b.h + ' / ' + sc.W + 'x' + sc.H + ')');
         });
-        sc.world.querySelectorAll('.node, .file, .file pre, .chip, .kv, .seg > span, .label, .txt, .big, .bytes').forEach((e) => {
+        sc.world.querySelectorAll('.node, .file, .file pre, .file-b, .chip, .kv, .seg > span, .label, .txt, .big, .bytes').forEach((e) => {
           if (e.closest('.hide') || e.closest('.term')) return;
           if (e.scrollWidth > e.clientWidth + 2 || e.scrollHeight > e.clientHeight + 2) out.push('scene ' + sc.no + ' step ' + (k + 1) + ': [' + name(e) + '] content overflows (' + e.scrollWidth + 'x' + e.scrollHeight + ' > ' + e.clientWidth + 'x' + e.clientHeight + ')');
         });
