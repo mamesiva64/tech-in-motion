@@ -176,7 +176,7 @@ TIM.scene('#sc-flow', {
 | `s.cls(sel, add, remove)` | クラス付け外し |
 | `s.pulse(sel)` / `s.shake(sel)` / `s.scan(sel)` | 注目リング／振動（エラー）／スキャン線（検証中） |
 | `s.stamp(sel, text, {cls})` | 判子（`st-ok` `st-bad` `st-warn` `st-acc`）。署名・検証結果の演出 |
-| `s.caption(html)` | ステージ下部の字幕（強調メッセージ）。`''` で消す |
+| `s.caption(html, {cls, x, y})` | ステージ下部の字幕（強調メッセージ）。`''` で消す。`x`（中心）/`y`（上端）で位置指定可 |
 | `s.camera({scale, x, y, to, dur})` | カメラズーム／パン。引数なしで戻す |
 | `s.spawn(html, {x, y, into, fx})` | 要素を動的生成して返す（同期） |
 | `s.hl(lines, blockIndex)` | 下部コードパネルの行をハイライト（1 始まり） |

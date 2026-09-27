@@ -1,0 +1,540 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>JWT — Tech in Motion</title>
+  <meta name="description" content="JWT（JSON Web Token）を header.payload.signature のバイト列から追う。どこで署名され、どこで検証され、改ざんがどう検出されるかを、ブラウザ上で実際に計算しながらアニメーションで可視化。">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Space+Grotesk:wght@500;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="../../assets/css/tim.css">
+  <link rel="stylesheet" href="page.css">
+</head>
+<body data-root="../../" data-topic="jwt">
+  <header class="site-h"></header>
+
+  <div class="page">
+    <aside class="toc"></aside>
+    <main class="doc">
+
+      <section class="hero">
+        <p class="kicker">Auth · RFC 7519 / 7515</p>
+        <h1>JWT<small>JSON Web Token — header.payload.signature の正体</small></h1>
+        <p class="lead">JWT は「<strong>署名付きの JSON</strong>」です。暗号化ではありません。<strong>誰がどの鍵で署名し、誰がどの鍵で検証するのか</strong>、そして改ざんされたトークンが<strong>どこで・なぜ</strong>弾かれるのかを、実際のバイト列とコマンドで追います。このページに出てくるトークン・ハッシュ・署名は、あなたのブラウザ上で WebCrypto により<strong>本当に計算</strong>しています（鍵はページを開くたびに生成）。</p>
+        <div class="facts">
+          <div class="fact"><span>署名する場所</span><b>認可サーバー（IdP）<br><code>private.pem</code> / KMS の秘密鍵</b></div>
+          <div class="fact"><span>検証する場所</span><b>API（リソースサーバー）<br><code>jwks.json</code> の公開鍵</b></div>
+          <div class="fact"><span>中身</span><b><code>base64url(JSON)</code> を <code>.</code> で連結<br>誰でもデコードできる</b></div>
+          <div class="fact"><span>仕様</span><b>RFC 7519 JWT / 7515 JWS<br>7517 JWK / 7518 JWA / 8725 BCP</b></div>
+        </div>
+        <div class="tokhero reveal" id="tokhero" aria-label="実際に計算された JWT">
+          <span class="th">eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9</span><span class="td">.</span><span class="tp">…</span><span class="td">.</span><span class="ts">…</span>
+        </div>
+        <div class="toklegend"><span class="th">■ header</span><span class="tp">■ payload（クレーム）</span><span class="ts">■ signature</span></div>
+      </section>
+
+      <!-- ============ 1 ============ -->
+      <section class="chapter" id="overview">
+        <h2>全体像：発行から検証まで</h2>
+        <p>登場するのは 3 者です。<strong>秘密鍵を持つのは認可サーバーだけ</strong>。API は <code>/.well-known/jwks.json</code> で公開された<strong>公開鍵</strong>だけで検証します。API はリクエストごとに認可サーバーへ問い合わせません。</p>
+
+        <div class="scene" id="sc-overview" data-title="トークンの発行 → API 呼び出し → 検証">
+          <div class="stage" data-w="960" data-h="480">
+            <div class="zone c-blue" data-label="browser · app.example.com" style="left:16px;top:24px;width:280px;height:436px"></div>
+            <div class="node c-blue" data-el="spa" style="left:32px;top:50px;width:248px">
+              <div class="node-h"><i data-icon="browser"></i><b class="node-t">SPA（ブラウザ）</b></div>
+              <div class="node-s">https://app.example.com</div>
+            </div>
+            <div class="file hide c-blue" data-el="resp" style="left:32px;top:132px;width:248px">
+              <div class="file-h">200 OK · token response</div>
+              <pre data-lang="json">{ "access_token": "eyJ…",
+  "token_type": "Bearer",
+  "expires_in": 900 }</pre>
+            </div>
+            <div class="chip hide c-blue" data-el="mem" style="left:32px;top:236px"><i data-icon="lock"></i>メモリに保持（localStorage は避ける）</div>
+            <div class="file hide c-lime" data-el="req" style="left:32px;top:282px;width:248px">
+              <div class="file-h">GET /v1/me</div>
+              <pre data-lang="http">GET /v1/me HTTP/1.1
+Host: api.example.com
+Authorization: Bearer eyJ…</pre>
+            </div>
+            <div class="chip hide c-green" data-el="got" style="left:32px;top:392px">200 {"id":"42","name":"alice"}</div>
+
+            <div class="zone c-pink" data-label="auth.example.com · 認可サーバー (IdP)" style="left:330px;top:24px;width:614px;height:210px"></div>
+            <div class="node c-pink" data-el="idp" style="left:346px;top:50px;width:250px">
+              <div class="node-h"><i data-icon="key"></i><b class="node-t">Auth Server</b></div>
+              <div class="node-s">POST /oauth/token</div>
+            </div>
+            <div class="node sm c-pink" data-el="udb" style="left:346px;top:128px;width:250px">
+              <div class="node-h"><i data-icon="db"></i><b class="node-t">auth DB</b></div>
+              <div class="node-s">authorization_codes / users</div>
+            </div>
+            <div class="chip hide c-pink" data-el="priv" style="left:346px;top:196px"><i data-icon="key"></i>/etc/auth/keys/2026-09.pem</div>
+            <div class="file hide c-pink" data-el="claims" style="left:616px;top:40px;width:316px">
+              <div class="file-h">header + payload (claims)</div>
+              <pre data-lang="json">{"alg":"RS256","typ":"JWT","kid":"2026-09"}
+{ "iss": "https://auth.example.com",
+  "sub": "42", "aud": "api.example.com",
+  "scope": "users:read",
+  "iat": 1790000000, "exp": 1790000900 }</pre>
+            </div>
+            <div class="seg hide" data-el="tok" style="left:616px;top:64px;width:316px">
+              <span class="c-pink"><small>header</small><em data-el="t1">eyJhbGci…</em></span><span class="c-violet"><small>payload</small><em data-el="t2">eyJpc3Mi…</em></span><span class="c-cyan"><small>signature (RS256)</small><em data-el="t3">…</em></span>
+            </div>
+            <div class="chip hide c-pink" data-el="jwksep" style="left:664px;top:196px"><i data-icon="globe"></i>/.well-known/jwks.json</div>
+
+            <div class="zone c-lime" data-label="api.example.com · リソースサーバー" style="left:330px;top:262px;width:614px;height:198px"></div>
+            <div class="node c-lime" data-el="api" style="left:346px;top:290px;width:250px">
+              <div class="node-h"><i data-icon="server"></i><b class="node-t">API server</b></div>
+              <div class="node-s">GET /v1/me · 公開鍵だけを持つ</div>
+            </div>
+            <div class="file hide c-lime" data-el="jwkc" style="left:616px;top:286px;width:316px">
+              <div class="file-h">JWKS cache（メモリ）</div>
+              <pre data-lang="json" data-el="jwkcb">{ "keys": [ { "kty": "RSA",
+    "kid": "2026-09", "use": "sig",
+    "alg": "RS256", "e": "AQAB",
+    "n": "…" } ] }</pre>
+            </div>
+            <div class="chip hide c-green" data-el="chk" style="left:346px;top:384px">✔ signature · exp · iss · aud</div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ============ 2 ============ -->
+      <section class="chapter" id="structure">
+        <h2>構造：3 つのパートを組み立てる</h2>
+        <p>JWS Compact Serialization（RFC 7515 §7.1）の形です。<code>BASE64URL(UTF8(header))</code> と <code>BASE64URL(payload)</code> を <code>.</code> でつないだ ASCII 文字列が<strong>署名対象（JWS Signing Input）</strong>になり、その署名を base64url して 3 つ目に付けます。ここでは共有シークレット方式の <code>HS256</code>（HMAC-SHA256）で、値はすべてこのブラウザで計算しています。</p>
+
+        <div class="scene" id="sc-structure" data-title="HS256 の JWT をバイト単位で組み立てる">
+          <div class="stage" data-w="960" data-h="530">
+            <div class="file hide c-pink" data-el="hj" style="left:24px;top:24px;width:330px">
+              <div class="file-h">header (JSON)</div>
+              <pre data-lang="json">{"alg":"HS256","typ":"JWT"}</pre>
+            </div>
+            <div class="file hide c-violet" data-el="pj" style="left:24px;top:100px;width:330px">
+              <div class="file-h">payload (JSON · claims)</div>
+              <pre data-lang="json">{
+  "sub": "42",
+  "name": "alice",
+  "role": "user",
+  "iat": 1790000000,
+  "exp": 1790000900
+}</pre>
+            </div>
+            <div class="b64 hide c-pink" data-el="hb" style="left:400px;top:30px;width:536px">
+              <small>BASE64URL(header) · <span data-el="hbn">36</span> chars</small><b data-el="hbv">…</b>
+            </div>
+            <div class="b64 hide c-violet" data-el="pb" style="left:400px;top:120px;width:536px">
+              <small>BASE64URL(payload) · <span data-el="pbn">0</span> chars</small><b data-el="pbv">…</b>
+            </div>
+            <div class="b64 hide c-amber" data-el="si" style="left:24px;top:292px;width:912px">
+              <small>JWS Signing Input = BASE64URL(header) + "." + BASE64URL(payload)（ASCII バイト列）</small><b data-el="siv">…</b>
+            </div>
+            <div class="node sm hide c-cyan" data-el="mac" style="left:24px;top:376px;width:300px">
+              <div class="node-h"><i data-icon="hash"></i><b class="node-t">HMAC-SHA256(secret, input)</b></div>
+              <div class="node-s">secret = $JWT_SECRET（32 bytes 以上）</div>
+            </div>
+            <div class="b64 hide c-cyan" data-el="hx" style="left:350px;top:376px;width:586px">
+              <small>HMAC 出力 · 32 bytes (hex)</small><b data-el="hxv">…</b>
+            </div>
+            <div class="b64 hide tokbox" data-el="tk" style="left:24px;top:442px;width:912px">
+              <small>JWT = header . payload . BASE64URL(signature)</small><b data-el="tkv">…</b>
+            </div>
+          </div>
+        </div>
+
+        <div class="note"><b>base64url とは：</b>通常の base64 の <code>+</code> を <code>-</code>、<code>/</code> を <code>_</code> に置き換え、末尾の <code>=</code> パディングを削った形式（RFC 4648 §5）です。URL やヘッダにそのまま載せられるようにするためで、<b>暗号化ではありません</b>。</div>
+      </section>
+
+      <!-- ============ 3 ============ -->
+      <section class="chapter" id="sign-verify">
+        <h2>署名と検証：秘密鍵はどこ、公開鍵はどこ</h2>
+        <p>本番では <code>RS256</code>（RSA）や <code>ES256</code>（ECDSA P-256）、<code>EdDSA</code> などの<strong>公開鍵暗号</strong>を使うのが一般的です。署名できるのは秘密鍵を持つ認可サーバーだけで、検証側（API）は公開鍵しか持たないため、API が侵害されてもトークンは偽造できません。下のシーンの鍵ペア・JWK・署名は、ページ表示時にブラウザ内で生成した<strong>本物の RSA 2048bit</strong> です。</p>
+
+        <div class="scene" id="sc-rs256" data-title="RS256：秘密鍵で署名し、JWKS の公開鍵で検証する">
+          <div class="stage" data-w="960" data-h="520">
+            <div class="zone c-pink" data-label="auth.example.com · 署名する側" style="left:16px;top:24px;width:452px;height:476px"></div>
+            <div class="term" data-el="kt" style="left:32px;top:46px;width:420px;height:136px">
+              <div class="term-h">root@auth:/etc/auth/keys</div>
+              <div class="term-b"></div>
+            </div>
+            <div class="file hide c-pink" data-el="privf" style="left:32px;top:194px;width:204px">
+              <div class="file-h"><i data-icon="lock"></i>private.pem <small>0600</small></div>
+              <pre data-lang="pem" data-el="privb">-----BEGIN PRIVATE KEY-----
+…</pre>
+            </div>
+            <div class="file hide c-green" data-el="pubf" style="left:248px;top:194px;width:204px">
+              <div class="file-h"><i data-icon="unlock"></i>public.pem <small>0644</small></div>
+              <pre data-lang="pem" data-el="pubb">-----BEGIN PUBLIC KEY-----
+…</pre>
+            </div>
+            <div class="node hide c-pink" data-el="signer" style="left:32px;top:318px;width:420px">
+              <div class="node-h"><i data-icon="sign"></i><b class="node-t">sign(RS256) = RSASSA-PKCS1-v1_5 + SHA-256</b></div>
+              <dl class="kv">
+                <dt>SHA-256(input)</dt><dd data-el="shav">…</dd>
+                <dt>signature</dt><dd class="acc" data-el="sigv">…</dd>
+                <dt>length</dt><dd>256 bytes → base64url 342 chars</dd>
+              </dl>
+            </div>
+
+            <div class="zone c-lime" data-label="api.example.com · 検証する側" style="left:492px;top:24px;width:452px;height:476px"></div>
+            <div class="file hide c-green" data-el="jwksf" style="left:508px;top:46px;width:420px">
+              <div class="file-h"><i data-icon="globe"></i>https://auth.example.com/.well-known/jwks.json</div>
+              <pre data-lang="json" data-el="jwksb">{ "keys": [ { … } ] }</pre>
+            </div>
+            <div class="node hide c-lime" data-el="ver" style="left:508px;top:222px;width:420px">
+              <div class="node-h"><i data-icon="shieldok"></i><b class="node-t">verify(token, JWKS)</b></div>
+              <dl class="kv">
+                <dt>header.kid</dt><dd data-el="kidv">2026-09 → JWKS から公開鍵 (n, e) を選択</dd>
+                <dt>signature</dt><dd data-el="okv">未検証</dd>
+              </dl>
+            </div>
+            <div class="node hide c-lime" data-el="claimchk" style="left:508px;top:338px;width:420px">
+              <div class="node-h"><i data-icon="check"></i><b class="node-t">クレーム検証（署名が正しくても必須）</b></div>
+              <dl class="kv">
+                <dt data-el="k1">alg ∈ [RS256]</dt><dd data-el="v1">—</dd>
+                <dt data-el="k2">exp &gt; now</dt><dd data-el="v2">—</dd>
+                <dt data-el="k3">iss</dt><dd data-el="v3">—</dd>
+                <dt data-el="k4">aud</dt><dd data-el="v4">—</dd>
+              </dl>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ============ 4 ============ -->
+      <section class="chapter" id="tamper">
+        <h2>改ざん：role を admin に書き換えると</h2>
+        <p>payload は誰でもデコード・編集・再エンコードできます。しかし<strong>署名は作り直せません</strong>。API は受け取った <code>header.payload</code> から署名を再計算し、添付された署名と 1 バイトでも違えば拒否します。下のシーンの「期待される署名」は、改ざん後の payload に対してこのブラウザで実際に HMAC を計算した値です。</p>
+
+        <div class="scene" id="sc-tamper" data-title="payload を書き換えたトークンが 401 になるまで">
+          <div class="stage" data-w="960" data-h="500">
+            <div class="node c-red" data-el="atk" style="left:24px;top:28px;width:240px">
+              <div class="node-h"><i data-icon="attacker"></i><b class="node-t">攻撃者（または利用者）</b></div>
+              <div class="node-s">DevTools でトークンを入手</div>
+            </div>
+            <div class="b64 hide tokbox" data-el="otok" style="left:290px;top:24px;width:646px">
+              <small>入手した正規トークン（role: user）</small><b data-el="otokv">…</b>
+            </div>
+            <div class="file hide c-violet" data-el="dj" style="left:24px;top:132px;width:300px">
+              <div class="file-h">payload をデコード</div>
+              <pre data-lang="json" data-el="djb">{}</pre>
+            </div>
+            <div class="b64 hide tokbox" data-el="ftok" style="left:350px;top:132px;width:586px">
+              <small>改ざんトークン = 同じ header . <em class="warnc">新しい payload</em> . <em>元の signature</em></small><b data-el="ftokv">…</b>
+            </div>
+            <div class="node c-lime" data-el="api" style="left:24px;top:336px;width:240px">
+              <div class="node-h"><i data-icon="server"></i><b class="node-t">API server</b></div>
+              <div class="node-s">HS256 · secret = $JWT_SECRET</div>
+            </div>
+            <div class="cmp hide" data-el="cmp" style="left:290px;top:318px;width:646px">
+              <div class="cmp-r"><small>期待される署名 = BASE64URL(HMAC-SHA256(secret, header + "." + 新しい payload))</small><b data-el="expv">…</b></div>
+              <div class="cmp-r"><small>トークンに付いている署名（元の payload に対するもの）</small><b data-el="gotv">…</b></div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ============ 5 ============ -->
+      <section class="chapter" id="attacks">
+        <h2>検証パイプライン：どのチェックで何が止まるか</h2>
+        <p>「署名が正しいか」だけでは足りません。RFC 8725（JWT Best Current Practices）が求めるのは、<strong>アルゴリズムの固定</strong>、<strong>信頼できる鍵だけを使うこと</strong>、そして <code>exp</code>・<code>iss</code>・<code>aud</code> などのクレーム検証です。代表的な攻撃・失敗ケースを、API 内の検証パイプラインに流してみます。</p>
+
+        <div class="scene" id="sc-pipeline" data-title="API 内の JWT 検証パイプライン（ケース別）">
+          <div class="stage" data-w="960" data-h="470">
+            <div class="big" data-el="case" style="left:24px;top:20px;width:912px"><small>CASE</small>—</div>
+            <div class="packet ghost" data-el="tk" style="left:94px;top:152px;position:absolute">JWT</div>
+            <div class="node sm pipe" data-el="c0" style="left:31px;top:196px;width:118px"><div class="node-t">① parse</div><div class="node-s">3 parts / b64url / JSON</div></div>
+            <div class="node sm pipe" data-el="c1" style="left:161px;top:196px;width:118px"><div class="node-t">② alg</div><div class="node-s">allowlist: RS256</div></div>
+            <div class="node sm pipe" data-el="c2" style="left:291px;top:196px;width:118px"><div class="node-t">③ key</div><div class="node-s">kid → 信頼 JWKS</div></div>
+            <div class="node sm pipe" data-el="c3" style="left:421px;top:196px;width:118px"><div class="node-t">④ signature</div><div class="node-s">RSASSA verify</div></div>
+            <div class="node sm pipe" data-el="c4" style="left:551px;top:196px;width:118px"><div class="node-t">⑤ exp / nbf</div><div class="node-s">now ± 60s</div></div>
+            <div class="node sm pipe" data-el="c5" style="left:681px;top:196px;width:118px"><div class="node-t">⑥ iss</div><div class="node-s">auth.example.com</div></div>
+            <div class="node sm pipe" data-el="c6" style="left:811px;top:196px;width:118px"><div class="node-t">⑦ aud</div><div class="node-s">api.example.com</div></div>
+            <div class="file c-violet" data-el="hdr" style="left:31px;top:296px;width:440px">
+              <div class="file-h">受け取ったトークン（デコード）</div>
+              <pre data-lang="json" data-el="hdrb">—</pre>
+            </div>
+            <div class="file c-lime" data-el="why" style="left:491px;top:296px;width:438px">
+              <div class="file-h" data-el="whyh">API のログ / レスポンス</div>
+              <pre data-lang="text" data-el="whyb">—</pre>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ============ 6 LAB ============ -->
+      <section class="chapter" id="lab">
+        <h2>ライブ・ラボ：自分で署名して、自分で壊す</h2>
+        <p>HS256/HS384/HS512 のトークンをこの場で発行・検証できます。入力はすべてこのブラウザ内（WebCrypto）で処理され、どこにも送信されません。それでも<strong>本番環境のトークンやシークレットは貼り付けないでください</strong>。</p>
+        <div class="lab" id="jwt-lab">
+          <div class="lab-h">LIVE LAB · WebCrypto HMAC</div>
+          <div class="lab-grid">
+            <div>
+              <label for="lab-h">Header</label>
+              <textarea id="lab-h" rows="2" spellcheck="false"></textarea>
+              <label for="lab-p">Payload</label>
+              <textarea id="lab-p" rows="8" spellcheck="false"></textarea>
+              <label for="lab-s">Secret（署名・検証の両方に使う共有鍵）</label>
+              <input id="lab-s" type="text" spellcheck="false" autocomplete="off">
+              <div class="btns">
+                <button class="btn pri" type="button" id="lab-sign">署名してトークン発行 →</button>
+                <button class="btn" type="button" id="lab-now">iat / exp を現在時刻に</button>
+              </div>
+              <p class="lab-err" id="lab-err"></p>
+            </div>
+            <div>
+              <label for="lab-t">Token（直接編集してもよい）</label>
+              <textarea id="lab-t" rows="5" spellcheck="false"></textarea>
+              <div class="tokview" id="lab-view"></div>
+              <div class="btns">
+                <button class="btn danger" type="button" data-act="tamper">payload の role を admin に（署名はそのまま）</button>
+                <button class="btn danger" type="button" data-act="flip">署名を 1 文字壊す</button>
+                <button class="btn danger" type="button" data-act="none">alg を none にして署名を消す</button>
+                <button class="btn" type="button" data-act="resign">正しい secret で再署名</button>
+              </div>
+              <div class="lab-verdict" id="lab-verdict"></div>
+              <ul class="lab-checks" id="lab-checks"></ul>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ============ 7 ============ -->
+      <section class="chapter" id="fields">
+        <h2>ヘッダ・クレーム・アルゴリズム一覧</h2>
+
+        <h3>登録済みクレーム（RFC 7519 §4.1）</h3>
+        <div class="tbl"><table class="ref">
+          <thead><tr><th>claim</th><th>型</th><th>意味</th><th>誰がどう検証するか</th></tr></thead>
+          <tbody>
+            <tr><td><code>iss</code></td><td>string (URL)</td><td>発行者</td><td>API が期待値（例 <code>https://auth.example.com</code>）と完全一致を確認</td></tr>
+            <tr><td><code>sub</code></td><td>string</td><td>主体（ユーザー ID など）</td><td>アプリが「誰のリクエストか」に使う。iss の中で一意</td></tr>
+            <tr><td><code>aud</code></td><td>string / array</td><td>受け手（このトークンを受け取るべき API）</td><td>API が自分の識別子を含むか確認。<b>別サービス向けトークンの流用</b>を防ぐ</td></tr>
+            <tr><td><code>exp</code></td><td>NumericDate</td><td>有効期限（UNIX 秒）</td><td><code>now &lt; exp</code>。時計ずれ用に数十秒の leeway を許すのが一般的</td></tr>
+            <tr><td><code>nbf</code></td><td>NumericDate</td><td>これより前は無効</td><td><code>now ≥ nbf</code></td></tr>
+            <tr><td><code>iat</code></td><td>NumericDate</td><td>発行時刻</td><td>古すぎるトークンの拒否などに使う</td></tr>
+            <tr><td><code>jti</code></td><td>string</td><td>トークン固有 ID</td><td>リプレイ検知・失効リスト（denylist）のキー</td></tr>
+          </tbody>
+        </table></div>
+
+        <h3>JOSE ヘッダ（RFC 7515 §4.1）</h3>
+        <div class="tbl"><table class="ref">
+          <thead><tr><th>param</th><th>例</th><th>意味 / 注意</th></tr></thead>
+          <tbody>
+            <tr><td><code>alg</code></td><td><code>RS256</code></td><td>署名アルゴリズム。<b>検証側はこの値を信用せず、許可リストで固定する</b></td></tr>
+            <tr><td><code>typ</code></td><td><code>JWT</code> / <code>at+jwt</code></td><td>メディアタイプ。OAuth のアクセストークンは <code>at+jwt</code>（RFC 9068）</td></tr>
+            <tr><td><code>kid</code></td><td><code>2026-09</code></td><td>どの鍵で署名したか。検証側は JWKS 内の同じ <code>kid</code> の鍵を選ぶ（鍵ローテーション用）</td></tr>
+            <tr><td><code>jku</code> / <code>x5u</code></td><td>URL</td><td>鍵の取得先 URL。<b>トークン内の URL から鍵を取りに行く実装は危険</b>。設定済みの JWKS URL のみ使う</td></tr>
+            <tr><td><code>jwk</code> / <code>x5c</code></td><td>埋め込み鍵 / 証明書チェーン</td><td>トークン自身が鍵を運ぶ。信頼の根拠にならないので、そのまま使ってはいけない</td></tr>
+            <tr><td><code>cty</code></td><td><code>JWT</code></td><td>入れ子 JWT のときのコンテンツタイプ</td></tr>
+            <tr><td><code>crit</code></td><td><code>["exp"]</code></td><td>理解できない拡張があれば拒否すべきパラメータの列挙</td></tr>
+          </tbody>
+        </table></div>
+
+        <h3>alg と鍵・署名長（RFC 7518 / RFC 8037）</h3>
+        <div class="tbl"><table class="ref">
+          <thead><tr><th>alg</th><th>方式</th><th>署名する鍵</th><th>検証する鍵</th><th>署名長 → base64url</th></tr></thead>
+          <tbody>
+            <tr><td><code>HS256</code></td><td>HMAC-SHA256</td><td>共有シークレット</td><td>同じ共有シークレット</td><td>32 bytes → 43 chars</td></tr>
+            <tr><td><code>HS512</code></td><td>HMAC-SHA512</td><td>共有シークレット</td><td>同じ共有シークレット</td><td>64 bytes → 86 chars</td></tr>
+            <tr><td><code>RS256</code></td><td>RSASSA-PKCS1-v1_5 + SHA-256</td><td>RSA 秘密鍵</td><td>RSA 公開鍵 (n, e)</td><td>2048bit 鍵で 256 bytes → 342 chars</td></tr>
+            <tr><td><code>PS256</code></td><td>RSASSA-PSS + SHA-256</td><td>RSA 秘密鍵</td><td>RSA 公開鍵</td><td>256 bytes → 342 chars（毎回値が変わる）</td></tr>
+            <tr><td><code>ES256</code></td><td>ECDSA P-256 + SHA-256</td><td>EC 秘密鍵</td><td>EC 公開鍵 (x, y)</td><td>R‖S 64 bytes → 86 chars（<b>DER ではない</b>）</td></tr>
+            <tr><td><code>EdDSA</code></td><td>Ed25519（RFC 8037）</td><td>Ed25519 秘密鍵</td><td>公開鍵 (x)</td><td>64 bytes → 86 chars</td></tr>
+            <tr><td><code>none</code></td><td>署名なし</td><td>—</td><td>—</td><td>空文字。<b>検証側では必ず拒否</b></td></tr>
+          </tbody>
+        </table></div>
+
+        <div class="cols">
+          <div class="card">
+            <h4>JWS（署名）と JWE（暗号化）</h4>
+            <p>一般に「JWT」と呼ばれるものの大半は <b>JWS</b>（3 パート：<code>header.payload.signature</code>）で、中身は読めます。中身も隠したい場合は <b>JWE</b>（RFC 7516、5 パート：<code>header.encrypted_key.iv.ciphertext.tag</code>）を使います。</p>
+          </div>
+          <div class="card">
+            <h4>どのトークンが JWT か</h4>
+            <p>OIDC の <b>ID トークン</b>は必ず JWT。<b>アクセストークン</b>は JWT のこともランダム文字列（opaque）のこともあります。<b>リフレッシュトークン</b>は通常 opaque。詳しくは <a href="../oauth-oidc/">OAuth 2.0 / OIDC</a>。</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- ============ 8 ============ -->
+      <section class="chapter" id="files">
+        <h2>実物ファイル：鍵と JWKS</h2>
+        <pre data-lang="tree" data-title="どのホストに何があるか">auth.example.com                         # 認可サーバー（署名する側）
+├── /etc/auth/keys/
+│   ├── 2026-09.pem                      # 現役の秘密鍵 (PKCS#8, 0600) ← 署名に使う
+│   └── 2026-06.pem                      # 旧鍵：新規署名には使わず、JWKS に公開鍵だけ残す
+└── GET /.well-known/jwks.json           # 公開鍵の集合 (JWK Set) を配信
+
+api.example.com                          # リソースサーバー（検証する側）
+├── config: JWKS_URL=https://auth.example.com/.well-known/jwks.json
+├── config: JWT_ISSUER=https://auth.example.com
+├── config: JWT_AUDIENCE=api.example.com
+└── (memory) JWKS キャッシュ              # kid ごとの公開鍵。未知の kid が来たら再取得
+
+HS256 を使う場合（署名も検証も同じ鍵）
+└── 環境変数 JWT_SECRET=...               # 署名側と検証側の両方に置く必要がある</pre>
+
+        <div class="cols">
+          <div>
+            <pre data-lang="pem" data-title="private.pem（openssl genpkey の出力・PKCS#8）">-----BEGIN PRIVATE KEY-----
+MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQC7…
+…（約 1.7KB。このファイルが漏れたら誰でも署名できる）
+-----END PRIVATE KEY-----</pre>
+          </div>
+          <div>
+            <pre data-lang="pem" data-title="public.pem（SubjectPublicKeyInfo）">-----BEGIN PUBLIC KEY-----
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAu1SU1LfVLPHCozMx…
+…（公開してよい。JWKS には n と e に分解して載せる）
+-----END PUBLIC KEY-----</pre>
+          </div>
+        </div>
+
+        <pre data-lang="json" data-title="GET https://auth.example.com/.well-known/jwks.json（RFC 7517）">{
+  "keys": [
+    {
+      "kty": "RSA",
+      "use": "sig",
+      "alg": "RS256",
+      "kid": "2026-09",
+      "n": "u1SU1LfVLPHCozMxH2Mo4lgOEePzNm0tRgeLezV6ffAt0gunVTLw7onLRnrq0_IzW7yWR7QkrmBL7jTKEn5u…",
+      "e": "AQAB"
+    },
+    {
+      "kty": "RSA", "use": "sig", "alg": "RS256", "kid": "2026-06",
+      "n": "…", "e": "AQAB"
+    }
+  ]
+}</pre>
+        <div class="note tip"><b>鍵ローテーション：</b>新しい鍵を JWKS に<b>先に</b>追加 → キャッシュが行き渡ってから新しい <code>kid</code> で署名開始 → 旧鍵で署名したトークンがすべて <code>exp</code> を過ぎたら JWKS から旧鍵を削除、の順で行います。</div>
+      </section>
+
+      <!-- ============ 9 ============ -->
+      <section class="chapter" id="commands">
+        <h2>コマンド早見表</h2>
+        <div class="tbl"><table class="ref">
+          <thead><tr><th>やりたいこと</th><th>コマンド</th></tr></thead>
+          <tbody>
+            <tr><td>RSA 鍵ペア生成</td><td><code>openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out private.pem</code></td></tr>
+            <tr><td>公開鍵を取り出す</td><td><code>openssl pkey -in private.pem -pubout -out public.pem</code></td></tr>
+            <tr><td>EC (P-256) 鍵生成</td><td><code>openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out ec.pem</code></td></tr>
+            <tr><td>HS256 用シークレット生成</td><td><code>openssl rand -base64 32</code>（256bit 以上。RFC 7518 §3.2）</td></tr>
+            <tr><td>HMAC 署名</td><td><code>printf '%s' "$INPUT" | openssl dgst -sha256 -hmac "$SECRET" -binary</code></td></tr>
+            <tr><td>RSA 署名 / 検証</td><td><code>openssl dgst -sha256 -sign private.pem -out sig.bin input.txt</code><br><code>openssl dgst -sha256 -verify public.pem -signature sig.bin input.txt</code> → <code>Verified OK</code></td></tr>
+            <tr><td>JWKS を取得</td><td><code>curl -s https://auth.example.com/.well-known/jwks.json</code></td></tr>
+            <tr><td>API を呼ぶ</td><td><code>curl -H "Authorization: Bearer $TOKEN" https://api.example.com/v1/me</code></td></tr>
+          </tbody>
+        </table></div>
+      </section>
+
+      <!-- ============ 10 ============ -->
+      <section class="chapter" id="try">
+        <h2>手元で試す：openssl だけで JWT を作って検証する</h2>
+        <p>ライブラリを使わず、<code>bash</code> と <code>openssl</code> だけで HS256 と RS256 のトークンを作ります。何を署名しているのかが一番よくわかる方法です。</p>
+        <pre data-lang="bash" data-title="jwt-by-hand.sh（HS256）">b64url() { base64 | tr '+/' '-_' | tr -d '=\n'; }
+
+HEADER=$(printf '%s' '{"alg":"HS256","typ":"JWT"}' | b64url)
+PAYLOAD=$(printf '%s' "{\"sub\":\"42\",\"role\":\"user\",\"exp\":$(( $(date +%s) + 900 ))}" | b64url)
+SECRET=$(openssl rand -base64 32)
+
+SIG=$(printf '%s' "$HEADER.$PAYLOAD" | openssl dgst -sha256 -hmac "$SECRET" -binary | b64url)
+TOKEN="$HEADER.$PAYLOAD.$SIG"
+echo "$TOKEN"</pre>
+
+        <pre data-lang="bash" data-title="RS256 で署名して openssl で検証する">openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out private.pem
+openssl pkey -in private.pem -pubout -out public.pem
+
+HEADER=$(printf '%s' '{"alg":"RS256","typ":"JWT","kid":"demo"}' | b64url)
+printf '%s' "$HEADER.$PAYLOAD" > input.txt
+openssl dgst -sha256 -sign private.pem -out sig.bin input.txt
+wc -c sig.bin                      # ⟪256 sig.bin⟫（2048bit 鍵）
+TOKEN="$HEADER.$PAYLOAD.$(b64url < sig.bin)"
+
+# 検証：受け取ったトークンから署名対象と署名を取り出して検証
+b64url_decode() { local s="${1//-/+}"; s="${s//_//}"; case $(( ${#s} % 4 )) in 2) s+="==";; 3) s+="=";; esac; printf '%s' "$s" | base64 -d; }
+printf '%s' "${TOKEN%.*}" > input.txt
+b64url_decode "${TOKEN##*.}" > sig.bin
+openssl dgst -sha256 -verify public.pem -signature sig.bin input.txt   # ⟪Verified OK⟫</pre>
+
+        <pre data-lang="bash" data-title="中身を読む（署名は検証しない）">b64url_decode "$(cut -d. -f1 <<< "$TOKEN")"; echo   # header
+b64url_decode "$(cut -d. -f2 <<< "$TOKEN")"; echo   # payload → {"sub":"42","role":"user","exp":...}</pre>
+
+        <div class="cols">
+          <pre data-lang="js" data-title="Node.js（jose）— 発行側">import { SignJWT, importPKCS8 } from 'jose';
+import { readFile } from 'node:fs/promises';
+
+const pem = await readFile('/etc/auth/keys/2026-09.pem', 'utf8');
+const privateKey = await importPKCS8(pem, 'RS256');
+
+const token = await new SignJWT({ scope: 'users:read' })
+  .setProtectedHeader({ alg: 'RS256', kid: '2026-09' })
+  .setIssuer('https://auth.example.com')
+  .setSubject('42')
+  .setAudience('api.example.com')
+  .setIssuedAt()
+  .setExpirationTime('15m')
+  .sign(privateKey);</pre>
+          <pre data-lang="js" data-title="Node.js（jose）— 検証側（API）">import { createRemoteJWKSet, jwtVerify } from 'jose';
+
+const JWKS = createRemoteJWKSet(
+  new URL('https://auth.example.com/.well-known/jwks.json'));
+
+const { payload, protectedHeader } = await jwtVerify(token, JWKS, {
+  issuer: 'https://auth.example.com',
+  audience: 'api.example.com',
+  algorithms: ['RS256'],   // alg を固定する
+  clockTolerance: 60,      // 秒
+});</pre>
+        </div>
+        <pre data-lang="py" data-title="Python（PyJWT）— 検証側">import jwt
+
+jwks = jwt.PyJWKClient("https://auth.example.com/.well-known/jwks.json")
+key = jwks.get_signing_key_from_jwt(token).key
+claims = jwt.decode(token, key, algorithms=["RS256"],
+                    audience="api.example.com",
+                    issuer="https://auth.example.com", leeway=60)</pre>
+      </section>
+
+      <!-- ============ 11 ============ -->
+      <section class="chapter" id="pitfalls">
+        <h2>ハマりどころ</h2>
+        <div class="note warn"><b>payload は暗号化されていない。</b>パスワード・個人情報・内部 ID の体系など、見られて困るものを入れない。DevTools やプロキシのログで誰でも読めます。</div>
+        <div class="note warn"><b>alg を固定する。</b>ヘッダの <code>alg</code> で検証方式を決める実装は、<code>none</code> や RS256→HS256 の混同攻撃（公開鍵の PEM 文字列を HMAC の鍵として使わせる）を許します。検証 API には必ず <code>algorithms: ['RS256']</code> のような許可リストを渡します。</div>
+        <div class="note warn"><b>exp は秒。</b>NumericDate は UNIX 秒です。JavaScript の <code>Date.now()</code> はミリ秒なので <code>Math.floor(Date.now() / 1000)</code>。ミリ秒を入れると 5 万年先まで有効なトークンになります。</div>
+        <div class="note warn"><b>aud と iss を検証する。</b>同じ認可サーバーが発行した「別 API 向け」のトークンでも署名は正しいので、<code>aud</code> を見ないと流用されます。</div>
+        <div class="note warn"><b>失効できない。</b>JWT はステートレスなので、発行後に取り消すには <code>jti</code> の denylist など追加の仕組みが要ります。アクセストークンは 5〜15 分程度と短くし、リフレッシュトークン（サーバー側で失効可能）と組み合わせるのが定石です。</div>
+        <div class="note warn"><b>HS256 の弱いシークレット。</b>トークン 1 つあればオフラインで総当たりできます。32 バイト以上のランダム値を使い、複数サービスで検証するなら非対称鍵（RS256 / ES256 / EdDSA）へ。</div>
+        <div class="note warn"><b>ES256 の署名形式。</b><code>openssl dgst -sign</code> の ECDSA 署名は ASN.1 DER ですが、JWS は 64 バイトの <code>R‖S</code> 連結です。手で作るときは変換が必要です。</div>
+        <div class="note warn"><b>保存場所。</b><code>localStorage</code> は XSS で抜かれます。<code>HttpOnly; Secure; SameSite</code> の Cookie に入れると JS から読めない代わりに CSRF 対策が必要です。SPA では BFF（Backend for Frontend）パターンも選択肢です。</div>
+        <div class="note warn"><b>ヘッダサイズ。</b>クレームを詰め込むとトークンが数 KB になり、プロキシのヘッダ上限（例：nginx の <code>large_client_header_buffers</code>）に当たって <code>400</code> / <code>431</code> になることがあります。</div>
+      </section>
+
+      <!-- ============ 12 ============ -->
+      <section class="chapter" id="spec">
+        <h2>仕様・参考</h2>
+        <ul>
+          <li><a href="https://www.rfc-editor.org/rfc/rfc7519" target="_blank" rel="noopener">RFC 7519 — JSON Web Token (JWT)</a></li>
+          <li><a href="https://www.rfc-editor.org/rfc/rfc7515" target="_blank" rel="noopener">RFC 7515 — JSON Web Signature (JWS)</a></li>
+          <li><a href="https://www.rfc-editor.org/rfc/rfc7516" target="_blank" rel="noopener">RFC 7516 — JSON Web Encryption (JWE)</a></li>
+          <li><a href="https://www.rfc-editor.org/rfc/rfc7517" target="_blank" rel="noopener">RFC 7517 — JSON Web Key (JWK)</a></li>
+          <li><a href="https://www.rfc-editor.org/rfc/rfc7518" target="_blank" rel="noopener">RFC 7518 — JSON Web Algorithms (JWA)</a></li>
+          <li><a href="https://www.rfc-editor.org/rfc/rfc8037" target="_blank" rel="noopener">RFC 8037 — CFRG Elliptic Curve (EdDSA) in JOSE</a></li>
+          <li><a href="https://www.rfc-editor.org/rfc/rfc8725" target="_blank" rel="noopener">RFC 8725 — JSON Web Token Best Current Practices</a></li>
+          <li><a href="https://www.rfc-editor.org/rfc/rfc6750" target="_blank" rel="noopener">RFC 6750 — OAuth 2.0 Bearer Token Usage</a></li>
+          <li><a href="https://www.rfc-editor.org/rfc/rfc9068" target="_blank" rel="noopener">RFC 9068 — JWT Profile for OAuth 2.0 Access Tokens</a></li>
+          <li><a href="https://www.rfc-editor.org/rfc/rfc4648#section-5" target="_blank" rel="noopener">RFC 4648 §5 — base64url</a></li>
+          <li><a href="https://github.com/panva/jose" target="_blank" rel="noopener">panva/jose（Node.js / ブラウザ）</a> ・ <a href="https://pyjwt.readthedocs.io/" target="_blank" rel="noopener">PyJWT</a></li>
+        </ul>
+      </section>
+
+    </main>
+  </div>
+
+  <footer class="site-f"></footer>
+  <script src="../../assets/js/topics.js"></script>
+  <script src="../../assets/js/tim.js"></script>
+  <script src="scenes.js"></script>
+</body>
+</html>

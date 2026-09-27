@@ -81,7 +81,7 @@ window.TIM_TOPICS = [
     sub: 'header.payload.signature。どこで署名され、どこで検証され、改ざんはどう検出されるか',
     cmds: ['openssl genpkey -algorithm RSA -out private.pem', 'curl -H "Authorization: Bearer eyJ…" …', 'curl https://auth.example.com/.well-known/jwks.json'],
     tags: ['alg', 'kid', 'exp', 'aud', 'JWKS'],
-    related: ['oauth-oidc', 'webapi', 'https-tls'], status: 'soon',
+    related: ['oauth-oidc', 'webapi', 'https-tls'], status: 'ready',
   },
   {
     id: 'oauth-oidc', cat: 'auth', title: 'OAuth 2.0 / OIDC',

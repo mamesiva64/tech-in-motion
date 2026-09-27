@@ -732,6 +732,7 @@ a.rel-a:hover { border-color: var(--accent); transform: translateY(-2px); box-sh
 .caption {
   position: absolute; left: 50%; bottom: 14px;
   translate: -50% 0;
+  width: max-content;
   max-width: 88%;
   padding: 8px 18px;
   border-radius: 10px;

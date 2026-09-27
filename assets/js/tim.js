@@ -654,6 +654,9 @@
       if (!c) { c = h('div', 'caption'); this.fx.appendChild(c); }
       c.className = 'caption ' + (o.cls || '');
       c.innerHTML = html;
+      c.style.left = o.x != null ? o.x + 'px' : '';
+      c.style.top = o.y != null ? o.y + 'px' : '';
+      c.style.bottom = o.y != null ? 'auto' : '';
       return this._a(c, [{ opacity: 0, translate: '-50% 10px' }, { opacity: 1, translate: '-50% 0' }], { dur: 420 });
     }
     camera(o = {}) {
