@@ -1,0 +1,68 @@
+/* Docker topic — page-specific stage parts */
+
+/* file-b の 1 行（ファイル名 + 右寄せの補足） */
+.stage .ctx-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 0 4px;
+  margin: 0 -4px;
+  border-radius: 4px;
+  white-space: nowrap;
+  transition: background 0.3s, color 0.3s, opacity 0.3s;
+}
+.stage .ctx-row small { color: var(--tx3); font-size: 10px; }
+.stage .ctx-row.on { background: color-mix(in srgb, var(--accent) 18%, transparent); color: var(--tx); }
+.stage .ctx-row.on small { color: var(--accent); }
+.stage .ctx-row.ex { text-decoration: line-through; opacity: 0.4; }
+.stage .ctx-row.mod small { color: var(--amber); }
+.stage .ctx-row .tag { color: var(--accent); font-weight: 700; }
+
+/* 1 行レイアウトのノード（overlay の層、プロセス行など） */
+.stage .lrow { padding: 5px 10px; border-radius: 9px; }
+/* overlay の層行は背景を半透明にして、層をまたぐ線（copy_up など）が透けて見えるようにする */
+.stage .lrow[data-overlap-ok] { background: rgba(17, 26, 44, 0.55); }
+.stage .lrow[data-overlap-ok].dimbg { background: rgba(10, 16, 32, 0.5); }
+.stage .lrow .node-t { font-size: 12.5px; }
+.stage .lrow .node-s { margin-top: 1px; }
+.stage .lrow.dimbg { background: #0a1020; }
+
+/* key → value 行（cgroup ファイルなど） */
+.stage .kvrow {
+  display: grid;
+  grid-template-columns: 118px 116px 1fr;
+  gap: 6px;
+  white-space: nowrap;
+}
+.stage .kvrow span { color: var(--tx3); }
+.stage .kvrow b { color: var(--tx); font-weight: 600; }
+.stage .kvrow small { color: var(--accent); font-size: 10.5px; overflow: hidden; text-overflow: ellipsis; }
+
+/* ゲージ（memory.current） */
+.stage .gauge {
+  padding: 8px 10px;
+  border: 1px solid var(--line2);
+  border-radius: 10px;
+  background: #080d17;
+  font: 11px/1.4 var(--mono);
+  color: var(--tx2);
+}
+.stage .gauge .g-h { display: flex; justify-content: space-between; margin-bottom: 6px; white-space: nowrap; }
+.stage .gauge .g-t { height: 8px; border-radius: 4px; background: var(--line); overflow: hidden; }
+.stage .gauge .g-t i { display: block; height: 100%; width: 0; background: var(--accent); box-shadow: 0 0 10px var(--accent); transition: width 1.4s cubic-bezier(.45,0,.25,1), background 0.3s; }
+.stage .gauge.full .g-t i { background: var(--red); box-shadow: 0 0 12px var(--red); }
+
+/* タイムライン（docker stop の猶予） */
+.stage .tline { padding: 8px 10px; border: 1px solid var(--line2); border-radius: 10px; background: #080d17; font: 11px/1.4 var(--mono); color: var(--tx2); }
+.stage .tline .g-h { display: flex; justify-content: space-between; white-space: nowrap; margin-bottom: 6px; }
+.stage .tline .g-t { position: relative; height: 8px; border-radius: 4px; background: var(--line); overflow: hidden; }
+.stage .tline .g-t i { display: block; height: 100%; width: 0; background: var(--amber); transition: width 2.4s linear; }
+.stage .tline.done .g-t i { background: var(--red); }
+.stage .tline .sec { color: var(--tx); font-weight: 700; }
+
+/* 文字の小さい pre（長いルール行） */
+.stage .file pre.sm { font-size: 10.5px; }
+
+/* 層カード内のステータス文字 */
+.stage .okt { color: var(--green); font-weight: 700; }
+.stage .badt { color: var(--red); font-weight: 700; }

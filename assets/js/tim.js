@@ -927,6 +927,8 @@
       this.ended = false;
       this.reset();
       const ff = new Ctx(this, tok, true, true);
+      // 早送り中は CSS transition も止める（幅・色などの transition が途中値で残らないように）
+      this.world.classList.add('ff');
       for (let k = 0; k < n; k++) {
         await this.runStep(k, ff);
         if (tok !== this.token) return;
@@ -935,7 +937,9 @@
       this.stepDone = false;
       this.renderStep(n);
       this.sync();
-      await this.runStep(n, new Ctx(this, tok, !!opt.instant || REDUCED || TIM.instant === true, false));
+      const instant = !!opt.instant || REDUCED || TIM.instant === true;
+      if (!instant) { void this.world.offsetWidth; this.world.classList.remove('ff'); }
+      await this.runStep(n, new Ctx(this, tok, instant, false));
       if (tok !== this.token) return;
       this.stepDone = true;
       if (this.playing) this.schedule();

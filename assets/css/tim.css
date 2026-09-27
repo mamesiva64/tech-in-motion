@@ -425,6 +425,7 @@ a.rel-a:hover { border-color: var(--accent); transform: translateY(-2px); box-sh
 .stage { position: absolute; left: 0; top: 0; transform-origin: 0 0; font: 13px/1.45 var(--sans); color: var(--tx); }
 .world { position: absolute; inset: 0; transform-origin: 0 0; }
 .world > * { position: absolute; }
+.world.ff, .world.ff * { transition: none !important; }
 .world > svg.wires { left: 0; top: 0; overflow: visible; pointer-events: none; }
 .world > .fx { left: 0; top: 0; right: 0; bottom: 0; pointer-events: none; z-index: 20; }
 

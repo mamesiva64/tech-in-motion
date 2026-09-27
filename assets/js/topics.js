@@ -25,7 +25,7 @@ window.TIM_TOPICS = [
     sub: 'Dockerfile → イメージ(レイヤー) → コンテナ。overlay2 と namespace の実体',
     cmds: ['docker build -t web:1.0 .', 'docker run -d -p 8080:80 web:1.0', 'docker image inspect web:1.0'],
     tags: ['Dockerfile', 'overlay2', 'manifest.json', 'namespaces', 'cgroups'],
-    related: ['docker-compose', 'dns', 'git-internals'], status: 'soon',
+    related: ['docker-compose', 'dns', 'git-internals'], status: 'ready',
   },
   {
     id: 'docker-compose', cat: 'container', title: 'Docker Compose',

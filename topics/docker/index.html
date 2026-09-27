@@ -1,0 +1,878 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Docker — Tech in Motion</title>
+  <meta name="description" content="docker run が /var/run/docker.sock → dockerd → containerd → runc と流れる様子、Dockerfile がレイヤー（manifest / config / blobs）になる仕組み、overlay2・namespaces・cgroup v2・iptables DNAT の実体を、実際のコマンド出力とファイルでステップ再生します。">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Space+Grotesk:wght@500;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="../../assets/css/tim.css">
+  <link rel="stylesheet" href="page.css">
+</head>
+<body data-root="../../" data-topic="docker">
+  <header class="site-h"></header>
+
+  <div class="page">
+    <aside class="toc"></aside>
+    <main class="doc">
+
+      <!-- 0. HERO -->
+      <section class="hero">
+        <p class="kicker">Container · Docker Engine / OCI</p>
+        <h1>Docker<small>Dockerfile → イメージ（レイヤー）→ コンテナ。その実体を /var/lib/docker と /proc で確かめる</small></h1>
+        <p class="lead"><code>docker run</code> は魔法ではありません。CLI が UNIX ソケット越しに REST API を叩き、<code>dockerd</code> → <code>containerd</code> → <code>runc</code> が namespaces と cgroup を設定して <code>execve</code> するだけです。イメージは sha256 で名前の付いた JSON と tar の集まり、コンテナのファイルシステムは overlay マウント、<code>-p 8080:3000</code> は iptables の DNAT ルール。このページではそれぞれを実際のファイル・コマンド出力で分解します。</p>
+        <div class="facts">
+          <div class="fact"><span>入口</span><b><code>docker</code> CLI → <code>/var/run/docker.sock</code>（Engine API v1.51）</b></div>
+          <div class="fact"><span>実行チェーン</span><b><code>dockerd</code> → <code>containerd</code> → <code>containerd-shim-runc-v2</code> → <code>runc</code></b></div>
+          <div class="fact"><span>実体の置き場</span><b><code>/var/lib/docker/overlay2/</code>・<code>/proc/&lt;pid&gt;/ns/</code>・<code>/sys/fs/cgroup/…/docker-&lt;id&gt;.scope/</code></b></div>
+          <div class="fact"><span>仕様</span><b>OCI Image Spec v1.1 / Runtime Spec v1.2・Docker Engine API</b></div>
+        </div>
+      </section>
+
+      <!-- 1. 全体像 -->
+      <section class="chapter" id="overview">
+        <h2>全体像：docker run は何を起動しているのか</h2>
+        <p><code>docker</code> コマンド自体はコンテナを作りません。やっていることは <strong>HTTP リクエストの送信だけ</strong>です。受け取った <code>dockerd</code> がイメージ・ネットワーク・ストレージを準備し、OCI Runtime Spec の <code>config.json</code> を作って <code>containerd</code> に渡し、最終的に <code>runc</code> がカーネルの機能（<code>clone(2)</code> の namespace フラグ、cgroup ファイルへの書き込み、<code>pivot_root(2)</code>）を使ってプロセスを起動します。</p>
+        <div class="note">本ページの出力例は <b>Ubuntu 24.04 + Docker Engine 28.5（API v1.51）+ <code>overlay2</code> ストレージドライバ + cgroup v2（systemd cgroup driver）</b>を前提にしています。Engine 29 以降の<b>新規インストール</b>では containerd image store が既定になり、レイヤーの置き場所が変わります（<a href="#filesystem">後述</a>）。コンテナ ID・PID・digest はこのページ用の例示値です。</div>
+
+        <div class="scene" id="sc-run" data-title="docker run の実体：CLI → dockerd → containerd → shim → runc">
+          <div class="stage" data-w="960" data-h="520">
+            <div class="zone" data-label="host · Ubuntu 24.04 · Docker Engine 28.5" style="left:16px;top:16px;width:928px;height:488px"></div>
+            <div class="term" data-el="t" style="left:34px;top:40px;width:316px;height:184px">
+              <div class="term-h">bash — docker CLI（クライアント）</div>
+              <div class="term-b"></div>
+            </div>
+            <div class="node" data-el="sock" style="left:382px;top:84px;width:178px">
+              <div class="node-h"><i data-icon="link"></i><b class="node-t">docker.sock</b></div>
+              <div class="node-s">/var/run/docker.sock<br>HTTP/1.1 over UNIX</div>
+            </div>
+            <div class="node" data-el="dockerd" style="left:592px;top:72px;width:160px">
+              <div class="node-h"><i data-icon="server"></i><b class="node-t">dockerd</b></div>
+              <div class="node-s">Engine API v1.51<br>/usr/bin/dockerd</div>
+            </div>
+            <div class="node" data-el="ctrd" style="left:778px;top:72px;width:150px">
+              <div class="node-h"><i data-icon="gear"></i><b class="node-t">containerd</b></div>
+              <div class="node-s">gRPC · ns=moby<br>containerd.sock</div>
+            </div>
+            <div class="node" data-el="shim" style="left:664px;top:246px;width:264px">
+              <div class="node-h"><i data-icon="box"></i><b class="node-t">containerd-shim-runc-v2</b></div>
+              <div class="node-s">コンテナごとに 1 つの親プロセス<br>stdio 保持・exit code 回収</div>
+            </div>
+            <div class="node" data-el="runc" style="left:476px;top:246px;width:160px">
+              <div class="node-h"><i data-icon="terminal"></i><b class="node-t">runc</b></div>
+              <div class="node-s">OCI runtime<br>create → start → 終了</div>
+            </div>
+            <div class="zone" data-el="box" data-label="container · web" style="left:34px;top:252px;width:410px;height:176px"></div>
+            <div class="node acc hide" data-el="proc" style="left:52px;top:280px;width:200px">
+              <div class="node-h"><i data-icon="code"></i><b class="node-t">node server.js</b></div>
+              <div class="node-s">PID 1（コンテナ内）<br>host PID 4321</div>
+            </div>
+            <div class="node sm hide" data-el="ns" style="left:268px;top:280px;width:160px">
+              <div class="node-h"><i data-icon="shield"></i><b class="node-t">namespaces</b></div>
+              <div class="node-s">pid net mnt<br>uts ipc cgroup</div>
+            </div>
+            <div class="chip hide" data-el="cg" style="left:52px;top:380px">cgroup memory.max=268435456</div>
+            <div class="chip hide" data-el="rootfs" style="left:268px;top:380px">rootfs: overlay2</div>
+            <div class="file hide" data-el="spec" style="left:476px;top:336px;width:452px">
+              <div class="file-h">…/io.containerd.runtime.v2.task/moby/e80e…/config.json</div>
+              <pre data-lang="json">"process": {"args": ["docker-entrypoint.sh",
+                     "node", "server.js"]},
+"root": {"path": "/var/lib/docker/overlay2/da2e…/merged"},
+"linux": {"namespaces": [{"type": "pid"}, …],
+  "cgroupsPath": "system.slice:docker:e80e…"}</pre>
+            </div>
+          </div>
+        </div>
+
+        <h3>登場するプロセスとソケット</h3>
+        <div class="tbl">
+          <table class="ref">
+            <thead><tr><th>プロセス</th><th>バイナリ / ソケット</th><th>話すプロトコル</th><th>役割</th></tr></thead>
+            <tbody>
+              <tr><td><code>docker</code>（CLI）</td><td><code>/usr/bin/docker</code></td><td>HTTP/1.1 over <code>/var/run/docker.sock</code></td><td>コマンドを Engine API 呼び出しに変換するだけのクライアント。接続先は <code>DOCKER_HOST</code> / <code>docker context</code> で変わる</td></tr>
+              <tr><td><code>dockerd</code></td><td><code>/usr/bin/dockerd</code><br><code>/var/run/docker.sock</code>（<code>docker.socket</code> ユニット）</td><td>REST API を受け、containerd へ gRPC</td><td>イメージ・ネットワーク・ボリューム・ビルド（BuildKit 内蔵）の管理、OCI Runtime Spec の生成</td></tr>
+              <tr><td><code>containerd</code></td><td><code>/usr/bin/containerd</code><br><code>/run/containerd/containerd.sock</code></td><td>gRPC（namespace <code>moby</code>）</td><td>コンテナ／タスクのライフサイクル管理。Docker のコンテナは <code>ctr -n moby</code> で見える</td></tr>
+              <tr><td><code>containerd-shim-runc-v2</code></td><td><code>/usr/bin/containerd-shim-runc-v2</code></td><td>ttrpc</td><td>コンテナごとに常駐する親プロセス。stdio を保持し、終了コードを回収する。dockerd / containerd を再起動してもコンテナが死なない理由</td></tr>
+              <tr><td><code>runc</code></td><td><code>/usr/bin/runc</code></td><td>コマンド実行（<code>runc create</code> / <code>start</code>）</td><td>namespaces・cgroup・rootfs を設定して <code>execve</code> し、<strong>自分は終了</strong>する</td></tr>
+              <tr><td><code>docker-proxy</code></td><td><code>/usr/bin/docker-proxy</code></td><td>TCP / UDP</td><td><code>-p</code> ごとに起動する userland proxy（<code>localhost:8080</code> 宛てなど iptables で拾えない通信を中継）</td></tr>
+              <tr><td><code>docker-init</code></td><td><code>/usr/bin/docker-init</code></td><td>—</td><td><code>docker run --init</code> のとき PID 1 になる小さな init（tini）。シグナル転送とゾンビ回収</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <pre data-lang="ini" data-title="/lib/systemd/system/docker.service（抜粋）">[Service]
+Type=notify
+⟪ExecStart=/usr/bin/dockerd -H fd:// --containerd=/run/containerd/containerd.sock⟫
+ExecReload=/bin/kill -s HUP $MAINPID
+TimeoutStartSec=0
+Restart=always</pre>
+        <p><code>-H fd://</code> は systemd のソケットアクティベーション（<code>docker.socket</code> が <code>/run/docker.sock</code> を listen して fd を渡す）を意味します。<code>/var/run</code> は <code>/run</code> へのシンボリックリンクなので、<code>/var/run/docker.sock</code> と <code>/run/docker.sock</code> は同じファイルです。</p>
+      </section>
+
+      <!-- 2. build -->
+      <section class="chapter" id="build">
+        <h2>docker build：Dockerfile からレイヤーへ</h2>
+        <p>Docker Engine 23.0 以降、<code>docker build</code> は <code>docker buildx build</code> の別名で、ビルドは dockerd に内蔵された <strong>BuildKit</strong> が行います。CLI はまず <strong>build context</strong>（最後の引数のディレクトリ）を <code>.dockerignore</code> で絞り込んで送り、BuildKit は Dockerfile の命令を 1 つずつ実行して、ファイルシステムの差分を <strong>レイヤー（tar）</strong>として積み上げます。</p>
+
+        <div class="scene" id="sc-build" data-title="docker build：context → BuildKit → レイヤーとキャッシュ">
+          <div class="stage" data-w="960" data-h="520">
+            <div class="file" data-el="ctx" style="left:16px;top:16px;width:250px">
+              <div class="file-h">~/web/（build context）</div>
+              <div class="file-b">
+                <div class="ctx-row" data-el="r-df">Dockerfile<small>141B</small></div>
+                <div class="ctx-row" data-el="r-ign">.dockerignore<small>29B</small></div>
+                <div class="ctx-row" data-el="r-pkg">package.json<small>412B</small></div>
+                <div class="ctx-row" data-el="r-lock">package-lock.json<small>31.4kB</small></div>
+                <div class="ctx-row" data-el="r-srv">server.js<small data-el="r-srv-s">1.9kB</small></div>
+                <div class="ctx-row" data-el="r-readme">README.md<small>214B</small></div>
+                <div class="ctx-row" data-el="r-src">src/<small>2.6kB</small></div>
+                <div class="ctx-row" data-el="r-nm">node_modules/<small>48MB</small></div>
+                <div class="ctx-row" data-el="r-git">.git/<small>12MB</small></div>
+                <div class="ctx-row" data-el="r-env">.env<small>96B</small></div>
+              </div>
+            </div>
+            <div class="node" data-el="bk" style="left:290px;top:16px;width:350px">
+              <div class="node-h"><i data-icon="gear"></i><b class="node-t">BuildKit（dockerd 内蔵）</b></div>
+              <div class="node-s">docker build ＝ buildx build（23.0+）</div>
+            </div>
+            <div class="file" data-el="df" style="left:290px;top:96px;width:350px">
+              <div class="file-h">Dockerfile<small>7 命令</small></div>
+              <pre data-lang="dockerfile" data-el="dfp">FROM node:22-alpine
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev
+COPY . .
+EXPOSE 3000
+CMD ["node", "server.js"]</pre>
+            </div>
+            <div class="term" data-el="t" style="left:16px;top:276px;width:626px;height:228px">
+              <div class="term-h">docker build（BuildKit の進捗表示）</div>
+              <div class="term-b"></div>
+            </div>
+            <div class="zone" data-el="img" data-label="image web:1.0" style="left:660px;top:16px;width:284px;height:488px"></div>
+            <div class="chip hide" data-el="iid" style="left:676px;top:40px">IMAGE ID a21f6cb024a6</div>
+            <div class="chip hide" data-el="tag" style="left:676px;top:74px">docker.io/library/web:1.0</div>
+            <div class="node sm hide" data-el="lc" style="left:676px;top:112px;width:252px;border-style:dashed">
+              <div class="node-h"><i data-icon="file"></i><b class="node-t">config（レイヤーなし）</b></div>
+              <div class="node-s">EXPOSE 3000<br>CMD ["node", "server.js"]</div>
+            </div>
+            <div class="node sm hide" data-el="l8" style="left:676px;top:196px;width:252px">
+              <div class="node-h"><i data-icon="layers"></i><b class="node-t">COPY . .</b></div>
+              <div class="node-s" data-el="l8s">sha256:4a19c8aa9c6d… 36.8kB</div>
+            </div>
+            <div class="node sm hide" data-el="l7" style="left:676px;top:256px;width:252px">
+              <div class="node-h"><i data-icon="layers"></i><b class="node-t">RUN npm ci --omit=dev</b></div>
+              <div class="node-s">sha256:7a2b52b3eaed… 2.1MB</div>
+            </div>
+            <div class="node sm hide" data-el="l6" style="left:676px;top:316px;width:252px">
+              <div class="node-h"><i data-icon="layers"></i><b class="node-t">COPY package*.json</b></div>
+              <div class="node-s">sha256:b020450f9e3a… 31.9kB</div>
+            </div>
+            <div class="node sm hide" data-el="l5" style="left:676px;top:376px;width:252px">
+              <div class="node-h"><i data-icon="layers"></i><b class="node-t">WORKDIR /app</b></div>
+              <div class="node-s">sha256:b2116af9f217… 0B</div>
+            </div>
+            <div class="node sm hide" data-el="lb" style="left:676px;top:436px;width:252px">
+              <div class="node-h"><i data-icon="layers"></i><b class="node-t">FROM node:22-alpine ×4</b></div>
+              <div class="node-s">sha256:9165f60dd944… ほか 3 層</div>
+            </div>
+          </div>
+        </div>
+
+        <h3>Dockerfile 命令とレイヤー</h3>
+        <p>ファイルシステムを変更する命令（<code>RUN</code> / <code>COPY</code> / <code>ADD</code>、ディレクトリを作る <code>WORKDIR</code>）だけがレイヤーになります。それ以外は image config（JSON）に書かれるだけで、<code>docker history</code> では <code>0B</code>、config の <code>history[]</code> では <code>"empty_layer": true</code> になります。</p>
+        <div class="tbl">
+          <table class="ref">
+            <thead><tr><th>命令</th><th>例</th><th>レイヤー</th><th>何が起きるか / 書かれる場所</th></tr></thead>
+            <tbody>
+              <tr><td><code>FROM</code></td><td><code>FROM node:22-alpine AS build</code></td><td>ベースの層を継承</td><td>タグを digest（<code>@sha256:…</code>）に解決し、その manifest の layers を土台にする。<code>AS</code> でマルチステージの名前</td></tr>
+              <tr><td><code>RUN</code></td><td><code>RUN npm ci --omit=dev</code></td><td>作る</td><td>一時コンテナでコマンドを実行し、変化したファイルを tar 化。shell 形式は <code>/bin/sh -c</code> 経由</td></tr>
+              <tr><td><code>COPY</code></td><td><code>COPY --chown=node:node . .</code></td><td>作る</td><td>build context（または <code>--from=</code> のステージ）からコピー。キャッシュ判定はファイル内容のチェックサム</td></tr>
+              <tr><td><code>ADD</code></td><td><code>ADD app.tar.gz /opt/</code></td><td>作る</td><td>COPY に加え、ローカル tar の自動展開・URL / Git 取得。単なるコピーなら COPY を使う</td></tr>
+              <tr><td><code>WORKDIR</code></td><td><code>WORKDIR /app</code></td><td>小さな層</td><td>config の <code>WorkingDir</code> を設定し、存在しなければディレクトリを作る（<code>docker history</code> では 0B）</td></tr>
+              <tr><td><code>ENV</code></td><td><code>ENV NODE_ENV=production</code></td><td>なし</td><td>config の <code>Env</code>。実行時も残る（秘密情報を入れない）</td></tr>
+              <tr><td><code>ARG</code></td><td><code>ARG VERSION=1.0</code></td><td>なし</td><td>ビルド時だけの変数（<code>--build-arg</code>）。値は <code>docker history</code> に出ることがある</td></tr>
+              <tr><td><code>EXPOSE</code></td><td><code>EXPOSE 3000</code></td><td>なし</td><td>config の <code>ExposedPorts</code>。<strong>ポートは公開されない</strong>（公開は <code>-p</code>）</td></tr>
+              <tr><td><code>USER</code></td><td><code>USER node</code></td><td>なし</td><td>config の <code>User</code>。以降の RUN と実行時のユーザー</td></tr>
+              <tr><td><code>ENTRYPOINT</code></td><td><code>ENTRYPOINT ["docker-entrypoint.sh"]</code></td><td>なし</td><td>config の <code>Entrypoint</code>。<code>docker run</code> の引数は CMD を置き換え、ENTRYPOINT の後ろに付く</td></tr>
+              <tr><td><code>CMD</code></td><td><code>CMD ["node", "server.js"]</code></td><td>なし</td><td>config の <code>Cmd</code>。exec 形式（JSON 配列）なら <code>/bin/sh -c</code> を挟まない</td></tr>
+              <tr><td><code>STOPSIGNAL</code></td><td><code>STOPSIGNAL SIGQUIT</code></td><td>なし</td><td><code>docker stop</code> が最初に送るシグナル（既定 SIGTERM）</td></tr>
+              <tr><td><code>HEALTHCHECK</code></td><td><code>HEALTHCHECK CMD wget -qO- localhost:3000/health</code></td><td>なし</td><td><code>.State.Health</code> に結果が溜まる</td></tr>
+              <tr><td><code>VOLUME</code></td><td><code>VOLUME /data</code></td><td>なし</td><td>実行時に匿名ボリュームを作ってマウント</td></tr>
+              <tr><td><code>LABEL</code></td><td><code>LABEL org.opencontainers.image.source=…</code></td><td>なし</td><td>config の <code>Labels</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="cols">
+          <pre data-lang="dockerfile" data-title="Dockerfile（キャッシュが効く順序）">FROM node:22-alpine
+WORKDIR /app
+# 依存定義だけ先にコピー → npm ci の層は package*.json が変わらない限り CACHED
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev
+# アプリ本体は最後（ここが一番よく変わる）
+COPY . .
+EXPOSE 3000
+CMD ["node", "server.js"]</pre>
+          <pre data-lang="text" data-title=".dockerignore（context から除外）">node_modules
+.git
+*.log
+.env</pre>
+        </div>
+        <div class="note tip"><b>キャッシュの判定ルール：</b>各命令のキャッシュキーは「親レイヤー + 命令文字列」です。<code>COPY</code> / <code>ADD</code> はさらに<b>コピー元ファイルの内容のチェックサム</b>を含みます（更新時刻は含みません）。<code>RUN</code> は<b>命令文字列だけ</b>で判定するため、<code>RUN apt-get update</code> は中身が古くなっても CACHED のままです。1 つの命令がミスすると、それ以降の命令はすべて再実行されます。</div>
+      </section>
+
+      <!-- 3. image -->
+      <section class="chapter" id="image">
+        <h2>イメージの中身：index → manifest → config → layers</h2>
+        <p>イメージは「sha256 のファイル名を持つ blob」の集まりです。<strong>manifest</strong> が config 1 個とレイヤー N 個を digest で指し、<strong>config</strong> が実行設定と各レイヤーの非圧縮 digest（<code>diff_ids</code>）を持ちます。中身を 1 バイトでも変えると digest が変わり、参照側と一致しなくなります（content-addressable）。</p>
+
+        <div class="scene" id="sc-image" data-title="docker save で見るイメージの正体（digest はこのページ上で実計算）">
+          <div class="stage" data-w="960" data-h="520">
+            <div class="file hide" data-el="tar" style="left:16px;top:16px;width:270px">
+              <div class="file-h">web.tar（tar -tf | cut -c1-25）</div>
+              <div class="file-b">
+                <div class="ctx-row">blobs/</div>
+                <div class="ctx-row">blobs/sha256/</div>
+                <div class="ctx-row" data-el="b-4a19">blobs/sha256/4a19c8aa9c6d<small data-el="k-4a19"></small></div>
+                <div class="ctx-row" data-el="b-5963">blobs/sha256/5963ebd6e20b<small data-el="k-5963"></small></div>
+                <div class="ctx-row" data-el="b-5e81">blobs/sha256/5e812f9a81df<small data-el="k-5e81"></small></div>
+                <div class="ctx-row" data-el="b-7a2b">blobs/sha256/7a2b52b3eaed<small data-el="k-7a2b"></small></div>
+                <div class="ctx-row" data-el="b-9165">blobs/sha256/9165f60dd944<small data-el="k-9165"></small></div>
+                <div class="ctx-row" data-el="b-9ae1">blobs/sha256/9ae139e3b399<small data-el="k-9ae1"></small></div>
+                <div class="ctx-row" data-el="b-a21f">blobs/sha256/a21f6cb024a6<small data-el="k-a21f"></small></div>
+                <div class="ctx-row" data-el="b-b020">blobs/sha256/b020450f9e3a<small data-el="k-b020"></small></div>
+                <div class="ctx-row" data-el="b-b211">blobs/sha256/b2116af9f217<small data-el="k-b211"></small></div>
+                <div class="ctx-row" data-el="b-fb89">blobs/sha256/fb89f63c9e99<small data-el="k-fb89"></small></div>
+                <div class="ctx-row" data-el="b-idx">index.json<small>入口</small></div>
+                <div class="ctx-row" data-el="b-mj">manifest.json<small>旧形式互換</small></div>
+                <div class="ctx-row" data-el="b-lay">oci-layout<small>1.0.0</small></div>
+                <div class="ctx-row" data-el="b-repo">repositories<small>旧形式互換</small></div>
+              </div>
+            </div>
+            <div class="term" data-el="t" style="left:16px;top:352px;width:270px;height:152px">
+              <div class="term-h">bash</div>
+              <div class="term-b"></div>
+            </div>
+            <div class="file hide" data-el="idx" style="left:304px;top:16px;width:316px">
+              <div class="file-h">index.json</div>
+              <pre data-lang="json">{"manifests": [{
+  "mediaType": "…manifest.v1+json",
+  "digest": "sha256:5e812f9a81df…",
+  "size": 1464}]}</pre>
+            </div>
+            <div class="file hide" data-el="man" style="left:304px;top:146px;width:316px">
+              <div class="file-h">blobs/sha256/5e812f9a81df…（manifest）</div>
+              <pre data-lang="json">{"config": {
+   "mediaType": "…image.config.v1+json",
+   "digest": "sha256:a21f6cb024a6…",
+   "size": 2994},
+ "layers": [
+   {"digest": "sha256:9165f60dd944…"},
+   … 全 8 層（…layer.v1.tar）]}</pre>
+            </div>
+            <div class="file hide" data-el="cfg" style="left:640px;top:16px;width:304px">
+              <div class="file-h">blobs/sha256/a21f6cb024a6…（config）</div>
+              <pre data-lang="json">"config": {
+ "Entrypoint": ["docker-entrypoint.sh"],
+ "Cmd": ["node", "server.js"],
+ "WorkingDir": "/app"},
+"rootfs": {"type": "layers",
+  "diff_ids": ["sha256:9165f60dd944…",
+               … 8 個 ]},
+"history": [ … 15 件 … ]</pre>
+            </div>
+            <div class="zone hide" data-el="lz" data-label="layers（非圧縮 tar）" style="left:640px;top:222px;width:304px;height:88px"></div>
+            <div class="chip hide" data-el="c1" style="left:652px;top:240px">9165f6</div>
+            <div class="chip hide" data-el="c2" style="left:722px;top:240px">9ae139</div>
+            <div class="chip hide" data-el="c3" style="left:792px;top:240px">5963eb</div>
+            <div class="chip hide" data-el="c4" style="left:862px;top:240px">fb89f6</div>
+            <div class="chip hide" data-el="c5" style="left:652px;top:274px">b2116a</div>
+            <div class="chip hide" data-el="c6" style="left:722px;top:274px">b02045</div>
+            <div class="chip hide" data-el="c7" style="left:792px;top:274px">7a2b52</div>
+            <div class="chip hide" data-el="c8" style="left:862px;top:274px">4a19c8</div>
+            <div class="node hide" data-el="calc" style="left:304px;top:330px;width:640px">
+              <div class="node-h"><i data-icon="hash"></i><b class="node-t">SHA-256（このページ上で WebCrypto により計算）</b></div>
+              <dl class="kv">
+                <dt>input</dt><dd data-el="cin">—</dd>
+                <dt>sha256</dt><dd class="acc" data-el="cout">—</dd>
+                <dt>expected</dt><dd data-el="cexp">—</dd>
+              </dl>
+            </div>
+            <div class="node sm hide" data-el="reg" style="left:304px;top:446px;width:640px">
+              <div class="node-h"><i data-icon="cloud"></i><b class="node-t">registry.example.com/web:1.0（push 後）</b></div>
+              <div class="node-s">layers[].mediaType = …rootfs.diff.tar.gzip → digest ≠ diff_id（圧縮後の sha256）</div>
+            </div>
+          </div>
+        </div>
+
+        <h3>blob の種類</h3>
+        <div class="tbl">
+          <table class="ref">
+            <thead><tr><th>blob</th><th>mediaType（OCI / Docker v2）</th><th>中身</th><th>どこから参照されるか</th></tr></thead>
+            <tbody>
+              <tr><td>index</td><td><code>application/vnd.oci.image.index.v1+json</code><br><code>application/vnd.docker.distribution.manifest.list.v2+json</code></td><td>プラットフォーム（<code>linux/amd64</code>, <code>linux/arm64</code>…）ごとの manifest の一覧</td><td>タグ（<code>node:22-alpine</code>）が最初に指すもの</td></tr>
+              <tr><td>manifest</td><td><code>application/vnd.oci.image.manifest.v1+json</code><br><code>application/vnd.docker.distribution.manifest.v2+json</code></td><td>config 1 個 + layers N 個の descriptor（mediaType / digest / size）</td><td>index、または <code>repo@sha256:…</code></td></tr>
+              <tr><td>config</td><td><code>application/vnd.oci.image.config.v1+json</code><br><code>application/vnd.docker.container.image.v1+json</code></td><td><code>architecture</code>, <code>os</code>, <code>config</code>（Env / Entrypoint / Cmd / WorkingDir / ExposedPorts / User）, <code>rootfs.diff_ids</code>, <code>history</code></td><td>manifest の <code>config.digest</code>。classic store では <strong>Image ID ＝ config の sha256</strong></td></tr>
+              <tr><td>layer</td><td><code>application/vnd.oci.image.layer.v1.tar(+gzip|+zstd)</code><br><code>application/vnd.docker.image.rootfs.diff.tar.gzip</code></td><td>ファイルシステム差分の tar。削除は <code>.wh.&lt;name&gt;</code>（whiteout）ファイルで表す</td><td>manifest の <code>layers[].digest</code>（圧縮後）/ config の <code>diff_ids</code>（非圧縮）</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <pre data-lang="json" data-title="blobs/sha256/5e812f9a81df…（manifest を jq . で整形。実ファイルは改行なし 1,464 バイト）">{
+  "schemaVersion": 2,
+  "mediaType": "application/vnd.oci.image.manifest.v1+json",
+  "config": {
+    "mediaType": "application/vnd.oci.image.config.v1+json",
+    "digest": "sha256:a21f6cb024a63a37e7bd03ca87c01068755a32f0c3df0056012e2fcfc8d76497",
+    "size": 2994
+  },
+  "layers": [
+    { "mediaType": "application/vnd.oci.image.layer.v1.tar", "digest": "sha256:9165f60dd944377e90b553d6e000a55c83f86128d4e020fdc1529fe7965c00dd", "size": 8121856 },
+    { "mediaType": "application/vnd.oci.image.layer.v1.tar", "digest": "sha256:9ae139e3b3994e42af83c4bd44c816a1b4d9c8e5a31e8e867bbb69a8f4606e80", "size": 137011200 },
+    { "mediaType": "application/vnd.oci.image.layer.v1.tar", "digest": "sha256:5963ebd6e20b7bf15e1f594c1764ae8cf70ba8ab17705f8186f3c9c757445efc", "size": 5448192 },
+    { "mediaType": "application/vnd.oci.image.layer.v1.tar", "digest": "sha256:fb89f63c9e99f1a6992d13fc39e08dbe374da728ae490b66cf382e38981ebadb", "size": 3584 },
+    { "mediaType": "application/vnd.oci.image.layer.v1.tar", "digest": "sha256:b2116af9f217a44b3666e6ec511a1cb9c753afcadcd1342192fb65c6a64d17e0", "size": 1536 },
+    { "mediaType": "application/vnd.oci.image.layer.v1.tar", "digest": "sha256:b020450f9e3a738a32e2a9c9b515ede980e75659de565ef2ad71e2ccd26f281e", "size": 34816 },
+    { "mediaType": "application/vnd.oci.image.layer.v1.tar", "digest": "sha256:7a2b52b3eaed0f8c183471fbfbbe8f674f725eef98244f9a7f66ca74039da308", "size": 2134016 },
+    { "mediaType": "application/vnd.oci.image.layer.v1.tar", "digest": "sha256:4a19c8aa9c6df420f8e373430d3a6e16203d7ccfa77d513eb4b89df5a5fe9bc7", "size": 45056 }
+  ]
+}</pre>
+        <pre data-lang="json" data-title="manifest.json（docker save の旧形式互換ファイル）">[
+  {
+    "Config": "blobs/sha256/a21f6cb024a63a37e7bd03ca87c01068755a32f0c3df0056012e2fcfc8d76497",
+    "RepoTags": ["web:1.0"],
+    "Layers": [
+      "blobs/sha256/9165f60dd944377e90b553d6e000a55c83f86128d4e020fdc1529fe7965c00dd",
+      "blobs/sha256/9ae139e3b3994e42af83c4bd44c816a1b4d9c8e5a31e8e867bbb69a8f4606e80",
+      "…（8 個）"
+    ]
+  }
+]</pre>
+        <div class="note">Docker Engine 25 以降の <code>docker save</code> は OCI Image Layout（<code>oci-layout</code> + <code>index.json</code> + <code>blobs/sha256/</code>）で出力し、旧来のツール向けに <code>manifest.json</code> と <code>repositories</code> も同梱します。レイヤー blob は<b>非圧縮 tar</b>（<code>application/vnd.oci.image.layer.v1.tar</code>）なので、ファイル名の digest は config の <code>diff_ids</code> と一致します。レジストリに push すると gzip 圧縮されるため、manifest の <code>layers[].digest</code> は別の値になります。</div>
+      </section>
+
+      <!-- 4. filesystem -->
+      <section class="chapter" id="filesystem">
+        <h2>コンテナのファイルシステム：overlay2 と Copy-on-Write</h2>
+        <p>コンテナの <code>/</code> は、イメージのレイヤー群（読み取り専用の <code>lowerdir</code>）の上にコンテナ専用の書き込み層（<code>upperdir</code>）を重ねた <strong>overlay マウント</strong>（<code>merged</code>）です。コンテナ内でファイルを書き換えると、そのファイルが丸ごと upperdir にコピーされてから変更されます（copy_up）。イメージ側のレイヤーは一切変わりません。</p>
+
+        <div class="scene" id="sc-overlay" data-title="overlay2：lowerdir + upperdir = merged、書き込みは copy_up">
+          <div class="stage" data-w="960" data-h="520">
+            <div class="term" data-el="t" style="left:16px;top:16px;width:330px;height:296px">
+              <div class="term-h">bash</div>
+              <div class="term-b"></div>
+            </div>
+            <div class="node sm" data-el="work" style="left:16px;top:328px;width:330px">
+              <div class="node-h"><i data-icon="gear"></i><b class="node-t">work/（workdir）</b></div>
+              <div class="node-s">copy_up や rename のための overlayfs 内部の作業領域</div>
+            </div>
+            <div class="node lrow acc" data-el="rm" data-overlap-ok style="left:364px;top:16px;width:580px">
+              <b class="node-t">merged/</b>
+              <div class="node-s">…/da2ecc9f0374/merged</div>
+            </div>
+            <div class="node lrow" data-el="ru" data-overlap-ok style="left:364px;top:64px;width:580px">
+              <b class="node-t">upperdir（RW）</b>
+              <div class="node-s">…/da2ecc9f0374/diff</div>
+            </div>
+            <div class="label acc" style="left:366px;top:116px">lowerdir（読み取り専用 · 上から順に検索）</div>
+            <div class="node lrow dimbg" data-el="ri" data-overlap-ok style="left:364px;top:136px;width:580px">
+              <b class="node-t">-init 層</b>
+              <div class="node-s">…/da2e…-init/diff</div>
+            </div>
+            <div class="node lrow dimbg" data-el="r8" data-overlap-ok style="left:364px;top:184px;width:580px">
+              <b class="node-t">COPY . .</b>
+              <div class="node-s">…/4c2b32ee9959/diff</div>
+            </div>
+            <div class="node lrow dimbg" data-el="r7" data-overlap-ok style="left:364px;top:232px;width:580px">
+              <b class="node-t">RUN npm ci</b>
+              <div class="node-s">…/46ad20a87021/diff</div>
+            </div>
+            <div class="node lrow dimbg" data-el="rb" data-overlap-ok style="left:364px;top:280px;width:580px">
+              <b class="node-t">下位 6 層</b>
+              <div class="node-s">node:22-alpine ほか</div>
+            </div>
+            <div class="chip" data-el="m1" style="left:520px;top:28px">server.js</div>
+            <div class="chip" data-el="m2" style="left:626px;top:28px">README.md</div>
+            <div class="chip" data-el="m3" style="left:732px;top:28px">node_modules</div>
+            <div class="chip hide" data-el="m4" style="left:838px;top:28px">cache.db</div>
+            <div class="chip hide c-amber" data-el="u1" style="left:520px;top:76px">server.js</div>
+            <div class="chip hide c-red" data-el="u2" style="left:626px;top:76px">✕ README.md</div>
+            <div class="chip hide c-green" data-el="u4" style="left:838px;top:76px">cache.db</div>
+            <div class="chip c-gray" data-el="i1" style="left:520px;top:148px">/.dockerenv /etc/hosts /etc/resolv.conf /etc/hostname …</div>
+            <div class="chip c-gray" data-el="l8a" style="left:520px;top:196px">server.js</div>
+            <div class="chip c-gray" data-el="l8b" style="left:626px;top:196px">README.md</div>
+            <div class="chip c-gray" data-el="l7a" style="left:732px;top:244px">node_modules</div>
+            <div class="chip c-gray" data-el="lba" style="left:520px;top:292px">/bin /lib /usr/local/bin/node …</div>
+            <div class="file hide" data-el="mnt" style="left:364px;top:344px;width:580px">
+              <div class="file-h">mount -t overlay（折り返して表示）</div>
+              <pre data-lang="text">overlay on /var/lib/docker/overlay2/da2ecc9f0374…/merged type overlay
+ (rw,relatime,
+  lowerdir=/var/lib/docker/overlay2/l/57AUS6HM…:l/GMHI7TY3…:…（計 9 層）,
+  upperdir=/var/lib/docker/overlay2/da2ecc9f0374…/diff,
+  workdir=/var/lib/docker/overlay2/da2ecc9f0374…/work)</pre>
+            </div>
+          </div>
+        </div>
+
+        <h3>/var/lib/docker の中身（overlay2 ドライバ）</h3>
+        <pre data-lang="tree" data-title="sudo tree -L 3 /var/lib/docker（抜粋）">/var/lib/docker/
+├── buildkit/                         # BuildKit のキャッシュとメタデータ
+├── containers/
+│   └── e80ea0e0d3914ba6…/            # コンテナ ID
+│       ├── e80ea0e0d3914ba6…-json.log # docker logs の実体（json-file ログドライバ）
+│       ├── config.v2.json            # docker inspect の元データ
+│       ├── hostconfig.json           # -p / -v / --memory など HostConfig
+│       ├── hostname                  # ↓ この 3 つはコンテナへ bind mount される
+│       ├── hosts
+│       ├── resolv.conf
+│       └── mounts/
+├── image/
+│   └── overlay2/
+│       ├── imagedb/content/sha256/   # image config（ファイル名 = Image ID）
+│       ├── layerdb/sha256/           # chainID ごとに cache-id / diff / size / tar-split.json.gz
+│       └── repositories.json         # タグ → Image ID の対応
+├── network/files/local-kv.db         # ネットワーク設定（bolt DB）
+├── overlay2/
+│   ├── l/                            # 短縮名 → ../&lt;id&gt;/diff のシンボリックリンク
+│   ├── 4c2b32ee9959…/                # イメージのレイヤー（COPY . .）
+│   │   ├── diff/                     #   レイヤーの中身そのもの
+│   │   ├── link                      #   l/ 配下の短縮名
+│   │   ├── lower                     #   下の層の短縮名を : で連結
+│   │   └── work/
+│   ├── da2ecc9f0374…-init/           # Docker が差し込む -init 層
+│   └── da2ecc9f0374…/                # コンテナの RW 層
+│       ├── diff/                     #   = upperdir
+│       ├── merged/                   #   = コンテナの /
+│       ├── work/                     #   = workdir
+│       ├── link
+│       └── lower
+└── volumes/
+    ├── metadata.db
+    └── pgdata/_data/                 # docker volume の実体</pre>
+        <div class="note warn"><b>Engine 29 以降の新規インストール（containerd image store）では場所が違います。</b>レイヤーは containerd の snapshotter（<code>overlayfs</code>）が管理し、<code>docker info -f '{{ .DriverStatus }}'</code> が <code>[[driver-type io.containerd.snapshotter.v1]]</code> を返します。<code>/var/lib/docker/overlay2</code> は使われず、<code>docker inspect</code> の <code>GraphDriver.Data</code> も上の例のようには埋まりません。実際のマウントは <code>findmnt -t overlay</code> で確認できます（lowerdir / upperdir / workdir の仕組み自体は同じです）。従来の overlay2 に戻すには <code>/etc/docker/daemon.json</code> に <code>"features": {"containerd-snapshotter": false}</code> を書きます。</div>
+      </section>
+
+      <!-- 5. isolation -->
+      <section class="chapter" id="isolation">
+        <h2>隔離の実体：namespaces と cgroup v2</h2>
+        <p>ホストから見ればコンテナは<strong>普通のプロセス</strong>です。違うのは、<code>runc</code> が <code>clone(2)</code> に <code>CLONE_NEWPID</code> などのフラグを付けて「見える世界」を分け（namespaces）、<code>/sys/fs/cgroup/…/memory.max</code> などに書き込んで「使える量」を制限（cgroup）している点だけです。</p>
+
+        <div class="scene" id="sc-ns" data-title="PID 4321 と PID 1 は同じプロセス：/proc/&lt;pid&gt;/ns と cgroup ファイル">
+          <div class="stage" data-w="960" data-h="520">
+            <div class="zone" data-label="host の PID namespace（ps）" style="left:16px;top:16px;width:450px;height:286px"></div>
+            <div class="node lrow" data-el="h1" style="left:32px;top:40px;width:230px">
+              <b class="node-t">systemd</b><div class="node-s">PID 1</div>
+            </div>
+            <div class="node lrow" data-el="h2" style="left:52px;top:90px;width:230px">
+              <b class="node-t">containerd</b><div class="node-s">PID 812 · PPID 1</div>
+            </div>
+            <div class="node lrow" data-el="h3" style="left:52px;top:140px;width:230px">
+              <b class="node-t">containerd-shim-runc-v2</b><div class="node-s">PID 4298 · PPID 1</div>
+            </div>
+            <div class="node lrow acc" data-el="h4" style="left:82px;top:190px;width:210px">
+              <b class="node-t">node server.js</b><div class="node-s">PID 4321 · PPID 4298</div>
+            </div>
+            <div class="node lrow hide" data-el="h5" style="left:82px;top:240px;width:210px">
+              <b class="node-t">sleep 300</b><div class="node-s">PID 4388 · PPID 4298</div>
+            </div>
+            <div class="zone hide" data-el="cz" data-label="container web の namespaces" style="left:490px;top:16px;width:454px;height:286px"></div>
+            <div class="node lrow acc hide" data-el="c1" style="left:510px;top:190px;width:200px">
+              <b class="node-t">node server.js</b><div class="node-s">PID 1</div>
+            </div>
+            <div class="node lrow hide" data-el="c13" style="left:510px;top:240px;width:200px">
+              <b class="node-t">sleep 300</b><div class="node-s">PID 13</div>
+            </div>
+            <div class="chip hide" data-el="xh" style="left:510px;top:44px">hostname = e80ea0e0d391</div>
+            <div class="chip hide" data-el="xn" style="left:510px;top:78px">eth0 172.17.0.2/16（別の net ns）</div>
+            <div class="chip hide" data-el="xc" style="left:510px;top:112px">/proc/self/cgroup = 0::/</div>
+            <div class="file hide" data-el="nsf" style="left:16px;top:318px;width:450px">
+              <div class="file-h">readlink /proc/4321/ns/* ↔ /proc/1/ns/*</div>
+              <pre data-lang="text">type    container(4321)  host(1)
+cgroup  4026532384       4026531835
+ipc     4026532320       4026531839
+mnt     4026532318       4026531841
+net     4026532323       4026531840
+pid     4026532321       4026531836
+uts     4026532319       4026531838
+user    4026531837       4026531837  ← 共有</pre>
+            </div>
+            <div class="file hide" data-el="cg" style="left:490px;top:318px;width:454px">
+              <div class="file-h">/sys/fs/cgroup/system.slice/docker-e80e….scope/</div>
+              <div class="file-b">
+                <div class="kvrow"><span>cgroup.procs</span><b>4321 4388</b><small>プロセス一覧</small></div>
+                <div class="kvrow" data-el="k-mem"><span>memory.max</span><b data-el="mmax">268435456</b><small data-el="mnote">← --memory 256m</small></div>
+                <div class="kvrow"><span>memory.current</span><b>23801856</b><small>いまの使用量</small></div>
+                <div class="kvrow" data-el="k-cpu"><span>cpu.max</span><b>150000 100000</b><small>← --cpus 1.5</small></div>
+                <div class="kvrow"><span>pids.max</span><b>max</b><small>--pids-limit なし</small></div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <h3>namespace の種類と Docker の既定</h3>
+        <div class="tbl">
+          <table class="ref">
+            <thead><tr><th>namespace</th><th>clone フラグ</th><th>分けるもの</th><th>Docker の既定 / 共有するオプション</th></tr></thead>
+            <tbody>
+              <tr><td><code>pid</code></td><td><code>CLONE_NEWPID</code></td><td>PID 番号空間（中では自分が PID 1）</td><td>新規 / <code>--pid=host</code>, <code>--pid=container:&lt;name&gt;</code></td></tr>
+              <tr><td><code>net</code></td><td><code>CLONE_NEWNET</code></td><td>NIC・IP アドレス・ルート・iptables・ポート番号</td><td>新規 / <code>--network=host</code>, <code>none</code>, <code>container:&lt;name&gt;</code></td></tr>
+              <tr><td><code>mnt</code></td><td><code>CLONE_NEWNS</code></td><td>マウントツリー（rootfs は overlay の merged）</td><td>新規</td></tr>
+              <tr><td><code>uts</code></td><td><code>CLONE_NEWUTS</code></td><td>hostname / domainname</td><td>新規（hostname はコンテナ ID 先頭 12 桁）/ <code>-h</code>, <code>--uts=host</code></td></tr>
+              <tr><td><code>ipc</code></td><td><code>CLONE_NEWIPC</code></td><td>System V IPC、POSIX メッセージキュー</td><td>新規 / <code>--ipc=host</code>, <code>--ipc=container:&lt;name&gt;</code></td></tr>
+              <tr><td><code>cgroup</code></td><td><code>CLONE_NEWCGROUP</code></td><td><code>/proc/self/cgroup</code> と <code>/sys/fs/cgroup</code> の見え方</td><td>cgroup v2 では新規（<code>--cgroupns=private</code>）/ <code>--cgroupns=host</code></td></tr>
+              <tr><td><code>user</code></td><td><code>CLONE_NEWUSER</code></td><td>UID / GID の対応付け</td><td><strong>既定では使わない</strong>（コンテナの root = ホストの uid 0）/ daemon の <code>userns-remap</code>、rootless モード</td></tr>
+              <tr><td><code>time</code></td><td><code>CLONE_NEWTIME</code></td><td><code>CLOCK_MONOTONIC</code> / <code>CLOCK_BOOTTIME</code> のオフセット</td><td>使わない</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <h3>docker run のフラグ → cgroup v2 のファイル</h3>
+        <div class="tbl">
+          <table class="ref">
+            <thead><tr><th>フラグ</th><th>書き込まれるファイル</th><th>値の例</th></tr></thead>
+            <tbody>
+              <tr><td><code>-m, --memory 256m</code></td><td><code>memory.max</code></td><td><code>268435456</code>（超えると cgroup 内で OOM Kill）</td></tr>
+              <tr><td><code>--memory-swap 512m</code></td><td><code>memory.swap.max</code></td><td><code>268435456</code>（512m − 256m。<code>--memory</code> と同値なら 0 = swap なし）</td></tr>
+              <tr><td><code>--memory-reservation 128m</code></td><td><code>memory.low</code></td><td><code>134217728</code></td></tr>
+              <tr><td><code>--cpus 1.5</code></td><td><code>cpu.max</code></td><td><code>150000 100000</code>（100ms 周期あたり 150ms）</td></tr>
+              <tr><td><code>--cpuset-cpus 0,1</code></td><td><code>cpuset.cpus</code></td><td><code>0-1</code></td></tr>
+              <tr><td><code>--pids-limit 100</code></td><td><code>pids.max</code></td><td><code>100</code>（fork 爆弾対策）</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>パスは systemd cgroup driver の場合 <code>/sys/fs/cgroup/system.slice/docker-&lt;コンテナID&gt;.scope/</code> です（<code>docker info</code> の <code>Cgroup Driver: systemd</code> / <code>Cgroup Version: 2</code> で確認）。<code>docker update --memory 512m web</code> は実行中のコンテナのこのファイルを書き換えます。</p>
+      </section>
+
+      <!-- 6. network -->
+      <section class="chapter" id="network">
+        <h2>ネットワーク：docker0・veth・iptables DNAT</h2>
+        <p>既定の <code>bridge</code> ネットワークでは、ホストに Linux ブリッジ <code>docker0</code>（<code>172.17.0.1/16</code>）があり、コンテナごとに <strong>veth ペア</strong>（片方はブリッジ、片方はコンテナの net namespace 内の <code>eth0</code>）が作られます。<code>-p 8080:3000</code> は <strong>iptables の nat テーブルの DNAT ルール</strong>と <code>docker-proxy</code> プロセスになります。</p>
+
+        <div class="scene" id="sc-net" data-title="-p 8080:3000 の正体：DNAT → docker0 → veth → eth0">
+          <div class="stage" data-w="960" data-h="520">
+            <div class="node" data-el="client" style="left:16px;top:70px;width:150px">
+              <div class="node-h"><i data-icon="laptop"></i><b class="node-t">client</b></div>
+              <div class="node-s">192.0.2.10</div>
+            </div>
+            <div class="zone" data-label="host · 198.51.100.20" style="left:190px;top:16px;width:754px;height:488px"></div>
+            <div class="node" data-el="eth0" style="left:208px;top:70px;width:160px">
+              <div class="node-h"><i data-icon="network"></i><b class="node-t">eth0</b></div>
+              <div class="node-s">198.51.100.20</div>
+            </div>
+            <div class="node hide" data-el="ipt" style="left:396px;top:40px;width:384px">
+              <div class="node-h"><i data-icon="shield"></i><b class="node-t">iptables -t nat</b></div>
+              <dl class="kv">
+                <dt>PREROUTING</dt><dd>--dst-type LOCAL → DOCKER</dd>
+                <dt>DOCKER</dt><dd>tcp dpt:8080 ! -i docker0</dd>
+                <dt>→ DNAT</dt><dd class="acc">to:172.17.0.2:3000</dd>
+                <dt>POSTROUTING</dt><dd>MASQUERADE 172.17.0.0/16 ! -o docker0</dd>
+              </dl>
+            </div>
+            <div class="node sm hide" data-el="proxy" style="left:798px;top:40px;width:136px">
+              <div class="node-h"><i data-icon="arrow"></i><b class="node-t">docker-proxy</b></div>
+              <div class="node-s">0.0.0.0:8080</div>
+            </div>
+            <div class="chip hide" data-el="local" style="left:780px;top:112px">curl localhost:8080</div>
+            <div class="node" data-el="br" style="left:396px;top:230px;width:250px">
+              <div class="node-h"><i data-icon="router"></i><b class="node-t">docker0（bridge）</b></div>
+              <div class="node-s">172.17.0.1/16</div>
+            </div>
+            <div class="node hide" data-el="veth" style="left:396px;top:340px;width:250px">
+              <div class="node-h"><i data-icon="link"></i><b class="node-t">veth3a1f2c9</b></div>
+              <div class="node-s">master docker0 · ifindex 7</div>
+            </div>
+            <div class="zone hide" data-el="cns" data-label="net namespace · web" style="left:680px;top:210px;width:250px;height:204px"></div>
+            <div class="node hide" data-el="ceth" style="left:698px;top:238px;width:214px">
+              <div class="node-h"><i data-icon="network"></i><b class="node-t">eth0@if7</b></div>
+              <div class="node-s">172.17.0.2/16 · gw 172.17.0.1</div>
+            </div>
+            <div class="node hide" data-el="app" style="left:698px;top:342px;width:214px">
+              <div class="node-h"><i data-icon="code"></i><b class="node-t">node server.js</b></div>
+              <div class="node-s">listen 0.0.0.0:3000</div>
+            </div>
+            <div class="chip hide" data-el="ct" style="left:208px;top:432px">conntrack: 192.0.2.10:51234 → :8080 ⇄ 172.17.0.2:3000</div>
+            <div class="chip hide" data-el="fw" style="left:208px;top:466px">net.ipv4.ip_forward = 1</div>
+            <div class="chip hide" data-el="dns" style="left:680px;top:432px">/etc/resolv.conf ← host のコピー</div>
+          </div>
+        </div>
+
+        <pre data-lang="bash" data-title="sudo iptables -t nat -S（Docker が入れるルール。-p 8080:3000 のコンテナが 1 つ）">-N DOCKER
+-A PREROUTING -m addrtype --dst-type LOCAL -j DOCKER
+-A OUTPUT ! -d 127.0.0.0/8 -m addrtype --dst-type LOCAL -j DOCKER
+-A POSTROUTING -s 172.17.0.0/16 ! -o docker0 -j MASQUERADE
+-A DOCKER -i docker0 -j RETURN
+⟪-A DOCKER ! -i docker0 -p tcp -m tcp --dport 8080 -j DNAT --to-destination 172.17.0.2:3000⟫</pre>
+        <ul>
+          <li><code>PREROUTING</code>：ホスト自身の IP 宛て（<code>--dst-type LOCAL</code>）のパケットを <code>DOCKER</code> チェーンへ。ここで宛先が <code>172.17.0.2:3000</code> に書き換わり、以降は FORWARD 経路で docker0 に流れます。</li>
+          <li><code>OUTPUT</code>：ホスト上のプロセスからの通信も対象。ただし <code>127.0.0.0/8</code> 宛ては除外されるので、<code>curl localhost:8080</code> は <code>docker-proxy</code> が受けて中継します。</li>
+          <li><code>POSTROUTING</code>：コンテナから外への通信を MASQUERADE（送信元をホストの IP に）。<code>net.ipv4.ip_forward=1</code> も Docker が有効にします。</li>
+          <li>Docker 28 以降は filter テーブルに <code>DOCKER-USER</code>、<code>DOCKER-FORWARD</code>、<code>DOCKER-BRIDGE</code>、<code>DOCKER-CT</code> などのチェーンも作られます。独自の制限は <code>DOCKER-USER</code> に書きます。</li>
+        </ul>
+        <p>サービス名で名前解決できるのは<strong>ユーザー定義ネットワーク</strong>（<code>docker network create</code>、Compose の既定）だけで、そこではコンテナの <code>/etc/resolv.conf</code> が組み込み DNS <code>127.0.0.11</code> を指します。詳しくは <a href="../docker-compose/">Docker Compose</a> と <a href="../dns/">DNS</a> のページへ。</p>
+      </section>
+
+      <!-- 7. failures -->
+      <section class="chapter" id="failures">
+        <h2>失敗ケース：ポート衝突・OOM Kill・stop に 10 秒</h2>
+        <p>現場でよく見る 3 つの失敗を、実際のエラーメッセージ・<code>docker inspect</code> の値・カーネルログで追います。どれも「どこで」失敗しているか（dockerd のポート割り当て／カーネルの OOM killer／PID 1 のシグナル処理）が分かれば迷いません。</p>
+
+        <div class="scene" id="sc-fail" data-title="失敗ケース：port is already allocated / OOMKilled / SIGTERM 無視">
+          <div class="stage" data-w="960" data-h="500">
+            <div class="node" data-el="k1" style="left:16px;top:16px;width:296px">
+              <div class="node-h"><i data-icon="network"></i><b class="node-t">① ポート衝突</b></div>
+              <div class="node-s">Bind for 0.0.0.0:8080 failed</div>
+            </div>
+            <div class="node" data-el="k2" style="left:332px;top:16px;width:296px">
+              <div class="node-h"><i data-icon="db"></i><b class="node-t">② OOM Kill</b></div>
+              <div class="node-s">Exited (137) · OOMKilled=true</div>
+            </div>
+            <div class="node" data-el="k3" style="left:648px;top:16px;width:296px">
+              <div class="node-h"><i data-icon="clock"></i><b class="node-t">③ stop に 10 秒</b></div>
+              <div class="node-s">SIGTERM 無視 → SIGKILL</div>
+            </div>
+            <div class="term" data-el="t" style="left:16px;top:100px;width:560px;height:384px">
+              <div class="term-h">bash</div>
+              <div class="term-b"></div>
+            </div>
+            <!-- case 1 -->
+            <div class="node hide" data-el="a1" style="left:596px;top:100px;width:348px">
+              <div class="node-h"><i data-icon="box"></i><b class="node-t">web（running）</b></div>
+              <div class="node-s">0.0.0.0:8080-&gt;3000/tcp を確保済み</div>
+            </div>
+            <div class="node hide" data-el="a2" style="left:596px;top:200px;width:348px">
+              <div class="node-h"><i data-icon="box"></i><b class="node-t">web2（Created）</b></div>
+              <div class="node-s">-p 8080:3000 を要求 → start で失敗</div>
+            </div>
+            <div class="chip hide c-green" data-el="a3" style="left:596px;top:300px">web2 は -p 8081:3000 で起動</div>
+            <!-- case 2 -->
+            <div class="node hide" data-el="b1" style="left:596px;top:100px;width:348px">
+              <div class="node-h"><i data-icon="gear"></i><b class="node-t">hog の cgroup</b></div>
+              <dl class="kv">
+                <dt>memory.max</dt><dd>268435456</dd>
+                <dt>memory.swap.max</dt><dd>0</dd>
+                <dt>memory.events</dt><dd>oom_kill <span data-el="bk">0</span></dd>
+              </dl>
+            </div>
+            <div class="gauge hide" data-el="b2" style="left:596px;top:236px;width:348px">
+              <div class="g-h"><span>memory.current</span><span data-el="bv">0 / 256 MiB</span></div>
+              <div class="g-t"><i data-el="bbar"></i></div>
+            </div>
+            <div class="chip hide c-red" data-el="b3" style="left:596px;top:306px">Killed process 5120 (python3)</div>
+            <div class="chip hide c-red" data-el="b4" style="left:596px;top:342px">OOMKilled=true · ExitCode=137</div>
+            <!-- case 3 -->
+            <div class="node hide" data-el="p1" style="left:596px;top:100px;width:348px">
+              <div class="node-h"><i data-icon="terminal"></i><b class="node-t">PID 1: /bin/sh /app/start.sh</b></div>
+              <div class="node-s">SIGTERM のハンドラなし（exec し忘れ）</div>
+            </div>
+            <div class="node hide" data-el="p2" style="left:626px;top:190px;width:318px">
+              <div class="node-h"><i data-icon="code"></i><b class="node-t">PID 7: node server.js</b></div>
+              <div class="node-s">SIGTERM が届かない</div>
+            </div>
+            <div class="tline hide" data-el="p3" style="left:596px;top:286px;width:348px">
+              <div class="g-h"><span>SIGTERM</span><span class="sec" data-el="psec">0.0 s</span><span>SIGKILL</span></div>
+              <div class="g-t"><i data-el="pbar"></i></div>
+            </div>
+            <div class="chip hide c-green" data-el="p4" style="left:596px;top:356px">exec node server.js / --init → 0.4 s</div>
+          </div>
+        </div>
+
+        <h3>終了コードの読み方</h3>
+        <div class="tbl">
+          <table class="ref">
+            <thead><tr><th>コード</th><th>意味</th><th>典型例</th></tr></thead>
+            <tbody>
+              <tr><td><code>125</code></td><td><code>docker run</code> 自体が失敗（daemon のエラー）</td><td><code>port is already allocated</code>、不正なフラグ</td></tr>
+              <tr><td><code>126</code></td><td>コマンドは見つかったが実行できない</td><td>実行権限のないスクリプトを CMD にした</td></tr>
+              <tr><td><code>127</code></td><td>コマンドが見つからない</td><td>alpine に <code>bash</code> が無いのに <code>CMD ["bash", …]</code></td></tr>
+              <tr><td><code>137</code></td><td>128 + 9：SIGKILL で終了</td><td>OOM Kill、<code>docker kill</code>、<code>docker stop</code> のタイムアウト。<strong>OOM かどうかは <code>.State.OOMKilled</code> で判別</strong></td></tr>
+              <tr><td><code>143</code></td><td>128 + 15：SIGTERM で終了</td><td>ハンドラを持たないプロセスが <code>docker stop</code> の SIGTERM で終了（PID 1 以外、または <code>--init</code> 配下）</td></tr>
+              <tr><td><code>139</code></td><td>128 + 11：SIGSEGV</td><td>ネイティブ拡張のクラッシュ</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="note bad"><b>PID 1 は特別：</b>Linux カーネルは、PID namespace の init（PID 1）に対しては<b>ハンドラを登録していないシグナルを配送しません</b>（SIGKILL / SIGSTOP を除く）。そのため <code>docker stop</code> の SIGTERM は、PID 1 がシェルや SIGTERM を処理しないプログラムだと無視され、猶予（既定 10 秒、<code>docker stop -t</code> / <code>--stop-timeout</code>）の後に SIGKILL されます。</div>
+      </section>
+
+      <!-- 8. CLI -->
+      <section class="chapter" id="cli">
+        <h2>コマンド早見表</h2>
+        <div class="tbl">
+          <table class="ref">
+            <thead><tr><th>コマンド</th><th>主なフラグ</th><th>何が起きるか（API / 実体）</th></tr></thead>
+            <tbody>
+              <tr><td><code>docker build -t web:1.0 .</code></td><td><code>-f</code> Dockerfile 指定, <code>--no-cache</code>, <code>--progress=plain</code>, <code>--target</code>, <code>--build-arg</code>, <code>--secret id=…,src=…</code>, <code>--platform</code></td><td>context を BuildKit に送り、命令ごとにレイヤーを作る</td></tr>
+              <tr><td><code>docker run IMAGE [CMD]</code></td><td><code>-d</code>, <code>--name</code>, <code>-p 8080:3000</code>, <code>-v vol:/data</code>, <code>-e K=V</code>, <code>--rm</code>, <code>-it</code>, <code>-m 256m</code>, <code>--cpus 1.5</code>, <code>--init</code>, <code>--network</code>, <code>--restart unless-stopped</code></td><td><code>POST /containers/create</code> → <code>POST /containers/{id}/start</code>（イメージが無ければ先に pull）</td></tr>
+              <tr><td><code>docker ps</code></td><td><code>-a</code> 停止中も, <code>-q</code> ID のみ, <code>--filter publish=8080</code>, <code>--format '{{.Names}} {{.Status}}'</code></td><td><code>GET /containers/json</code></td></tr>
+              <tr><td><code>docker exec -it web sh</code></td><td><code>-u</code> ユーザー, <code>-w</code> 作業ディレクトリ, <code>-e</code></td><td>既存の namespaces に新しいプロセスを入れる（<code>POST /containers/{id}/exec</code>）</td></tr>
+              <tr><td><code>docker logs web</code></td><td><code>-f</code>, <code>--tail 100</code>, <code>--since 10m</code>, <code>-t</code></td><td><code>/var/lib/docker/containers/&lt;id&gt;/&lt;id&gt;-json.log</code> を読む（json-file ドライバ）</td></tr>
+              <tr><td><code>docker inspect web</code></td><td><code>-f '{{.State.Pid}}'</code>, <code>-f '{{json .GraphDriver.Data}}'</code>, <code>--type image</code></td><td><code>GET /containers/{id}/json</code> の生 JSON</td></tr>
+              <tr><td><code>docker top web</code></td><td><code>[ps のオプション]</code></td><td>ホスト側 PID でコンテナ内のプロセス一覧</td></tr>
+              <tr><td><code>docker stats</code></td><td><code>--no-stream</code>, <code>--format</code></td><td>cgroup の <code>memory.current</code> / <code>cpu.stat</code> などを集計</td></tr>
+              <tr><td><code>docker stop web</code> / <code>docker kill web</code></td><td><code>-t 30</code> 猶予秒 / <code>-s SIGHUP</code></td><td>stop：STOPSIGNAL（既定 SIGTERM）→ 猶予後 SIGKILL。kill：即 SIGKILL（既定）</td></tr>
+              <tr><td><code>docker rm web</code></td><td><code>-f</code> 実行中も, <code>-v</code> 匿名ボリュームも</td><td>upperdir（<code>overlay2/&lt;id&gt;/diff</code>）ごと削除</td></tr>
+              <tr><td><code>docker images</code> / <code>docker image ls</code></td><td><code>--digests</code>, <code>-a</code>, <code>--filter dangling=true</code></td><td>タグと Image ID（classic store では config の sha256）</td></tr>
+              <tr><td><code>docker rmi web:1.0</code></td><td><code>-f</code></td><td>タグを外し、参照が無くなったレイヤーを削除</td></tr>
+              <tr><td><code>docker pull</code> / <code>push</code> / <code>tag</code></td><td><code>--platform linux/arm64</code>, <code>-a</code></td><td>Registry HTTP API で manifest → blob を取得 / 送信</td></tr>
+              <tr><td><code>docker image inspect web:1.0</code></td><td><code>-f '{{json .RootFS.Layers}}'</code>, <code>-f '{{.Id}}'</code></td><td>config の中身（diff_ids など）</td></tr>
+              <tr><td><code>docker history web:1.0</code></td><td><code>--no-trunc</code>, <code>--format</code></td><td>config の <code>history[]</code> と各層のサイズ</td></tr>
+              <tr><td><code>docker save</code> / <code>docker load</code></td><td><code>-o web.tar</code> / <code>-i web.tar</code></td><td>OCI Image Layout の tar を書き出し / 取り込み</td></tr>
+              <tr><td><code>docker diff web</code></td><td>—</td><td>upperdir の変更一覧（<code>A</code> 追加 / <code>C</code> 変更 / <code>D</code> 削除）</td></tr>
+              <tr><td><code>docker cp web:/app/log.txt .</code></td><td><code>-a</code></td><td>コンテナの merged ビューとの間でコピー</td></tr>
+              <tr><td><code>docker commit web web:patched</code></td><td><code>-c 'CMD …'</code></td><td>upperdir を新しいレイヤーにしてイメージ化</td></tr>
+              <tr><td><code>docker update web</code></td><td><code>--memory 512m</code>, <code>--cpus 2</code>, <code>--restart</code></td><td>実行中の cgroup ファイルを書き換え</td></tr>
+              <tr><td><code>docker network ls</code> / <code>inspect bridge</code> / <code>create appnet</code></td><td><code>-f '{{json .IPAM.Config}}'</code>, <code>--subnet</code></td><td>ブリッジ・IPAM・接続中コンテナ</td></tr>
+              <tr><td><code>docker volume ls</code> / <code>inspect</code></td><td><code>-f '{{.Mountpoint}}'</code></td><td><code>/var/lib/docker/volumes/&lt;name&gt;/_data</code></td></tr>
+              <tr><td><code>docker events</code></td><td><code>--filter event=oom</code>, <code>--since 1h</code></td><td><code>GET /events</code>：create / start / die / oom などのストリーム</td></tr>
+              <tr><td><code>docker system df</code></td><td><code>-v</code></td><td>Images / Containers / Local Volumes / Build Cache の使用量</td></tr>
+              <tr><td><code>docker system prune</code></td><td><code>-a</code> 未使用イメージも, <code>--volumes</code>, <code>--filter until=24h</code></td><td>停止コンテナ・未使用ネットワーク・dangling イメージ・ビルドキャッシュを削除</td></tr>
+              <tr><td><code>docker builder prune</code></td><td><code>-a</code>, <code>--keep-storage 10GB</code></td><td>BuildKit のキャッシュ（<code>/var/lib/docker/buildkit</code>）を削除</td></tr>
+              <tr><td><code>docker context ls</code> / <code>use</code></td><td>—</td><td>接続先（<code>unix:///var/run/docker.sock</code>、<code>ssh://user@host</code> など）の切り替え</td></tr>
+              <tr><td><code>docker info</code></td><td><code>-f '{{.CgroupVersion}} {{.Driver}}'</code></td><td>Storage Driver / Cgroup Driver / Docker Root Dir など daemon の設定</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- 9. config files -->
+      <section class="chapter" id="config">
+        <h2>設定ファイル：daemon.json と ~/.docker/config.json</h2>
+        <div class="cols">
+          <div>
+            <pre data-lang="json" data-title="/etc/docker/daemon.json（dockerd の設定）">{
+  "data-root": "/var/lib/docker",
+  "storage-driver": "overlay2",
+  "features": { "containerd-snapshotter": false },
+  "exec-opts": ["native.cgroupdriver=systemd"],
+  "log-driver": "json-file",
+  "log-opts": { "max-size": "10m", "max-file": "3" },
+  "bip": "172.17.0.1/16",
+  "default-address-pools": [
+    { "base": "10.200.0.0/16", "size": 24 }
+  ],
+  "live-restore": true,
+  "userland-proxy": true,
+  "registry-mirrors": ["https://mirror.example.com"]
+}</pre>
+            <p>反映は <code>sudo systemctl restart docker</code>。<code>log-opts</code> を設定しないと json-file ログは<strong>無制限に増えます</strong>。<code>live-restore</code> を有効にすると dockerd の再起動中もコンテナ（shim 配下のプロセス）が動き続けます。<code>default-address-pools</code> は <code>docker network create</code> が払い出すサブネット（社内 LAN と 172.x が衝突するときに変更）。</p>
+          </div>
+          <div>
+            <pre data-lang="json" data-title="~/.docker/config.json（CLI の設定）">{
+  "auths": {
+    "registry.example.com": {}
+  },
+  "credsStore": "secretservice",
+  "currentContext": "default",
+  "psFormat": "table {{.Names}}\t{{.Status}}\t{{.Ports}}",
+  "detachKeys": "ctrl-e,e"
+}</pre>
+            <p><code>credsStore</code> を設定すると、<code>docker login</code> の資格情報は OS のキーチェーン等（<code>docker-credential-secretservice</code> / <code>-osxkeychain</code> / <code>-wincred</code> / <code>-desktop</code>）に保存され、<code>auths</code> には空オブジェクトだけが残ります。</p>
+            <div class="note warn">credential helper が無い環境では <code>"auth": "YWxpY2U6czNjcjN0LXRva2Vu"</code> のように <b><code>ユーザー名:パスワード</code> の base64</b>（この例は <code>alice:s3cr3t-token</code>）がそのまま書かれます。暗号化ではありません。</div>
+          </div>
+        </div>
+      </section>
+
+      <!-- 10. try -->
+      <section class="chapter" id="tryit">
+        <h2>手元で試す</h2>
+        <p>Linux ホスト（Docker Engine 28 系・overlay2・cgroup v2）で、このページの出力をそのまま再現する手順です。Docker Desktop の場合は後述の「VM に入る」コマンドで dockerd の動いている VM に入ってから <code>/proc</code> や <code>/var/lib/docker</code> を見てください。</p>
+        <pre data-lang="bash" data-title="1. アプリとイメージを作る">mkdir -p ~/web/src && cd ~/web
+cat > server.js &lt;&lt;'EOF'
+const http = require('http');
+const os = require('os');
+const server = http.createServer((req, res) => res.end(`hello from ${os.hostname()}\n`));
+server.listen(3000, () => console.log('listening on :3000'));
+process.on('SIGTERM', () => server.close(() => process.exit(0)));
+EOF
+echo '# web' > README.md
+echo '{ "name": "web", "version": "1.0.0", "private": true, "main": "server.js" }' > package.json
+printf 'node_modules\n.git\n*.log\n.env\n' > .dockerignore
+# package-lock.json を node の入ったコンテナで作る（ホストに node 不要）
+docker run --rm -v "$PWD":/app -w /app node:22-alpine npm install --package-lock-only
+cat > Dockerfile &lt;&lt;'EOF'
+FROM node:22-alpine
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev
+COPY . .
+EXPOSE 3000
+CMD ["node", "server.js"]
+EOF
+docker build -t web:1.0 .
+docker history web:1.0
+echo '// v1.1' >> server.js && docker build -t web:1.1 .     # CACHED を確認</pre>
+        <pre data-lang="bash" data-title="2. 起動して API・プロセス・namespace・cgroup を見る">docker run -d --name web -p 8080:3000 --memory 256m --cpus 1.5 web:1.0
+curl -s http://localhost:8080/
+curl -s --unix-socket /var/run/docker.sock http://localhost/v1.51/containers/json | jq '.[] | {Names, State, Ports}'
+PID=$(docker inspect -f '{{.State.Pid}}' web); echo "$PID"
+docker top web
+docker exec web ps
+grep NSpid /proc/$PID/status
+sudo ls -l /proc/$PID/ns
+sudo lsns -p $PID
+CID=$(docker inspect -f '{{.Id}}' web)
+cat /sys/fs/cgroup/system.slice/docker-$CID.scope/memory.max /sys/fs/cgroup/system.slice/docker-$CID.scope/cpu.max</pre>
+        <pre data-lang="bash" data-title="3. overlay2 と Copy-on-Write">docker inspect -f '{{json .GraphDriver.Data}}' web | jq
+mount -t overlay
+docker exec web sh -c 'echo "// patched" >> /app/server.js && touch /tmp/cache.db && rm /app/README.md'
+docker diff web
+UPPER=$(docker inspect -f '{{.GraphDriver.Data.UpperDir}}' web)
+sudo find "$UPPER" -mindepth 1 -printf '%y %p\n'      # README.md は c（whiteout）</pre>
+        <pre data-lang="bash" data-title="4. ネットワークとイメージの中身">ip -br addr show docker0
+ip -br link show master docker0
+sudo iptables -t nat -L DOCKER -n
+sudo ss -ltnp 'sport = :8080'
+docker save web:1.0 -o web.tar && mkdir -p img && tar -xf web.tar -C img
+jq . img/index.json
+jq . img/blobs/sha256/$(jq -r '.manifests[0].digest' img/index.json | cut -d: -f2)
+sha256sum img/blobs/sha256/* | head</pre>
+        <pre data-lang="bash" data-title="5. 失敗ケースを再現する">docker run -d --name web2 -p 8080:3000 web:1.0; echo "exit=$?"         # 125: port is already allocated
+docker rm web2
+docker run --name hog -m 256m --memory-swap 256m python:3.12-alpine \
+  python3 -c "b = b'x' * (512 * 1024 * 1024)"; echo "exit=$?"            # 137
+docker inspect -f 'exit={{.State.ExitCode}} oom={{.State.OOMKilled}}' hog
+sudo journalctl -k | grep -i 'out of memory' | tail -1
+docker rm hog
+# 後片付け
+docker rm -f web && docker rmi web:1.0 web:1.1</pre>
+        <pre data-lang="bash" data-title="Docker Desktop（macOS / Windows）で VM の中に入る">docker run -it --rm --privileged --pid=host alpine nsenter -t 1 -m -u -n -i sh
+# ここが dockerd の動いている Linux VM。/var/lib/docker や /proc/&lt;pid&gt;/ns はこの中にある</pre>
+      </section>
+
+      <!-- 11. pitfalls -->
+      <section class="chapter" id="pitfalls">
+        <h2>ハマりどころ</h2>
+        <div class="note warn"><b><code>latest</code> は「最新」ではありません。</b>タグを省略したときに補われるだけの普通のタグ名で、いつ誰が付け替えたかは分かりません。本番では <code>node:22-alpine@sha256:…</code> のように digest で固定するか、少なくともバージョンタグを使います。同じタグでも pull した時期で中身（digest）が変わります。</div>
+        <div class="note bad"><b>秘密情報は後から消してもレイヤーに残ります。</b><code>COPY .env .</code> の後に <code>RUN rm .env</code> しても、COPY の層の tar には入ったままで、<code>docker save</code> して展開すれば誰でも読めます。<code>ENV</code> / <code>ARG</code> の値も config や <code>docker history</code> に残ります。ビルド時の秘密は <code>RUN --mount=type=secret,id=npmrc,target=/root/.npmrc npm ci</code> ＋ <code>docker build --secret id=npmrc,src=$HOME/.npmrc .</code> で渡します（どの層にも書かれません）。</div>
+        <div class="note warn"><b>exec 形式と shell 形式。</b><code>CMD node server.js</code>（shell 形式）は <code>["/bin/sh", "-c", "node server.js"]</code> として保存され、シェルが間に入ります（シェルの実装によっては単一コマンドを exec で置き換えることもあり、挙動が環境依存）。<code>CMD ["node", "server.js"]</code>（exec 形式）ならアプリが直接 PID 1 になります。起動スクリプトの最後は <code>exec "$@"</code> / <code>exec node server.js</code>。確実にしたいなら <code>docker run --init</code>。</div>
+        <div class="note warn"><b>Docker Desktop は VM の中で動いています。</b>macOS / Windows の Docker Desktop では dockerd・<code>/var/lib/docker</code>・<code>/proc/&lt;pid&gt;</code>・iptables は Linux VM（Windows は WSL 2）の中にあり、ホスト OS からは見えません。<code>-v</code> のホストパスは VM へのファイル共有を経由するので遅く、パーミッションの見え方も Linux と異なります。コンテナからホストへは <code>host.docker.internal</code> を使います。</div>
+        <div class="note bad"><b><code>-p</code> は ufw / firewalld を素通りします。</b>DNAT は nat テーブルの PREROUTING で行われ、パケットは INPUT ではなく FORWARD を通るため、ufw の INPUT ルールでは止まりません。外に出したくないポートは <code>-p 127.0.0.1:8080:3000</code> のようにバインド先を限定するか、<code>DOCKER-USER</code> チェーンで制限します。</div>
+        <div class="note bad"><b><code>/var/run/docker.sock</code> へのアクセスは root 権限と同じです。</b><code>docker</code> グループに入れる、ソケットをコンテナに <code>-v /var/run/docker.sock:/var/run/docker.sock</code> でマウントする、TCP で無認証公開する——いずれも <code>docker run -v /:/host --privileged …</code> でホストを乗っ取れることを意味します。</div>
+        <div class="note warn"><b>書き込みは <code>docker rm</code> で消えます。</b>コンテナ内の変更は upperdir（<code>overlay2/&lt;id&gt;/diff</code>）にあり、コンテナ削除と同時に消えます。DB などのデータは <code>-v 名前:/path</code>（<code>/var/lib/docker/volumes/名前/_data</code>）か bind mount に置きます。copy_up はファイル丸ごとのコピーなので、巨大ファイルを少しだけ書き換える処理も遅くなります。</div>
+        <div class="note warn"><b>ディスクが静かに埋まります。</b>json-file ログ（<code>log-opts</code> 未設定だと無制限）、dangling イメージ、ビルドキャッシュ、停止コンテナの upperdir。<code>docker system df</code> で内訳を見て、<code>docker system prune</code> / <code>docker builder prune</code> で掃除します。</div>
+        <div class="note"><b>Engine 29 以降の新規インストールはパスが違います。</b>containerd image store が既定になり、<code>/var/lib/docker/overlay2</code> や <code>GraphDriver.Data</code> を前提にしたスクリプトは動きません。<code>docker info -f '{{ .DriverStatus }}'</code> で確認してください。</div>
+      </section>
+
+      <!-- 12. spec -->
+      <section class="chapter" id="spec">
+        <h2>仕様・参考</h2>
+        <ul>
+          <li><a href="https://docs.docker.com/reference/api/engine/" target="_blank" rel="noopener">Docker Engine API</a>（バージョン対応表：Engine 28.5 = API v1.51 / 29.x = v1.52〜）</li>
+          <li><a href="https://docs.docker.com/reference/dockerfile/" target="_blank" rel="noopener">Dockerfile reference</a> ／ <a href="https://docs.docker.com/build/cache/" target="_blank" rel="noopener">Docker build cache</a> ／ <a href="https://docs.docker.com/build/concepts/context/" target="_blank" rel="noopener">Build context と .dockerignore</a></li>
+          <li><a href="https://docs.docker.com/engine/storage/drivers/overlayfs-driver/" target="_blank" rel="noopener">OverlayFS storage driver</a> ／ <a href="https://docs.docker.com/engine/storage/containerd/" target="_blank" rel="noopener">containerd image store</a></li>
+          <li><a href="https://docs.docker.com/engine/containers/resource_constraints/" target="_blank" rel="noopener">Resource constraints（--memory / --cpus）</a> ／ <a href="https://docs.docker.com/reference/cli/docker/container/run/" target="_blank" rel="noopener">docker container run（Exit status など）</a></li>
+          <li><a href="https://docs.docker.com/engine/network/firewall-iptables/" target="_blank" rel="noopener">Docker with iptables</a> ／ <a href="https://docs.docker.com/reference/cli/dockerd/" target="_blank" rel="noopener">dockerd（daemon.json）</a></li>
+          <li><a href="https://github.com/opencontainers/image-spec/blob/main/spec.md" target="_blank" rel="noopener">OCI Image Format Specification</a>（<a href="https://github.com/opencontainers/image-spec/blob/main/manifest.md" target="_blank" rel="noopener">manifest</a> / <a href="https://github.com/opencontainers/image-spec/blob/main/config.md" target="_blank" rel="noopener">config</a> / <a href="https://github.com/opencontainers/image-spec/blob/main/layer.md" target="_blank" rel="noopener">layer・whiteout</a> / <a href="https://github.com/opencontainers/image-spec/blob/main/image-layout.md" target="_blank" rel="noopener">image layout</a>）</li>
+          <li><a href="https://github.com/opencontainers/runtime-spec/blob/main/config.md" target="_blank" rel="noopener">OCI Runtime Specification — config.json</a> ／ <a href="https://github.com/opencontainers/runc" target="_blank" rel="noopener">runc</a> ／ <a href="https://github.com/containerd/containerd" target="_blank" rel="noopener">containerd</a></li>
+          <li><a href="https://docs.kernel.org/filesystems/overlayfs.html" target="_blank" rel="noopener">Linux kernel: Overlay Filesystem</a> ／ <a href="https://docs.kernel.org/admin-guide/cgroup-v2.html" target="_blank" rel="noopener">Control Group v2</a> ／ <a href="https://man7.org/linux/man-pages/man7/namespaces.7.html" target="_blank" rel="noopener">namespaces(7)</a> ／ <a href="https://man7.org/linux/man-pages/man7/pid_namespaces.7.html" target="_blank" rel="noopener">pid_namespaces(7)</a></li>
+          <li><a href="https://github.com/nodejs/docker-node/blob/main/docs/BestPractices.md" target="_blank" rel="noopener">docker-node Best Practices（PID 1 とシグナル）</a></li>
+        </ul>
+      </section>
+
+    </main>
+  </div>
+
+  <footer class="site-f"></footer>
+  <script src="../../assets/js/topics.js"></script>
+  <script src="../../assets/js/tim.js"></script>
+  <script src="scenes.js"></script>
+</body>
+</html>
