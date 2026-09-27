@@ -1,0 +1,177 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TECH IN MOTION — 見えないプロトコルを、動かして見る。</title>
+  <meta name="description" content="Docker, JWT, HTTPS/TLS, X.509, CA, DKIM, DNS, SSH, Git… わかりにくい IT 技術を、実際のコマンド・ファイル・ヘッダ・バイト列まで含めてモーショングラフィックスで可視化するエンジニア向け図鑑。">
+  <meta property="og:title" content="TECH IN MOTION">
+  <meta property="og:description" content="見えないプロトコルを、動かして見る。コマンド・ファイル・ヘッダ・バイト列まで可視化するエンジニア向け図鑑。">
+  <meta name="theme-color" content="#05080f">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect x='2' y='2' width='28' height='28' rx='8' fill='%2305080f' stroke='%2322d3ee' stroke-width='2'/%3E%3Cpath d='M8 20l5-8 4 5 3-4 4 7' fill='none' stroke='%23a78bfa' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Space+Grotesk:wght@500;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="assets/css/tim.css">
+  <link rel="stylesheet" href="assets/css/home.css">
+</head>
+<body data-root="./" class="home">
+  <header class="site-h"></header>
+
+  <!-- ================= HERO ================= -->
+  <section class="h-hero" id="top">
+    <canvas id="net" aria-hidden="true"></canvas>
+    <div class="hud hud-tl" aria-hidden="true"><b>SYS://TIM</b><span>v1.0 · static · no-build</span></div>
+    <div class="hud hud-tr" aria-hidden="true"><span>PACKETS</span><b id="hud-pk">0</b></div>
+    <div class="hud hud-bl" aria-hidden="true"><span>LAYER</span><b id="hud-layer">L7 · HTTP</b></div>
+    <div class="hud hud-br" aria-hidden="true"><span>RTT</span><b id="hud-rtt">— ms</b></div>
+    <div class="h-hero-in">
+      <p class="h-kicker">A VISUAL FIELD GUIDE FOR ENGINEERS</p>
+      <h1 class="h-title" aria-label="TECH IN MOTION">
+        <span class="w w1" data-w="TECH"></span>
+        <span class="w w2" data-w="IN"></span>
+        <span class="w w3" data-w="MOTION"></span>
+      </h1>
+      <p class="h-tag">見えないプロトコルを、<em>動かして</em>見る。</p>
+      <p class="h-sub">コマンド・ファイル・ヘッダ・バイト列まで。<br class="sp">概念図で終わらせない、エンジニアのための可視化図鑑。</p>
+      <div class="h-term" aria-live="off"><span class="h-term-p">$</span><span id="typer"></span><span class="h-caret"></span><a id="typer-topic" class="h-term-t" href="#topics"></a></div>
+      <div class="h-cta">
+        <a href="#map" class="btn pri">SITEMAP を見る</a>
+        <a href="#journey" class="btn">1 リクエストの旅 ▶</a>
+      </div>
+    </div>
+    <a class="h-scroll" href="#stats" aria-label="スクロール"><span>SCROLL</span><i></i></a>
+  </section>
+
+  <!-- ================= TICKER ================= -->
+  <div class="ticker" aria-hidden="true">
+    <div class="ticker-row" id="tick1"></div>
+    <div class="ticker-row rev" id="tick2"></div>
+  </div>
+
+  <main class="home-main">
+
+    <!-- ================= STATS ================= -->
+    <section class="stats" id="stats">
+      <div class="stat reveal"><b data-count="topics">0</b><span>TOPICS</span></div>
+      <div class="stat reveal"><b data-count="cats">0</b><span>CATEGORIES</span></div>
+      <div class="stat reveal"><b data-count="cmds">0</b><span>REAL COMMANDS ON THIS PAGE</span></div>
+      <div class="stat reveal"><b>0</b><span>BUILD STEPS · PURE HTML/JS</span></div>
+    </section>
+
+    <!-- ================= MAP ================= -->
+    <section class="h-sec" id="map">
+      <div class="sec-h reveal">
+        <span class="sec-no">01</span>
+        <h2>SITEMAP<small>トピックの星座図</small></h2>
+        <p>中心から 7 つのカテゴリ、その先に各トピック。破線は「一緒に理解すると効く」関連です。ノードにカーソルを合わせると中身のプレビュー、クリックで各ページへ。</p>
+      </div>
+      <div class="map-wrap" id="map-wrap">
+        <svg id="map-svg" viewBox="0 0 1200 760" role="img" aria-label="トピックのサイトマップ"></svg>
+        <div class="map-card" id="map-card" aria-live="polite"></div>
+      </div>
+    </section>
+
+    <!-- ================= TOPICS ================= -->
+    <section class="h-sec" id="topics">
+      <div class="sec-h reveal">
+        <span class="sec-no">02</span>
+        <h2>TOPICS<small>全トピック</small></h2>
+        <p>各ページは「全体像 → 実物の中身 → 処理の流れ → 失敗・改ざんケース → コマンド早見表 → 手元で試す」の順で構成されています。</p>
+      </div>
+      <div class="filters" id="filters" role="tablist" aria-label="カテゴリで絞り込み"></div>
+      <div class="grid" id="grid"></div>
+    </section>
+
+    <!-- ================= JOURNEY ================= -->
+    <section class="h-sec" id="journey">
+      <div class="sec-h reveal">
+        <span class="sec-no">03</span>
+        <h2>ONE REQUEST<small>1 リクエストの旅</small></h2>
+        <p><code>curl</code> を 1 回叩いただけで、DNS・TCP・TLS・証明書チェーン・HTTP・リバースプロキシ・コンテナ・JWT 検証が順番に走ります。各ステップから詳しいページへ飛べます。</p>
+      </div>
+
+      <div class="scene" id="sc-journey" data-title="curl -v https://api.example.com/v1/users/42 の裏側">
+        <div class="stage" data-w="960" data-h="500">
+          <div class="zone c-blue" data-label="your laptop" style="left:16px;top:22px;width:300px;height:460px"></div>
+          <div class="term" data-el="term" style="left:30px;top:44px;width:272px;height:214px">
+            <div class="term-h">zsh — ~/work</div>
+            <div class="term-b"></div>
+          </div>
+          <div class="node" data-el="client" style="left:30px;top:280px;width:272px">
+            <div class="node-h"><i data-icon="laptop"></i><b class="node-t">curl 8.x</b></div>
+            <div class="node-s">libcurl + OpenSSL 3 · trust store<br><b>/etc/ssl/certs/ca-certificates.crt</b></div>
+          </div>
+          <div class="chip hide c-blue" data-el="ipchip" style="left:30px;top:372px">api.example.com → 203.0.113.10</div>
+          <div class="chip hide c-green" data-el="chain" style="left:30px;top:408px">✔ chain: R11 → ISRG Root X1</div>
+
+          <div class="node c-blue" data-el="dns" style="left:360px;top:30px;width:230px">
+            <div class="node-h"><i data-icon="globe"></i><b class="node-t">DNS resolver</b></div>
+            <div class="node-s">192.0.2.53:53/udp</div>
+          </div>
+
+          <div class="zone c-violet" data-label="edge · 203.0.113.10" style="left:346px;top:140px;width:258px;height:342px"></div>
+          <div class="file hide c-violet" data-el="cert" style="left:356px;top:160px;width:238px">
+            <div class="file-h">fullchain.pem (leaf)</div>
+            <pre data-lang="cert">Subject: CN=api.example.com
+Issuer: O=Let's Encrypt, CN=R11
+Not After: Dec 27 2026 GMT
+SAN: DNS:api.example.com</pre>
+          </div>
+          <div class="node c-violet" data-el="nginx" style="left:362px;top:292px;width:226px">
+            <div class="node-h"><i data-icon="server"></i><b class="node-t">nginx :443</b></div>
+            <div class="node-s">TLS 終端 · reverse proxy</div>
+          </div>
+          <div class="chip hide c-violet" data-el="key" style="left:362px;top:372px"><i data-icon="key"></i>privkey.pem (0600) で署名</div>
+
+          <div class="zone c-cyan" data-label="docker network · app_default" style="left:640px;top:22px;width:304px;height:460px"></div>
+          <div class="node c-pink" data-el="auth" style="left:660px;top:46px;width:264px">
+            <div class="node-h"><i data-icon="key"></i><b class="node-t">auth.example.com</b></div>
+            <div class="node-s">/.well-known/jwks.json</div>
+          </div>
+          <div class="node c-cyan" data-el="api" style="left:660px;top:292px;width:264px">
+            <div class="node-h"><i data-icon="box"></i><b class="node-t">api (container)</b></div>
+            <div class="node-s">app-api-1 · 172.18.0.3:8080</div>
+          </div>
+          <div class="seg hide c-pink" data-el="jwt" style="left:660px;top:364px;width:264px">
+            <span class="c-pink"><small>header</small>eyJhbGci…</span><span class="c-violet"><small>payload</small>eyJzdWIi…</span><span class="c-cyan"><small>sig</small>Qm9i…</span>
+          </div>
+          <div class="file hide c-lime" data-el="json" style="left:660px;top:418px;width:264px">
+            <div class="file-h">200 OK · application/json</div>
+            <pre data-lang="json">{ "id": 42, "name": "alice",
+  "email": "alice@example.com" }</pre>
+          </div>
+        </div>
+      </div>
+
+      <div class="legend reveal">
+        <div><kbd>Space</kbd> 再生 / 一時停止</div>
+        <div><kbd>←</kbd> <kbd>→</kbd> ステップ移動</div>
+        <div><b class="lg-dot"></b> ドットでジャンプ</div>
+        <div><kbd>f</kbd> 全画面</div>
+        <div><b class="lg-sp">1.5×</b> 再生速度</div>
+      </div>
+    </section>
+
+    <!-- ================= PRINCIPLES ================= -->
+    <section class="h-sec" id="about">
+      <div class="sec-h reveal">
+        <span class="sec-no">04</span>
+        <h2>PRINCIPLES<small>このサイトの約束</small></h2>
+      </div>
+      <div class="principles">
+        <div class="pr reveal"><b>01</b><h3>実物を出す</h3><p>鍵と鍵穴の比喩ではなく、<code>openssl x509 -text</code> の出力、<code>/var/lib/docker/overlay2</code>、<code>DKIM-Signature: bh=</code> を見せます。</p></div>
+        <div class="pr reveal"><b>02</b><h3>どこで・何を・どうやって</h3><p>署名するのはどのホストのどのプロセスで、どのファイルの鍵を使い、どこで誰が検証するのか。</p></div>
+        <div class="pr reveal"><b>03</b><h3>失敗も動かす</h3><p>改ざん・期限切れ・設定ミスで、どのステップが何のエラーメッセージで止まるのかまで再生します。</p></div>
+        <div class="pr reveal"><b>04</b><h3>手元で再現できる</h3><p>各ページの「手元で試す」は、コピペでそのまま動くコマンド列です。仕様（RFC）へのリンクも添えます。</p></div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="site-f"></footer>
+
+  <script src="assets/js/topics.js"></script>
+  <script src="assets/js/tim.js"></script>
+  <script src="assets/js/home.js"></script>
+</body>
+</html>

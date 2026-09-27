@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TEMPLATE — Tech in Motion</title>
+  <meta name="description" content="ページの説明（検索結果・SNS に出る 1 文）">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Space+Grotesk:wght@500;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="../../assets/css/tim.css">
+  <!-- <link rel="stylesheet" href="page.css"> ページ固有 CSS が必要なときだけ -->
+</head>
+<body data-root="../../" data-topic="_template">
+  <header class="site-h"></header>
+
+  <div class="page">
+    <aside class="toc"></aside>
+    <main class="doc">
+
+      <!-- 0. HERO -->
+      <section class="hero">
+        <p class="kicker">Category · Subtitle</p>
+        <h1>トピック名<small>1 行で「何が見えるページか」</small></h1>
+        <p class="lead">リード文。対象読者が「実物として」何を理解できるかを 2〜3 文で。</p>
+        <div class="facts">
+          <div class="fact"><span>どこで</span><b>ホスト / プロセス / ファイル</b></div>
+          <div class="fact"><span>何を</span><b>データ構造 / フィールド</b></div>
+          <div class="fact"><span>どうやって</span><b><code>command --flag</code></b></div>
+          <div class="fact"><span>仕様</span><b>RFC XXXX</b></div>
+        </div>
+      </section>
+
+      <!-- 1. 全体像 -->
+      <section class="chapter" id="overview">
+        <h2>全体像</h2>
+        <p>このシーンはエンジン API の動作サンプルです。コピーして書き換えてください。</p>
+
+        <div class="scene" id="sc-demo" data-title="エンジン API デモ">
+          <div class="stage" data-w="960" data-h="440">
+            <div class="zone" data-label="host-a" style="left:24px;top:40px;width:300px;height:360px"></div>
+            <div class="node" data-el="client" style="left:60px;top:80px;width:220px">
+              <div class="node-h"><i data-icon="laptop"></i><b class="node-t">Client</b></div>
+              <div class="node-s">curl 8.x</div>
+            </div>
+            <div class="term hide" data-el="t1" style="left:48px;top:190px;width:256px;height:190px">
+              <div class="term-h">bash</div>
+              <div class="term-b"></div>
+            </div>
+            <div class="node" data-el="server" style="left:640px;top:80px;width:260px">
+              <div class="node-h"><i data-icon="server"></i><b class="node-t">Server</b></div>
+              <div class="node-s">nginx 1.27 · :443</div>
+            </div>
+            <div class="file hide" data-el="f1" style="left:640px;top:200px;width:260px">
+              <div class="file-h">/etc/nginx/conf.d/app.conf</div>
+              <pre data-lang="text">server {
+  listen 443 ssl;
+  server_name app.example.com;
+}</pre>
+            </div>
+            <div class="chip hide" data-el="hash" style="left:380px;top:360px;width:auto">sha256: <span data-el="hv">-</span></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- 2..n 各章 -->
+      <section class="chapter" id="reference">
+        <h2>コマンド早見表</h2>
+        <div class="tbl">
+          <table class="ref">
+            <thead><tr><th>コマンド</th><th>主なフラグ</th><th>何が起きるか</th></tr></thead>
+            <tbody>
+              <tr><td><code>curl -v URL</code></td><td><code>-v</code> 詳細, <code>-I</code> HEAD</td><td>リクエスト/レスポンスヘッダを表示</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <pre data-lang="bash" data-title="手元で試す">$ curl -v https://example.com/ -o /dev/null
+# ⟪&lt; HTTP/2 200⟫ のような行が見えます</pre>
+        <div class="note warn"><b>ハマりどころ：</b>ここに注意点。</div>
+      </section>
+
+      <section class="chapter" id="spec">
+        <h2>仕様・参考</h2>
+        <ul>
+          <li><a href="https://www.rfc-editor.org/rfc/rfc9110" target="_blank" rel="noopener">RFC 9110 — HTTP Semantics</a></li>
+        </ul>
+      </section>
+
+    </main>
+  </div>
+
+  <footer class="site-f"></footer>
+  <script src="../../assets/js/topics.js"></script>
+  <script src="../../assets/js/tim.js"></script>
+  <script src="scenes.js"></script>
+</body>
+</html>
